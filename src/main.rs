@@ -25,7 +25,8 @@
 //!    不阻断启动（优雅同步）；
 //! 4. **总线装配**：`EventBus`（`tokio::sync::broadcast`，容量 256）注入模块管理器
 //!    作为广播出口；
-//! 5. **模块注册**：注册内置常驻守护模块（[`PopupBlockerModule`]）；
+//! 5. **模块注册**：注册内置常驻守护模块（[`PopupBlockerModule`] 弹窗拦截、
+//!    [`KeepAwakeModule`] 系统防休眠）；
 //! 6. **自动启动模块**：按配置对 `auto_start_modules` 执行 `toggle(id, true)`——
 //!    **先于 UI 装配**，启动期广播事件因尚无订阅者而被总线按设计丢弃，随后以调度
 //!    层**真实状态快照**填充 UI 初始模型，保证“界面即事实”；
@@ -59,6 +60,7 @@ use tltoolbox::autostart;
 use tltoolbox::bus::{AppEvent, EventBus, TrayAction};
 use tltoolbox::config::ConfigManager;
 use tltoolbox::manager::{ModuleManager, SharedManager};
+use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::PopupBlockerModule;
 use tltoolbox::tray::{self, TrayControl};
 
@@ -307,8 +309,22 @@ async fn main() -> Result<(), AppError> {
     let event_bus = EventBus::default();
 
     // ---- 4. 模块管理器装配：先注册全部内置常驻守护模块。 ----
+    //      弹窗拦截模块的初始黑名单取自配置 `popup_blacklist`（含默认广告关键词），
+    //      运行期可经 `PopupBlockerModule::update_rules` 热更新而无需重启原生泵线程。
     let mut module_mgr = ModuleManager::new(event_bus.clone());
-    module_mgr.register(Arc::new(PopupBlockerModule::new()));
+    let popup_rules_count = app_config.popup_blacklist.len();
+    module_mgr.register(Arc::new(PopupBlockerModule::with_rules(
+        app_config.popup_blacklist.clone(),
+    )));
+    tracing::info!(
+        target: "main",
+        "弹窗拦截黑名单已注入 PopupBlockerModule（{} 条关键词，运行期可热更新）",
+        popup_rules_count
+    );
+    //      系统防休眠模块：无参构造即可注册。注册即出现在 UI 模块列表，但**不**进入
+    //      默认自动启动列表——阻止系统睡眠属「显式开启才合理」的电源行为改变，避免
+    //      首次安装即静默改写用户机器的空闲休眠策略（由用户在 UI / 托盘手动开启）。
+    module_mgr.register(Arc::new(KeepAwakeModule::new()));
     let shared_mgr: SharedManager = Arc::new(module_mgr);
     let registered_modules: Vec<&str> = shared_mgr
         .get_metadata_list()

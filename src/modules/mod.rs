@@ -53,5 +53,8 @@ pub trait ToolModule: Send + Sync {
     fn is_running(&self) -> bool;
 }
 
+/// 系统防休眠模块（阶段二原生落地：第二个常驻守护模块）。
+pub mod keep_awake;
+
 /// Win32 弹窗拦截模块（阶段一原生落地实现）。
 pub mod popup_blocker;

@@ -2,8 +2,18 @@
 # 说明：auto_start_windows 以本文件为准，启动装配层会与注册表
 # HKCU\Software\Microsoft\Windows\CurrentVersion\Run 自动收敛（开而缺→写入；
 # 关而残留→删除）。
+#
+# popup_blacklist 为弹窗拦截模块的黑名单关键词（窗口标题 / 类名的子串匹配，
+# 忽略大小写）。启动时注入 PopupBlockerModule；运行期修改本列表后需经模块的
+# update_rules 热更新（或重启应用）方可生效——模块不会自动重读本文件。
 
 auto_start_modules = ["popup_blocker"]
+popup_blacklist = [
+    "广告",
+    "Flash Helper Service",
+    "Update Notice",
+    "推广弹窗",
+]
 auto_start_windows = false
 minimize_to_tray = true
 

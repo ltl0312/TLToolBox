@@ -29,14 +29,40 @@
 //! 丢失、泵线程永久挂起。为此泵线程在回报自身线程 ID 之前，先以
 //! `PeekMessageW(PM_NOREMOVE)` 强制建立队列，再与父侧完成一次性握手；握手成功后队列
 //! 必然存在，任何后续投递的 `WM_QUIT` 都不会丢失。
+//!
+//! ## 动态黑名单与热更新（阶段三：配置驱动的规则存储）
+//!
+//! 黑名单关键词不再硬编码于本模块，而是以 [`crate::config::AppConfig::popup_blacklist`]
+//! 为唯一事实源，由装配层在注册时经 [`PopupBlockerModule::with_rules`] 注入；运行期亦可
+//! 调用 [`PopupBlockerModule::update_rules`] **热更新**——不需要重启原生消息泵线程，
+//! 因为回调并非读取某个启动期常量，而是每条事件现场读取所属实例的当前规则快照。
+//!
+//! 由于 `SetWinEventHook` 的回调是 `unsafe extern "system" fn`（与实例无关联的静态
+//! 函数，无法捕获 `&self`），本模块通过一张 **进程级钩子句柄注册表**
+//! （`OnceLock<RwLock<HashMap<hook 句柄, Arc<RuleStore>>>>`，仅在 Windows 平台存在）
+//! 把回调收到的 `HWINEVENTHOOK` 路由回它所属的 [`PopupBlockerModule`] 实例——不同实例
+//! 各自持有独立的规则存储，互不串扰。泵线程在装钩成功后注册、卸载钩子前注销。
+//!
+//! 并发模型遵循两条铁律：
+//! - **规则存储为 copy-on-write**：[`RuleStore`] 内部是 `std::sync::RwLock<Arc<RuleSet>>`，
+//!   `update_rules` 以写锁**整体替换**不可变快照（快照生成时一次性完成大小写归一与
+//!   去重，杜绝回调内逐条重复归一）；读取方只短暂持读锁克隆 `Arc`，随即在**锁外**
+//!   完成全部字符串匹配；
+//! - **回调内绝不持有重锁**：`win_event_proc` 在锁内只做「注册表查表 + 克隆 `Arc`」
+//!   两个指针级操作，匹配与窗口查询均在无锁路径上执行，泵线程 / 桌面 UI 不会因
+//!   规则更新或并发读取而挂起（更新与查表互斥窗口为微秒级）。
 
 use super::{ModuleError, ToolModule};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock as StdRwLock};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(windows)]
+use std::collections::HashMap;
+#[cfg(windows)]
+use std::sync::OnceLock;
 #[cfg(windows)]
 use std::time::Duration;
 
@@ -64,9 +90,159 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 命中即关闭的目标窗口标题 / 类名黑名单（匹配窗口标题与窗口类名）。
+// ---------------------------------------------------------------------------
+// 动态黑名单规则存储（跨平台核心：Windows 钩子回调与单元测试共用同一判定逻辑）
+// ---------------------------------------------------------------------------
+
+/// 单条黑名单关键词的“已编译”形态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompiledPattern {
+    /// 归一化后的原始关键词（去首尾空白；保留原大小写，供日志与 `current_rules` 回读）。
+    raw: String,
+    /// 小写归一后的匹配针：判定时与同样小写化的窗口标题 / 类名做子串匹配。
+    needle: String,
+}
+
+/// 不可变黑名单快照。
+///
+/// 快照在写入（[`RuleStore::set`]）时**一次性编译**完成（归一化 + 去重 + 小写化），
+/// 之后为纯只读共享，多个消息泵线程 / 回调可无锁并发执行 [`RuleSet::matches`]。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RuleSet {
+    patterns: Vec<CompiledPattern>,
+}
+
+impl RuleSet {
+    /// 从原始关键词列表编译快照：
+    /// 1) 逐条去首尾空白，空白串直接剔除；
+    /// 2) 按**小写归一针**去重（同一关键词的大小写变体视作同一条目，保留首现形态）。
+    fn compile(raw_rules: impl IntoIterator<Item = String>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let patterns = raw_rules
+            .into_iter()
+            .filter_map(|rule| {
+                let raw = rule.trim().to_string();
+                if raw.is_empty() {
+                    return None; // 空白条目无匹配意义
+                }
+                let needle = raw.to_lowercase();
+                if !seen.insert(needle.clone()) {
+                    return None; // 与既有条目同义（大小写不敏感去重）
+                }
+                Some(CompiledPattern { raw, needle })
+            })
+            .collect();
+        Self { patterns }
+    }
+
+    /// 是否不含任何关键词（空黑名单 = 不拦截任何窗口；匹配路径零分配短路）。
+    fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// 回读当前关键词（归一化后的原始文本，顺序与去重后一致）。
+    fn raw_keywords(&self) -> Vec<String> {
+        self.patterns.iter().map(|pattern| pattern.raw.clone()).collect()
+    }
+
+    /// 判定窗口标题 / 类名是否命中任意黑名单关键词。
+    ///
+    /// 匹配语义：**子串匹配 + 忽略大小写**（Unicode 小写归一；中文等无大小写之分的
+    /// 字符不受影响，仍为逐字子串匹配）。标题与类名各自小写化**一次**后统一比对，
+    /// 避免按关键词逐条重复归一化。
+    fn matches(&self, title: &str, class_name: &str) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let title = title.to_lowercase();
+        let class_name = class_name.to_lowercase();
+        self.patterns
+            .iter()
+            .any(|pattern| title.contains(&pattern.needle) || class_name.contains(&pattern.needle))
+    }
+}
+
+/// 实例级动态规则存储（copy-on-write 并发模型）。
+///
+/// - **读路径**（钩子回调 / 单元测试）：[`RuleStore::snapshot`] 仅在极短读锁内克隆
+///   `Arc<RuleSet>` 即释放锁，全部字符串匹配都在**锁外**完成——回调绝不持锁扫描；
+/// - **写路径**（[`RuleStore::set`]，即 `update_rules`）：以写锁**整体替换**快照，
+///   发布-订阅语义。正在运行的原生消息泵线程无需任何干预，下一条事件即按新规则
+///   判定，热更新即时生效。
+#[derive(Debug)]
+struct RuleStore {
+    current: StdRwLock<Arc<RuleSet>>,
+}
+
+impl RuleStore {
+    fn new(rules: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            current: StdRwLock::new(Arc::new(RuleSet::compile(rules))),
+        }
+    }
+
+    /// 整体替换规则快照（热更新入口）。
+    fn set(&self, rules: impl IntoIterator<Item = String>) {
+        let compiled = Arc::new(RuleSet::compile(rules));
+        *self.current.write().unwrap_or_else(PoisonError::into_inner) = compiled;
+    }
+
+    /// 取当前快照（读锁仅覆盖一次 `Arc` 克隆）。
+    fn snapshot(&self) -> Arc<RuleSet> {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 #[cfg(windows)]
-const BLACKLIST_PATTERNS: &[&str] = &["广告", "Flash Helper Service", "Update Notice", "推广弹窗"];
+/// 进程级钩子句柄注册表：`HWINEVENTHOOK 原始指针值 -> 所属实例的规则存储`。
+///
+/// `SetWinEventHook` 回调是静态 `unsafe extern "system" fn`，系统只回传
+/// `HWINEVENTHOOK` 等载荷、不携带任何用户指针——回调收到事件时必须反查本表才能
+/// 路由回安装该钩子的 [`PopupBlockerModule`] 实例（不同实例各持独立规则存储，
+/// 互不串扰）。键取句柄的裸指针值（`usize`）：句柄类型自身未实现 `Hash`。
+///
+/// 生命周期与钩子安装 / 卸载严格对齐：泵线程在 `SetWinEventHook` 成功**之后**注册、
+/// 在 `UnhookWinEvent` **之前**注销；句柄被操作系统复用时不会命中残留映射。
+static HOOK_RULE_REGISTRY: OnceLock<StdRwLock<HashMap<usize, Arc<RuleStore>>>> =
+    OnceLock::new();
+
+#[cfg(windows)]
+fn hook_registry() -> &'static StdRwLock<HashMap<usize, Arc<RuleStore>>> {
+    HOOK_RULE_REGISTRY.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+#[cfg(windows)]
+fn hook_key(hook: HWINEVENTHOOK) -> usize {
+    hook.0 as usize
+}
+
+#[cfg(windows)]
+fn register_hook_rules(hook: HWINEVENTHOOK, store: Arc<RuleStore>) {
+    hook_registry()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(hook_key(hook), store);
+}
+
+#[cfg(windows)]
+fn unregister_hook_rules(hook: HWINEVENTHOOK) {
+    hook_registry()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&hook_key(hook));
+}
+
+#[cfg(windows)]
+fn lookup_hook_rules(hook: HWINEVENTHOOK) -> Option<Arc<RuleStore>> {
+    hook_registry()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&hook_key(hook))
+        .cloned()
+}
 
 /// WinEvent 系统回调的裸函数指针类型（与 `WINEVENTPROC` 载荷一致）。
 ///
@@ -91,6 +267,10 @@ struct PopupBlockerInner {
     running: AtomicBool,
     /// 当前活动运行上下文（一次运行仅对应一条泵线程）。
     active: StdMutex<Option<ActiveRun>>,
+    /// 动态黑名单规则存储（copy-on-write，见 [`RuleStore`]）：实例级事实源，
+    /// 由装配层注入（`with_rules`），运行期可热更新（`update_rules`），
+    /// 钩子回调经全局句柄注册表路由回本存储。
+    rules: Arc<RuleStore>,
 }
 
 /// 单次运行（泵线程）的运行时上下文。
@@ -106,15 +286,44 @@ struct ActiveRun {
 }
 
 impl PopupBlockerModule {
-    /// 构造一个尚未启动的弹窗拦截模块。
+    /// 构造一个尚未启动、**规则为空**的弹窗拦截模块。
+    ///
+    /// 空黑名单语义 = 不拦截任何窗口（deny-list 为空的保守默认）。常规装配路径应使用
+    /// [`Self::with_rules`] 注入配置中的黑名单；`new()` 供测试与延迟配置场景使用。
     pub fn new() -> Self {
+        Self::with_rules(Vec::<String>::new())
+    }
+
+    /// 以初始黑名单关键词构造模块（装配层注入 [`crate::config::AppConfig::popup_blacklist`]）。
+    pub fn with_rules(rules: impl IntoIterator<Item = String>) -> Self {
         Self {
             inner: Arc::new(PopupBlockerInner {
                 lifecycle: AsyncMutex::new(()),
                 running: AtomicBool::new(false),
                 active: StdMutex::new(None),
+                rules: Arc::new(RuleStore::new(rules)),
             }),
         }
+    }
+
+    /// 热更新黑名单：整体替换规则快照（发布-订阅语义）。
+    ///
+    /// - 同步方法、微秒级完成，任意线程（含 Tokio 工作线程）可调用；
+    /// - **无需重启**正在运行的原生消息泵线程：回调每条事件现场读取当前快照，
+    ///   更新落定后下一条事件即按新规则判定；
+    /// - 传入的关键词会先经 [`RuleSet::compile`] 归一化（去空白、剔除空串、去重）。
+    pub fn update_rules(&self, rules: impl IntoIterator<Item = String>) {
+        self.inner.rules.set(rules);
+        tracing::debug!(
+            target: "popup_blocker",
+            "黑名单已热更新（{} 条关键词，无需重启消息泵线程）",
+            self.inner.rules.snapshot().patterns.len()
+        );
+    }
+
+    /// 回读当前生效的黑名单（归一化后的原始关键词，供 UI / 诊断展示）。
+    pub fn current_rules(&self) -> Vec<String> {
+        self.inner.rules.snapshot().raw_keywords()
     }
 
     /// WinEvent 事件回调：由泵线程在 `DispatchMessageW` 派发阶段被系统调用。
@@ -122,10 +331,13 @@ impl PopupBlockerModule {
     /// # Safety / 约束
     /// - 必须与 `WINEVENTPROC` 布局一致（`unsafe extern "system"`）；
     /// - 运行于专用原生线程的系统回调上下文，**严禁**在其中执行任何异步 / Tokio
-    ///   操作，也禁止可能 `panic` / 跨 FFI 边界展开的代码。
+    ///   操作，也禁止可能 `panic` / 跨 FFI 边界展开的代码；
+    /// - 黑名单不再硬编码：回调经句柄注册表（[`lookup_hook_rules`]）路由回所属实例
+    ///   的规则存储并取快照——锁内只做查表与 `Arc` 克隆两个指针级操作，窗口文本
+    ///   查询与字符串匹配全部在**无锁路径**上执行，规则热更新无需重启泵线程。
     #[cfg(windows)]
     unsafe extern "system" fn win_event_proc(
-        _hook: HWINEVENTHOOK,
+        hook: HWINEVENTHOOK,
         event: u32,
         hwnd: HWND,
         id_object: i32,
@@ -135,6 +347,14 @@ impl PopupBlockerModule {
     ) {
         // OBJID_WINDOW == 0 && CHILDID_SELF == 0：只关心窗口本体（而非子元素/子对象）的创建。
         if event != EVENT_OBJECT_CREATE || hwnd.0.is_null() || id_object != 0 || id_child != 0 {
+            return;
+        }
+
+        // 快照为空（空黑名单 = 不拦截）时零分配短路：连窗口文本都无需读取。
+        let Some(snapshot) = lookup_hook_rules(hook).map(|store| store.snapshot()) else {
+            return; // 钩子已注销 / 注册表未就绪：忽略该事件
+        };
+        if snapshot.is_empty() {
             return;
         }
 
@@ -149,17 +369,8 @@ impl PopupBlockerModule {
             let class_name = String::from_utf16_lossy(&class_buf[..class_len.min(class_buf.len())]);
             let title = String::from_utf16_lossy(&title_buf[..title_len.min(title_buf.len())]);
 
-            // 拉丁字母模式做大小写不敏感匹配；中文模式直接包含匹配。
-            let matched = BLACKLIST_PATTERNS.iter().any(|pattern| {
-                if pattern.is_ascii() {
-                    let needle = pattern.to_ascii_lowercase();
-                    title.to_ascii_lowercase().contains(&needle)
-                        || class_name.to_ascii_lowercase().contains(&needle)
-                } else {
-                    title.contains(pattern) || class_name.contains(pattern)
-                }
-            });
-            if !matched {
+            // 快照匹配：子串匹配 + 忽略大小写（大小写归一在快照写入时已完成）。
+            if !snapshot.matches(&title, &class_name) {
                 return;
             }
 
@@ -175,9 +386,12 @@ impl PopupBlockerModule {
 
     /// 泵线程主体：运行于专用操作系统原生线程，承载钩子安装与标准 Win32 消息泵。
     ///
+    /// `rules` 为所属实例的规则存储（`Arc` 克隆传入，线程独立持有）：装钩成功后立即
+    /// 注册「钩子句柄 → 规则存储」路由，卸载钩子前注销——回调由此路由回所属实例。
+    ///
     /// 线程退出前必须完成 `UnhookWinEvent`（钩子只能由安装线程卸载）。
     #[cfg(windows)]
-    fn pump_thread_main(ready_tx: oneshot::Sender<Result<u32, String>>) {
+    fn pump_thread_main(ready_tx: oneshot::Sender<Result<u32, String>>, rules: Arc<RuleStore>) {
         // SAFETY:
         // - 本函数整体运行在由 `std::thread::Builder::spawn` 派生的专用原生线程中；
         // - `PeekMessageW` 仅用于建立本线程消息队列（取不到消息也无副作用）；
@@ -212,11 +426,16 @@ impl PopupBlockerModule {
                 return;
             }
 
+            // 2.5) 注册「钩子句柄 → 实例规则存储」路由。必须在握手与消息泵之前完成：
+            //      回调一经派发即可正确定位所属实例的当前规则。
+            register_hook_rules(hook, rules);
+
             let thread_id = GetCurrentThreadId();
 
             // 3) 与父侧握手。若父侧已放弃等待（oneshot 关闭 / future 被取消），
-            //    立即卸载钩子并退出，绝不遗留无主事件钩子。
+            //    立即注销路由并卸载钩子后退出，绝不遗留无主事件钩子。
             if ready_tx.send(Ok(thread_id)).is_err() {
+                unregister_hook_rules(hook);
                 let _ = UnhookWinEvent(hook);
                 return;
             }
@@ -237,7 +456,10 @@ impl PopupBlockerModule {
                 let _ = DispatchMessageW(&msg);
             }
 
-            // 5) 泵退出后在同一线程安全卸载钩子，随后线程自然结束。
+            // 5) 泵退出后在同一线程注销路由并安全卸载钩子，随后线程自然结束。
+            //    顺序不可颠倒：先注销再 UnhookWinEvent——句柄在卸载后才可能被操作系统
+            //    复用给新钩子，先注销可杜绝“复用句柄命中残留映射”的竞态。
+            unregister_hook_rules(hook);
             let _ = UnhookWinEvent(hook);
             tracing::info!(target: "popup_blocker", "Win32 原生事件钩子已安全卸载，泵线程退出");
         }
@@ -254,10 +476,14 @@ impl PopupBlockerModule {
         let cancel = CancellationToken::new();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<u32, String>>();
 
+        // 所属实例的规则存储克隆进泵线程：装钩成功后注册句柄路由，回调据此
+        // 读取动态黑名单；规则热更新只写存储、不触碰泵线程。
+        let rules = Arc::clone(&self.inner.rules);
+
         // 派生专用操作系统原生线程承载钩子与消息泵（严禁放置于 Tokio 协程中）。
         let thread = std::thread::Builder::new()
             .name("win32-popup-hook-pump".to_string())
-            .spawn(move || Self::pump_thread_main(ready_tx))
+            .spawn(move || Self::pump_thread_main(ready_tx, rules))
             .map_err(|e| -> ModuleError { Box::new(e) })?;
 
         // 等待原生线程完成“建队列 + 装钩子”握手，安装失败则回收线程并上报。
@@ -503,6 +729,132 @@ mod tests {
                 .expect("并发 stop 任务应正常结束")
                 .expect("并发 stop 应成功");
         }
+        assert!(!module.is_running());
+    }
+
+    // -----------------------------------------------------------------------
+    // 动态黑名单规则核心（跨平台纯逻辑，不依赖 Win32）
+    // -----------------------------------------------------------------------
+
+    /// 默认关键词的命中语义：子串匹配 + 忽略大小写；标题与类名任一命中即算命中。
+    #[test]
+    fn rule_set_matches_substring_case_insensitively() {
+        let rules = RuleSet::compile(
+            ["广告", "Flash Helper Service", "Update Notice", "推广弹窗"]
+                .into_iter()
+                .map(String::from),
+        );
+
+        // 中文逐字子串命中（标题 / 类名任一命中均可）。
+        assert!(rules.matches("今日推广弹窗已拦截", "SomeClass"));
+        assert!(rules.matches("普通标题", "广告专用窗口类"));
+        // 拉丁关键词忽略大小写命中。
+        assert!(rules.matches("FLASH HELPER SERVICE 正在运行", "#32770"));
+        assert!(rules.matches("请查看 update notice", "Chrome_WidgetWin_1"));
+        // 完全无关的窗口不得误伤。
+        assert!(!rules.matches("Steam 下载中", "Chrome_WidgetWin_1"));
+        assert!(!rules.matches("", ""));
+    }
+
+    /// 空黑名单（等价的 deny-list 空集）不得命中任何窗口——含空标题 / 类名输入。
+    #[test]
+    fn empty_rule_set_blocks_nothing() {
+        let rules = RuleSet::default();
+        assert!(rules.is_empty());
+        assert!(!rules.matches("广告", ""));
+        assert!(!rules.matches("", "Flash Helper Service"));
+        assert!(!rules.matches("", ""));
+    }
+
+    /// 归一化契约：去首尾空白、剔除空白串、按小写针大小写不敏感去重（保留首现形态）。
+    #[test]
+    fn rule_set_compile_normalizes_trims_and_dedups() {
+        let rules = RuleSet::compile(
+            [
+                "  广告  ",           // 去空白后与下方 "广告" 重复
+                "广告",
+                "",                   // 空串剔除
+                "   ",                // 纯空白剔除
+                "Flash Helper Service",
+                "flash helper service", // 与上一条同义（忽略大小写）→ 剔除
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+
+        assert_eq!(
+            rules.raw_keywords(),
+            vec!["广告".to_string(), "Flash Helper Service".to_string()],
+            "应保留首现形态并按序去重"
+        );
+        assert!(!rules.is_empty());
+    }
+
+    /// [`RuleStore`] 的 copy-on-write 语义：`set` 整体替换快照后，新针即时生效、
+    /// 旧针即时失效；已被快照引用的旧 `Arc` 不受影响（隔离性）。
+    #[test]
+    fn rule_store_set_swaps_snapshot_immediately() {
+        let store = RuleStore::new(["广告"].into_iter().map(String::from));
+
+        let before = store.snapshot();
+        assert!(before.matches("xx广告xx", ""));
+        assert!(!before.matches("推广弹窗", ""));
+
+        // 热替换：增删（增 "推广弹窗"、删 "广告"）在同一份快照中原子生效。
+        store.set(["推广弹窗", "Update Notice"].into_iter().map(String::from));
+
+        let after = store.snapshot();
+        assert!(after.matches("请查看 Update Notice", ""));
+        assert!(after.matches("推广弹窗", ""));
+        assert!(!after.matches("xx广告xx", ""), "删除的关键词应立即失效");
+
+        // 旧快照 Arc 仍是不可变历史版本，语义不受后续写入影响。
+        assert!(before.matches("xx广告xx", ""));
+
+        // 清空 → 恢复“不拦截任何窗口”。
+        store.set(Vec::<String>::new());
+        assert!(store.snapshot().is_empty());
+        assert!(!store.snapshot().matches("Update Notice", ""));
+    }
+
+    /// 模块级热更新：**运行中**调用 `update_rules` 不打断生命周期、无需重启泵线程，
+    /// 新黑名单对后续判定即时生效；`current_rules` 回读归一化结果。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_rules_takes_effect_while_running_without_restart() {
+        let module = PopupBlockerModule::with_rules(["广告"].into_iter().map(String::from));
+        assert_eq!(module.current_rules(), vec!["广告".to_string()]);
+
+        module.start().await.expect("启动应成功");
+        assert!(module.is_running());
+
+        // 运行态热更新：增删关键词，不调用 stop / start。
+        module.update_rules(
+            ["  Flash Helper Service  ", "推广弹窗", "广告", "广告"]
+                .into_iter()
+                .map(String::from),
+        );
+
+        // 生命周期未被热更新打断。
+        assert!(module.is_running(), "热更新不得影响泵线程运行状态");
+
+        // 归一化 + 去重后的回读结果（"广告" 重复条目仅保留一个）。
+        assert_eq!(
+            module.current_rules(),
+            vec![
+                "Flash Helper Service".to_string(),
+                "推广弹窗".to_string(),
+                "广告".to_string(),
+            ]
+        );
+
+        // 匹配判定读取的是更新后的快照（即时生效性）。
+        let snapshot = module.inner.rules.snapshot();
+        assert!(snapshot.matches("FLASH HELPER SERVICE", ""));
+        assert!(snapshot.matches("xx推广弹窗xx", ""));
+        assert!(!snapshot.matches("普通窗口内容", "Edit"), "无关窗口不得误伤");
+        assert!(!snapshot.matches("", ""));
+
+        module.stop().await.expect("停止应成功");
         assert!(!module.is_running());
     }
 }

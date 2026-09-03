@@ -36,6 +36,15 @@ pub struct AppConfig {
     /// 应用启动后应自动拉起（`toggle(id, true)`）的模块 ID 列表，按序启动。
     #[serde(default = "AppConfig::default_auto_start_modules")]
     pub auto_start_modules: Vec<String>,
+    /// 弹窗拦截黑名单关键词（弹窗拦截模块的唯一事实源）。
+    ///
+    /// 装配层（`crate::main`）在模块注册时将其注入
+    /// [`PopupBlockerModule`](crate::modules::popup_blocker::PopupBlockerModule)；
+    /// 匹配语义为「窗口标题 / 类名的子串匹配、忽略大小写」。条目会先经模块侧
+    /// 归一化（去首尾空白、剔除空串、去重）再参与判定。运行期改写本字段并调用
+    /// 模块的 `update_rules` 即可热更新，无需重启原生消息泵线程。
+    #[serde(default = "AppConfig::default_popup_blacklist")]
+    pub popup_blacklist: Vec<String>,
     /// 是否跟随系统开机自启（写入注册表 Run 键，见 [`crate::autostart`]）。
     ///
     /// 配置为准：启动装配层在配置加载后据此同步注册表实际状态。
@@ -55,6 +64,16 @@ impl AppConfig {
         vec!["popup_blocker".to_string()]
     }
 
+    /// 默认弹窗拦截黑名单：保留传统内置的常见广告 / 流氓进程窗口关键词。
+    fn default_popup_blacklist() -> Vec<String> {
+        vec![
+            "广告".to_string(),
+            "Flash Helper Service".to_string(),
+            "Update Notice".to_string(),
+            "推广弹窗".to_string(),
+        ]
+    }
+
     fn default_auto_start_windows() -> bool {
         false
     }
@@ -68,6 +87,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             auto_start_modules: Self::default_auto_start_modules(),
+            popup_blacklist: Self::default_popup_blacklist(),
             auto_start_windows: Self::default_auto_start_windows(),
             minimize_to_tray: Self::default_minimize_to_tray(),
             module_custom_params: HashMap::new(),
@@ -283,6 +303,18 @@ mod tests {
         assert!(!cfg.auto_start_windows, "开机自启默认应为关闭（显式开启才写注册表）");
         assert!(cfg.minimize_to_tray, "关闭按钮最小化到托盘默认应开启（桌面常驻定位）");
         assert!(cfg.module_custom_params.is_empty());
+
+        // 弹窗黑名单默认值 = 传统内置的常见广告 / 流氓窗口关键词。
+        let expected: Vec<String> = [
+            "广告",
+            "Flash Helper Service",
+            "Update Notice",
+            "推广弹窗",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cfg.popup_blacklist, expected, "黑名单默认值应保留原有关键词");
     }
 
     #[tokio::test]
@@ -295,6 +327,7 @@ mod tests {
         cfg.auto_start_modules = vec!["popup_blocker".into(), "fake_module".into()];
         cfg.auto_start_windows = true;
         cfg.minimize_to_tray = false;
+        cfg.popup_blacklist = vec!["弹窗测试关键词".into(), "Popup Test Ad".into()];
         cfg.module_custom_params
             .insert("popup_blocker".into(), "aggressive".into());
 
@@ -351,9 +384,37 @@ mod tests {
         let mgr = ConfigManager::new(&path);
         let cfg = mgr.load().await.expect("缺字段应回退默认值而非报错");
         assert_eq!(cfg.auto_start_modules, vec!["popup_blocker".to_string()]);
+        assert_eq!(
+            cfg.popup_blacklist,
+            AppConfig::default().popup_blacklist,
+            "黑名单缺省时应回退默认关键词"
+        );
         assert_eq!(cfg.auto_start_windows, AppConfig::default().auto_start_windows);
         assert_eq!(cfg.minimize_to_tray, AppConfig::default().minimize_to_tray);
         assert!(cfg.module_custom_params.is_empty());
+
+        remove_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn popup_blacklist_field_parses_and_roundtrips() {
+        let path = temp_cfg_path("blacklist");
+        remove_if_exists(&path).await;
+
+        let mgr = ConfigManager::new(&path);
+        let mut cfg = AppConfig::default();
+        cfg.popup_blacklist = vec![
+            "购物返利".into(),
+            "Flash Helper Service".into(),
+            "Update Notice".into(),
+        ];
+        mgr.save(&cfg).await.expect("保存应成功");
+
+        let loaded = mgr.load().await.expect("加载应成功");
+        assert_eq!(
+            loaded.popup_blacklist, cfg.popup_blacklist,
+            "黑名单应逐字往返一致"
+        );
 
         remove_if_exists(&path).await;
     }
@@ -376,6 +437,11 @@ mod tests {
         let mgr = ConfigManager::new(&path);
         let cfg = mgr.load().await.expect("旧版 llm 键应被忽略而非报错");
         assert_eq!(cfg.auto_start_modules, vec!["popup_blocker".to_string()]);
+        assert_eq!(
+            cfg.popup_blacklist,
+            AppConfig::default().popup_blacklist,
+            "旧版配置缺黑名单键时应回退默认关键词"
+        );
         assert_eq!(cfg.auto_start_windows, AppConfig::default().auto_start_windows);
         assert_eq!(cfg.minimize_to_tray, AppConfig::default().minimize_to_tray);
 

@@ -41,6 +41,8 @@ tray-icon = "0.19"
 #   - Win32_UI_Accessibility      ：SetWinEventHook / UnhookWinEvent / HWINEVENTHOOK / WINEVENTPROC
 #   - Win32_System_Registry       ：RegOpenKeyExW / RegSetValueExW / RegQueryValueExW /
 #                                  RegDeleteValueW（开机自启读写的注册表 API）
+#   - Win32_System_Power          ：SetThreadExecutionState / EXECUTION_STATE / ES_*
+#                                  （系统防休眠模块阻止睡眠与熄屏的执行状态 API）
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
@@ -49,10 +51,20 @@ features = [
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_System_Registry",
+    "Win32_System_Power",
 ]
 
 [build-dependencies]
 slint-build = "1.9"
+
+# Windows 资源嵌入（build.rs 侧，仅 Windows 目标生效）：把 app.manifest
+# （UAC asInvoker / Per-Monitor V2 DPI / Common-Controls v6）编译为 RT_MANIFEST
+# 资源内嵌进 exe；res/app.ico 图标就绪后由 build.rs 的预留分支一并嵌入。
+# 说明：选用 winresource 而非 winres = "0.1"——API 完全兼容，但是仍在维护的
+# 分支（winres 自 0.1.x 起多年未更新，MSVC rc.exe 自动发现与新 SDK 适配靠
+# winresource 补全）；两者对 build.rs 的用法一致，替换成本为零。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 # ---- 发布构建：极致体积压制 ----
 # TLToolBox 交付单文件原生可执行程序（release 为无控制台 GUI 子系统），体积与

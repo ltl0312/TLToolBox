@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  TLToolBox · Windows 应用程序清单（Application Manifest）
+  ======================================================================
+  经 build.rs（winresource = winres 的维护版分支）在 Windows 目标下编译为
+  RT_MANIFEST 资源（资源 ID = 1 / CREATEPROCESS_MANIFEST_RESOURCE_ID）内嵌
+  进最终 exe。自嵌入本清单起即整体替换 MSVC 链接器自动生成的默认清单，因此
+  下方四个核心节点缺一不可（executionLevel / DPI / 兼容性声明 / Common-Controls）。
+
+  注意：XML 注释内容中禁止连续出现两个半角减号（dash），本文件内分隔线一律
+  用 "=" 而非 "-"（中文破折号 "——" 为不同字符，不受此限）。
+
+  核心决策：
+  1) requestedExecutionLevel = asInvoker
+     与启动方同权限运行：普通双击 = 标准（中完整性）令牌，绝不弹 UAC。
+     取舍说明（highestAvailable 为何不选）：
+       - 本程序经注册表 Run 键以 silent 静默参数开机自启；若声明 highestAvailable，
+         管理员账户每次登录都会被 UAC 拦一道确认框，常驻工具不可接受；
+       - 拦截高权限窗口权限不足问题（向高完整性窗口 PostMessage(WM_CLOSE)
+         被 UIPI 静默丢弃）仅靠提权声明不能体面解决：要么整个进程常驻高权限
+         （安全面大、与托盘常驻定位冲突），要么按动作按需提权（ShellExecute
+         "runas" 拉起提权辅助进程 / COM 提升 Moniker），建议后续以独立辅助
+         进程承载，而非把主进程整体 highestAvailable。
+  2) DPI 感知 = Per-Monitor V2
+     Win10 1703+ 逐显示器感知缩放；Slint 渲染层按实际监视器 DPI 以物理像素
+     栅格化字体，2K/4K 高分屏不再被系统位图拉伸（不发虚）。dpiAwareness 声明
+     PerMonitorV2, PerMonitor 双值回退，另留旧式 dpiAware true/pm 兜底 8.1。
+  3) Common-Controls v6：显式依赖 comctl32 6.0，启用视觉样式（Visual Styles）。
+  4) supportedOS 显式声明 Win7 至 Win11：避免 GetVersionEx 兼容层把系统版本
+     谎报为 6.2 而触发旧行为分支。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+
+  <!-- 程序集标识：name 与可执行文件（tltoolbox.exe）同名即可，版本随发布对齐 -->
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="TLToolBox" type="win32"/>
+
+  <description>TLToolBox - 轻量级原生 Windows 桌面实用工具箱</description>
+
+  <!-- ===== Windows 通用控件 v6（Visual Styles 必需） ===== -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32"
+                        name="Microsoft.Windows.Common-Controls"
+                        version="6.0.0.0"
+                        processorArchitecture="*"
+                        publicKeyToken="6595b64144ccf1df"
+                        language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <!-- ===== UAC 执行级别：asInvoker（随启动方完整性级别运行，取舍见文件头） ===== -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- ===== 兼容性声明：显式声明支持的 Windows 版本 ===== -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a16-b84b-4c10-b011-8b7c8d9e1e5a}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </application>
+  </compatibility>
+
+  <!-- ===== DPI 感知：Per-Monitor V2（逐显示器缩放，高分屏文本不发虚） =====
+       dpiAwareness 取值顺序即优先级：PerMonitorV2 不可用（Win10 1703 之前）时
+       自动回退 PerMonitor（v1）；更老的系统（Win8.1）读旧式 dpiAware
+       "true/pm"。与 Slint/winit 运行期 SetProcessDpiAwarenessContext 调用
+       目标一致（同为 PMv2），二者不冲突。 -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+
+</assembly>
