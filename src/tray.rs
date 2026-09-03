@@ -1,0 +1,702 @@
+//! # 系统托盘与常驻生命周期（Windows 原生实现）
+//!
+//! TLToolBox 定位为**桌面常驻**工具：主窗口可以隐藏、常驻于系统通知区
+//! （System Tray），由托盘图标承载右键菜单与双击唤醒。本模块是常驻层的
+//! 底层机制，负责：
+//!
+//! - 创建托盘图标（优先使用应用图标资源，缺失时退化为**程序化生成的备用嵌入
+//!   图标**——纯代码像素绘制，零额外资源文件）；
+//! - 构建原生右键菜单（`muda` crate）：`显示主窗口` / `全部模块：开启/关闭` /
+//!   `退出程序`；
+//! - 监听托盘事件（菜单点击、双击图标），把用户意图以
+//!   [`AppEvent::TrayAction`] 发布到事件总线，由装配层的“生命周期控制器”
+//!   消费执行——托盘代码**不直接触碰** UI 与模块调度器。
+//!
+//! # 线程与消息泵模型（核心）
+//!
+//! ```text
+//! 主线程(UI/Tokio)               托盘线程(OS 专用)              总线/调度层
+//! ──────────────               ──────────────              ─────────────
+//!   lifecycle_controller  ──SyncAllModules──▶ TrayManager      EventBus
+//!    (订阅 ModuleStatus)        (控制通道 mpsc)   │  ▲             ▲  │
+//!   TrayHandle::shutdown ──▶ WM_QUIT 定向投递    │  └─ 菜单/双击 ──┘  │
+//!     (主线程收尾)               (PostThreadMessageW)   (bus.publish)  │
+//!   forward_bus_events ◀─────────────────────────────────────────────┘
+//!    (订阅总线 → UI)
+//! ```
+//!
+//! 1. **托盘线程是唯一拥有托盘资源的线程**：`TrayIcon`、`muda::Menu` 及全部
+//!    菜单项内部为 `Rc`（非 `Send`），且 Windows 上 `Shell_NotifyIcon` 的回调
+//!    消息只投递给**创建该图标的线程**。因此托盘对象在专用 OS 线程内构造、
+//!    由该线程自己运行 Win32 消息泵（`GetMessageW` → `TranslateMessage` →
+//!    `DispatchMessageW`）驱动——右键菜单、双击、气泡等回调全部在该线程
+//!    的窗口过程里触发，天然满足 tray-icon/muda 的线程亲和约束；
+//! 2. **出站只发事件、入站只收命令**：托盘线程把用户意图经
+//!    [`EventBus::publish`]（同步、无锁、非阻塞）投上事件总线；主线程把菜单
+//!    文案刷新等低频控制经 **mpsc 控制通道 + `WM_TRAY_CONTROL` 线程消息唤醒**
+//!    送回托盘线程。两个方向都是**单向、无应答、无等待**的投递；
+//! 3. **零跨线程锁**：本模块不引入任何 `Mutex`/`RwLock`。唯一的共享可变状态
+//!    是“全部模块聚合开关”缓存与菜单文案，全部位于托盘线程内部；总线事件是
+//!    值语义快照（[`AppEvent`] `Clone`），线程之间只传递值，不共享引用。
+//!
+//! # 为什么不会死锁
+//!
+//! - 托盘线程**从不阻塞等待主线程**：消息泵只在自己的队列上 `GetMessageW`
+//!   阻塞；总线发布是即发即弃的广播（无订阅者也不报错）；控制通道 send 同样
+//!   非阻塞（mpsc 有界？此处为 `sync_channel` 无界/或标准 `channel` 有界——
+//!   见下文说明，均为短指令、低频率，不会积压）；
+//! - 主线程**从不阻塞等待托盘线程**（除进程收尾时一次性 `join` 停机线程，
+//!   该线程此时已收到 `WM_QUIT` 即将退出，join 只是收尸）；
+//! - UI 更新永远走 `slint::invoke_from_event_loop` 排队到 UI 线程执行，
+//!   托盘线程/总线任务与 UI 线程之间不存在“我等你、你等我”的环。
+//!
+//! # 依赖配对说明
+//!
+//! `tray-icon 0.19` 原生依赖 `muda 0.15`（菜单类型直接互操作），二者必须同
+//! 版本使用；Slint 的 winit 后端会自引一份更新的 muda，仅服务 Slint 原生菜单
+//! 栏，与本模块的托盘菜单互不干扰（两份 muda 的全局事件通道相互独立）。
+
+use crate::bus::{AppEvent, EventBus, TrayAction};
+use std::fmt;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::thread::JoinHandle;
+
+// ---------------------------------------------------------------------------
+// 公开常量：菜单项 ID（muda 以字符串 ID 区分菜单项）
+// ---------------------------------------------------------------------------
+
+/// “显示主窗口”菜单项 ID。
+pub const MENU_ID_SHOW_WINDOW: &str = "show-window";
+/// “全部模块：开启 / 关闭”菜单项 ID（文案随聚合状态动态切换）。
+pub const MENU_ID_TOGGLE_ALL: &str = "toggle-all";
+/// “退出程序”菜单项 ID。
+pub const MENU_ID_EXIT: &str = "exit-app";
+
+/// “全部模块”菜单项文案（当前聚合状态为“全部开启”时）。
+pub const MENU_LABEL_TOGGLE_OFF: &str = "全部模块：关闭";
+/// “全部模块”菜单项文案（当前聚合状态为“非全部开启”时）。
+pub const MENU_LABEL_TOGGLE_ON: &str = "全部模块：开启";
+
+/// 由聚合状态推导“全部模块”菜单项文案。
+///
+/// 文案描述的是**点击后将要执行的动作**：全部开启时点击 = 全部关闭，
+/// 否则点击 = 全部开启。
+pub fn toggle_all_label(all_enabled: bool) -> &'static str {
+    if all_enabled {
+        MENU_LABEL_TOGGLE_OFF
+    } else {
+        MENU_LABEL_TOGGLE_ON
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 跨线程控制指令（主线程 → 托盘线程）
+// ---------------------------------------------------------------------------
+
+/// 主线程 → 托盘线程的控制指令。
+///
+/// 指令极低频（模块状态变更 / 退出时各一次），经 mpsc 控制通道投递，
+/// 并通过向托盘线程投递 `WM_TRAY_CONTROL` 消息唤醒阻塞中的消息泵。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayCommand {
+    /// 同步“全部模块”聚合开关状态（`true` = 全部开启），托盘据此刷新菜单文案。
+    SyncAllModules(bool),
+    /// 请求托盘线程退出（配合 `WM_QUIT` 定向投递，见 [`TrayControl::request_shutdown`]）。
+    Shutdown,
+}
+
+// ---------------------------------------------------------------------------
+// 错误模型（跨平台）
+// ---------------------------------------------------------------------------
+
+/// 托盘初始化 / 运行错误。
+#[derive(Debug)]
+pub enum TrayError {
+    /// 非 Windows 平台：系统托盘是 Win32（`Shell_NotifyIcon`）原生能力。
+    UnsupportedPlatform,
+    /// 托盘初始化失败（图标 / 菜单 / 系统通知区不可用等）。
+    Init {
+        /// 失败原因描述。
+        reason: String,
+    },
+    /// 无法创建托盘线程。
+    SpawnThread {
+        /// 底层 IO 错误。
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for TrayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPlatform => {
+                write!(f, "系统托盘仅支持 Windows（Shell_NotifyIcon 原生能力）")
+            }
+            Self::Init { reason } => write!(f, "托盘初始化失败: {reason}"),
+            Self::SpawnThread { source } => write!(f, "托盘线程创建失败: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for TrayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SpawnThread { source } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 公开句柄与控制端
+// ---------------------------------------------------------------------------
+
+/// 托盘控制端（`Clone` 为 O(1) 浅拷贝）。
+///
+/// 供主线程的“生命周期控制器”等**多个**消费者共享，向托盘线程投递控制
+/// 指令；所有方法均为非阻塞投递，可安全地在任意线程调用。
+#[derive(Clone)]
+pub struct TrayControl {
+    tx: mpsc::Sender<TrayCommand>,
+    /// 托盘线程 ID（`0` = 线程尚未就绪）；用于 `WM_TRAY_CONTROL` 唤醒。
+    tray_thread_id: Arc<AtomicU32>,
+}
+
+impl TrayControl {
+    /// 同步“全部模块”聚合状态，让托盘菜单文案与调度层事实收敛。
+    ///
+    /// 非阻塞：send 失败（托盘线程已退出）时静默忽略。
+    pub fn sync_all_modules(&self, enabled: bool) {
+        self.send(TrayCommand::SyncAllModules(enabled));
+    }
+
+    /// 请求托盘线程停机（进程收尾时调用；随后由 [`TrayHandle::shutdown`] join）。
+    ///
+    /// 同时投递 `WM_QUIT`：即使托盘线程正阻塞在 `GetMessageW`、甚至正停在
+    /// 右键弹出菜单的模态循环里，也能立即唤醒并使其退出。
+    pub fn request_shutdown(&self) {
+        self.send(TrayCommand::Shutdown);
+        platform::post_wm_quit(&self.tray_thread_id);
+    }
+
+    /// 底层非阻塞投递（send + 唤醒消息）。
+    fn send(&self, command: TrayCommand) {
+        if self.tx.send(command).is_ok() {
+            platform::wake_tray_thread(&self.tray_thread_id);
+        }
+    }
+}
+
+/// 托盘句柄：持有控制端与线程 join 句柄，由 [`spawn`] 返回。
+///
+/// 主线程用它把控制器任务所需的 [`TrayControl`] 克隆出去，并在进程收尾时
+/// [`shutdown`](Self::shutdown) 平滑关闭托盘线程。
+pub struct TrayHandle {
+    control: TrayControl,
+    join: Option<JoinHandle<()>>,
+}
+
+impl TrayHandle {
+    /// 克隆控制端（供生命周期控制器等后台任务共享）。
+    pub fn control(&self) -> TrayControl {
+        self.control.clone()
+    }
+
+    /// 请求停机并等待托盘线程退出（进程收尾的一次性调用）。
+    ///
+    /// 托盘线程收到 `WM_QUIT` / `Shutdown` 后立即结束消息泵、释放图标资源并
+    /// 退出；此处 join 只做收尾，不参与任何业务锁，不会死锁。
+    pub fn shutdown(mut self) {
+        self.control.request_shutdown();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for TrayHandle {
+    fn drop(&mut self) {
+        // 兜底：未显式 shutdown 即被丢弃（如启动早期错误路径）时，至少请求
+        // 托盘线程退出，避免图标残留。不在此 join——Drop 路径不阻塞调用方。
+        self.control.request_shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 平台实现门面
+// ---------------------------------------------------------------------------
+
+/// 启动系统托盘（创建托盘图标 + 右键菜单 + 后台消息泵线程）。
+///
+/// - `bus`：托盘事件（[`TrayAction`]）的发布出口；
+/// - `all_modules_enabled`：装配时刻“全部模块”的聚合状态，用于菜单初始文案。
+///
+/// 返回 [`TrayHandle`]；初始化失败（通知区不可用等）返回 [`TrayError`]，
+/// 由调用方决定降级（无托盘继续运行）而非崩溃。
+#[cfg(windows)]
+pub fn spawn(bus: EventBus, all_modules_enabled: bool) -> Result<TrayHandle, TrayError> {
+    platform::spawn_impl(bus, all_modules_enabled)
+}
+
+/// 非 Windows 兜底：系统托盘不可用（见 [`TrayError::UnsupportedPlatform`]）。
+#[cfg(not(windows))]
+pub fn spawn(_bus: EventBus, _all_modules_enabled: bool) -> Result<TrayHandle, TrayError> {
+    Err(TrayError::UnsupportedPlatform)
+}
+
+/// 非 Windows 占位实现：无托盘能力，唤醒 / 停机投递均为 no-op
+/// （`TrayControl` 的公共方法跨平台编译，但非 Windows 上永远不会产生
+/// 真实托盘线程，因此这些调用是安全的空操作）。
+#[cfg(not(windows))]
+mod platform {
+    use super::*;
+
+    /// no-op：无托盘线程可唤醒。
+    pub(super) fn wake_tray_thread(_thread_id: &Arc<AtomicU32>) {}
+
+    /// no-op：无托盘线程可停机。
+    pub(super) fn post_wm_quit(_thread_id: &Arc<AtomicU32>) {}
+}
+
+/// Windows 真实实现（见模块文档的线程模型）。
+#[cfg(windows)]
+mod platform {
+    use super::*;
+
+    use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, PostThreadMessageW,
+        TranslateMessage, WM_APP, WM_QUIT,
+    };
+
+    /// 托盘线程唤醒消息（主线程投递，非 `WM_QUIT` 时仅唤醒不携带载荷）。
+    const WM_TRAY_CONTROL: u32 = WM_APP + 0x0100;
+
+    /// 备用嵌入图标的规格（32×32，Windows 托盘按 DPI 缩放）。
+    const ICON_SIZE: usize = 32;
+
+    // ------------------------------------------------------------------
+    // 托盘管理器（托盘线程独享；非 Send —— 内部为 Rc 句柄）
+    // ------------------------------------------------------------------
+
+    /// 托盘管理器：托盘图标 + 右键菜单 + 事件路由（**托盘线程独享实例**）。
+    ///
+    /// 本结构体在托盘线程内构造与销毁，绝不跨线程移动：`muda` 菜单项内部为
+    /// `Rc<RefCell<_>>`，`tray-icon` 的隐藏窗口绑定创建线程。所有方法只能在
+    /// 拥有它的托盘线程（消息泵循环内）调用。
+    pub struct TrayManager {
+        /// 事件总线出口：菜单点击 / 双击 → [`AppEvent::TrayAction`]。
+        bus: EventBus,
+        /// 托盘图标本体（持有右键菜单；Drop 时移除图标并销毁隐藏窗口）。
+        _tray_icon: TrayIcon,
+        /// “全部模块”菜单项句柄（动态文案）。
+        toggle_all_item: MenuItem,
+        /// 托盘线程本地缓存的聚合开关状态（与菜单文案一致；由
+        /// [`TrayCommand::SyncAllModules`] 从调度层事实收敛）。
+        all_enabled: bool,
+    }
+
+    impl TrayManager {
+        /// 在**当前线程**构造托盘管理器（本函数运行于托盘线程内）。
+        ///
+        /// 任一环节失败（图标 / 菜单 / 系统通知区不可用）返回 [`TrayError`]，
+        /// 托盘线程据此上报初始化失败并退出，调用方降级为无托盘模式。
+        fn new(bus: EventBus, all_enabled: bool) -> Result<Self, TrayError> {
+            // 1) 右键菜单：显示主窗口 / 分隔 / 全部模块 / 分隔 / 退出程序。
+            let menu = Menu::new();
+            let show_item = MenuItem::with_id(MENU_ID_SHOW_WINDOW, "显示主窗口", true, None);
+            let separator_a = PredefinedMenuItem::separator();
+            let toggle_item = MenuItem::with_id(
+                MENU_ID_TOGGLE_ALL,
+                toggle_all_label(all_enabled),
+                true,
+                None,
+            );
+            let separator_b = PredefinedMenuItem::separator();
+            let exit_item = MenuItem::with_id(MENU_ID_EXIT, "退出程序", true, None);
+
+            for item in [
+                &show_item as &dyn muda::IsMenuItem,
+                &separator_a,
+                &toggle_item,
+                &separator_b,
+                &exit_item,
+            ] {
+                menu.append(item)
+                    .map_err(|err| TrayError::Init {
+                        reason: format!("右键菜单装配失败: {err}"),
+                    })?;
+            }
+
+            // 2) 图标：备用嵌入图标（纯代码像素绘制，见 build_fallback_icon）。
+            let icon = build_fallback_icon()?;
+
+            // 3) 托盘图标：绑定菜单；左键单击**不**弹出菜单（仅右键弹出，
+            //    左键保留给双击 → 显示主窗口）。
+            let tray_icon = TrayIconBuilder::new()
+                .with_tooltip("TLToolBox")
+                .with_menu(Box::new(menu))
+                .with_icon(icon)
+                .with_menu_on_left_click(false)
+                .build()
+                .map_err(|err| TrayError::Init {
+                    reason: format!("托盘图标创建失败: {err}"),
+                })?;
+
+            Ok(Self {
+                bus,
+                _tray_icon: tray_icon,
+                toggle_all_item: toggle_item,
+                all_enabled,
+            })
+        }
+
+        /// 更新聚合开关缓存与“全部模块”菜单文案（仅托盘线程内调用）。
+        fn set_all_enabled(&mut self, enabled: bool) {
+            if self.all_enabled == enabled {
+                return;
+            }
+            self.all_enabled = enabled;
+            self.toggle_all_item.set_text(toggle_all_label(enabled));
+        }
+
+        /// 处理一条菜单事件：路由为用户动作并发布到事件总线。
+        fn handle_menu_event(&mut self, event: MenuEvent) {
+            let action = if event.id == MENU_ID_SHOW_WINDOW {
+                Some(TrayAction::ShowWindow)
+            } else if event.id == MENU_ID_TOGGLE_ALL {
+                // 取反聚合缓存得到“点击将执行的目标状态”，并先行收敛文案；
+                // 调度层落定后的 ModuleStatusChanged 会经 SyncAllModules 再次校正。
+                let target = !self.all_enabled;
+                self.set_all_enabled(target);
+                Some(TrayAction::ToggleAllModules(target))
+            } else if event.id == MENU_ID_EXIT {
+                Some(TrayAction::ExitApp)
+            } else {
+                None // 未知菜单项（防御性忽略）
+            };
+
+            if let Some(action) = action {
+                self.bus.publish(AppEvent::TrayAction(action));
+            }
+        }
+
+        /// 处理一条托盘图标事件：双击左键 → 显示主窗口。
+        fn handle_tray_icon_event(&mut self, event: TrayIconEvent) {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                self.bus.publish(AppEvent::TrayAction(TrayAction::ShowWindow));
+            }
+            // 其余事件（单击、移动、进出等）暂不消费。
+        }
+
+        /// 排空控制通道（主线程 → 托盘线程的指令）。
+        fn drain_controls(&mut self, cmd_rx: &mpsc::Receiver<TrayCommand>) -> bool {
+            let mut keep_running = true;
+            while let Ok(command) = cmd_rx.try_recv() {
+                match command {
+                    TrayCommand::SyncAllModules(enabled) => self.set_all_enabled(enabled),
+                    TrayCommand::Shutdown => keep_running = false,
+                }
+            }
+            keep_running
+        }
+
+        /// 排空 muda 菜单事件通道（事件在窗口过程 / 弹出菜单模态循环中入队）。
+        fn drain_menu_events(&mut self) {
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                self.handle_menu_event(event);
+            }
+        }
+
+        /// 排空 tray-icon 图标事件通道。
+        fn drain_tray_icon_events(&mut self) {
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                self.handle_tray_icon_event(event);
+            }
+        }
+
+        /// 运行 Win32 消息泵直至停机（消费本结构体，退出时自动释放图标）。
+        fn run(mut self, cmd_rx: mpsc::Receiver<TrayCommand>) {
+            tracing::debug!(target: "tray", "托盘消息泵已启动");
+            loop {
+                // 1) 控制指令（可被 WM_TRAY_CONTROL 唤醒后到达）。
+                if !self.drain_controls(&cmd_rx) {
+                    break; // 收到 Shutdown
+                }
+                // 2) 菜单 / 图标事件（刚完成的 DispatchMessageW 可能已入队）。
+                self.drain_menu_events();
+                self.drain_tray_icon_events();
+
+                // 3) 阻塞泵取一条消息（含托盘隐藏窗口的 Shell_NotifyIcon 回调）。
+                let mut msg = MSG::default();
+                let ret = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
+                if ret.0 == 0 {
+                    break; // WM_QUIT（TrayControl::request_shutdown 定向投递）
+                }
+                if ret.0 == -1 {
+                    tracing::warn!(target: "tray", "GetMessageW 失败，托盘消息泵退出");
+                    break;
+                }
+                if msg.message != WM_TRAY_CONTROL {
+                    // 唤醒消息只用于跳出 GetMessageW，本身无载荷，无需分发。
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        let _ = DispatchMessageW(&msg);
+                    }
+                }
+            }
+            tracing::debug!(target: "tray", "托盘消息泵已退出，正在释放图标资源");
+            // self 在此析构：TrayIcon::drop → Shell_NotifyIcon(NIM_DELETE) +
+            // DestroyWindow(隐藏窗口)；菜单 HMENU 随之释放。
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 托盘线程（在独立 OS 线程上构造 TrayManager 并泵消息）
+    // ------------------------------------------------------------------
+
+    /// 在托盘线程内完成的引导：建消息队列 → 构造管理器 → 回报结果 → 泵消息。
+    fn run_tray_thread(
+        bus: EventBus,
+        all_enabled: bool,
+        cmd_rx: mpsc::Receiver<TrayCommand>,
+        init_tx: mpsc::Sender<Result<(), String>>,
+        thread_id: Arc<AtomicU32>,
+    ) {
+        // 先调用一次 PeekMessageW：确保本线程消息队列存在，之后
+        // PostThreadMessageW(WM_TRAY_CONTROL / WM_QUIT) 才能可靠送达。
+        let mut probe = MSG::default();
+        unsafe {
+            let _ = PeekMessageW(&mut probe, HWND::default(), 0, 0, PM_REMOVE);
+        }
+        thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+
+        let result = TrayManager::new(bus, all_enabled);
+        if let Err(err) = &result {
+            tracing::warn!(target: "tray", "托盘初始化失败: {err}");
+        }
+        // 先行回报：父线程据此判断 spawn 成败（管理器失败时不进入消息泵）。
+        let outcome = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|err| err.to_string());
+        let _ = init_tx.send(outcome);
+
+        if let Ok(manager) = result {
+            manager.run(cmd_rx);
+        }
+    }
+
+    /// Windows 平台实现入口：派生托盘线程并等待其初始化结果。
+    pub(super) fn spawn_impl(
+        bus: EventBus,
+        all_enabled: bool,
+    ) -> Result<TrayHandle, TrayError> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TrayCommand>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+        let thread_id = Arc::new(AtomicU32::new(0));
+
+        let join = std::thread::Builder::new()
+            .name("tltoolbox-tray".into())
+            .spawn({
+                let init_tx = init_tx.clone();
+                let thread_id = Arc::clone(&thread_id);
+                move || run_tray_thread(bus, all_enabled, cmd_rx, init_tx, thread_id)
+            })
+            .map_err(|source| TrayError::SpawnThread { source })?;
+
+        // 等待托盘线程完成图标/菜单初始化（构造失败会立即回包并退出线程）。
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(TrayHandle {
+                control: TrayControl {
+                    tx: cmd_tx,
+                    tray_thread_id: thread_id,
+                },
+                join: Some(join),
+            }),
+            Ok(Err(reason)) => {
+                let _ = join.join(); // 线程已自行退出，join 仅为收尸
+                Err(TrayError::Init { reason })
+            }
+            Err(_recv_error) => {
+                // 线程在回报前 panic / 被系统杀死。
+                Err(TrayError::Init {
+                    reason: "托盘线程在初始化完成前异常退出".into(),
+                })
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 主线程 → 托盘线程的唤醒 / 停机（见 TrayControl 的调用约定）
+    // ------------------------------------------------------------------
+
+    /// 向托盘线程投递 `WM_TRAY_CONTROL`，唤醒阻塞中的 `GetMessageW`。
+    pub(super) fn wake_tray_thread(thread_id: &Arc<AtomicU32>) {
+        let tid = thread_id.load(Ordering::Acquire);
+        if tid != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_TRAY_CONTROL, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    /// 向托盘线程投递 `WM_QUIT`（停机信号，令其消息泵返回 0 退出）。
+    pub(super) fn post_wm_quit(thread_id: &Arc<AtomicU32>) {
+        let tid = thread_id.load(Ordering::Acquire);
+        if tid != 0 {
+            unsafe {
+                let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 备用嵌入图标（程序化像素绘制）
+    // ------------------------------------------------------------------
+
+    /// 生成备用托盘图标：品牌蓝圆角方块 + 白色 “T” 字形。
+    ///
+    /// 纯代码逐像素绘制（零资源文件、零解码依赖）；若未来引入应用图标资源
+    /// （`.ico` 经 `include_bytes!` + 解码，或 `.rc` 编译进资源），可在此处
+    /// 优先加载、本函数降级为兜底。
+    fn build_fallback_icon() -> Result<Icon, TrayError> {
+        let mut rgba = vec![0u8; ICON_SIZE * ICON_SIZE * 4];
+        for y in 0..ICON_SIZE {
+            for x in 0..ICON_SIZE {
+                let pixel = pixel_color(x as i32, y as i32);
+                if let Some((r, g, b)) = pixel {
+                    let offset = (y * ICON_SIZE + x) * 4;
+                    rgba[offset] = r;
+                    rgba[offset + 1] = g;
+                    rgba[offset + 2] = b;
+                    rgba[offset + 3] = 255;
+                }
+            }
+        }
+        Icon::from_rgba(rgba, ICON_SIZE as u32, ICON_SIZE as u32).map_err(|err| {
+            TrayError::Init {
+                reason: format!("备用托盘图标生成失败: {err}"),
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 像素绘制纯函数（平台无关，可单测）
+// ---------------------------------------------------------------------------
+
+/// 备用图标品牌色（RGB）。
+const BRAND_RGB: (u8, u8, u8) = (0x2D, 0x74, 0xE8);
+/// 备用图标字形色（白色）。
+const GLYPH_RGB: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+
+/// 判定坐标是否落在备用图标的圆角方块内（32×32 画布，内边距 4）。
+pub(crate) fn inside_rounded_square(x: i32, y: i32) -> bool {
+    const X0: i32 = 4;
+    const X1: i32 = 27;
+    const Y0: i32 = 4;
+    const Y1: i32 = 27;
+    const RADIUS: i32 = 5;
+
+    // 中部十字区域（排除四角）。
+    if (X0 + RADIUS..=X1 - RADIUS).contains(&x) && (Y0..=Y1).contains(&y) {
+        return true;
+    }
+    if (Y0 + RADIUS..=Y1 - RADIUS).contains(&y) && (X0..=X1).contains(&x) {
+        return true;
+    }
+    // 四角圆弧（1/4 圆）。
+    let corners = [
+        (X0 + RADIUS, Y0 + RADIUS),
+        (X1 - RADIUS, Y0 + RADIUS),
+        (X0 + RADIUS, Y1 - RADIUS),
+        (X1 - RADIUS, Y1 - RADIUS),
+    ];
+    corners
+        .iter()
+        .any(|&(cx, cy)| (x - cx).pow(2) + (y - cy).pow(2) <= RADIUS.pow(2))
+}
+
+/// 判定坐标是否落在白色 “T” 字形内（横梁 + 中柱）。
+pub(crate) fn inside_glyph_t(x: i32, y: i32) -> bool {
+    // 横梁：y ∈ [8, 11]，x ∈ [9, 22]。
+    let bar = (8..=11).contains(&y) && (9..=22).contains(&x);
+    // 中柱：x ∈ [14, 17]，y ∈ [12, 23]。
+    let stem = (12..=23).contains(&y) && (14..=17).contains(&x);
+    bar || stem
+}
+
+/// 计算 32×32 备用图标上某像素的颜色；`None` = 透明。
+pub(crate) fn pixel_color(x: i32, y: i32) -> Option<(u8, u8, u8)> {
+    if inside_glyph_t(x, y) {
+        Some(GLYPH_RGB)
+    } else if inside_rounded_square(x, y) {
+        Some(BRAND_RGB)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 单元测试（纯函数层，跨平台）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_label_flips_with_aggregate_state() {
+        assert_eq!(toggle_all_label(true), MENU_LABEL_TOGGLE_OFF);
+        assert_eq!(toggle_all_label(false), MENU_LABEL_TOGGLE_ON);
+    }
+
+    #[test]
+    fn rounded_square_covers_center_and_excludes_corners() {
+        assert!(inside_rounded_square(16, 16), "画布中心应在方块内");
+        assert!(inside_rounded_square(5, 16), "左边带应在方块内");
+        assert!(!inside_rounded_square(0, 0), "画布角落应透明");
+        assert!(!inside_rounded_square(31, 31), "右下角应透明");
+        assert!(!inside_rounded_square(16, 31), "下边缘外应透明");
+    }
+
+    #[test]
+    fn glyph_t_is_drawn_inside_and_centered() {
+        assert!(inside_glyph_t(15, 10), "横梁中部应着色");
+        assert!(inside_glyph_t(16, 20), "中柱下部应着色");
+        assert!(!inside_glyph_t(10, 20), "横梁下方两侧应留给底色");
+        assert!(inside_rounded_square(10, 20), "但仍在圆角方块内（品牌蓝）");
+        // 像素合成：字形内为白色，字形外方块内为品牌蓝，方块外透明。
+        assert_eq!(pixel_color(15, 10), Some(GLYPH_RGB));
+        assert_eq!(pixel_color(10, 20), Some(BRAND_RGB));
+        assert_eq!(pixel_color(0, 0), None);
+    }
+
+    #[test]
+    fn icon_canvas_is_fully_filled_within_bounds() {
+        // 整幅画布上每个像素都能求出颜色（含透明），不越界不 panic。
+        for y in 0..32 {
+            for x in 0..32 {
+                let _ = pixel_color(x, y);
+            }
+        }
+        // 字形必须被方块完全包住（保证视觉上不“穿帮”）。
+        for y in 0..32 {
+            for x in 0..32 {
+                if inside_glyph_t(x, y) {
+                    assert!(inside_rounded_square(x, y), "字形像素必须位于方块内: ({x},{y})");
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,20 @@
+# ---- Rust build artifacts ----
+/target
+**/*.rs.bk
+# NOTE: Cargo.lock is intentionally NOT ignored — TLToolBox ships a single-file
+# native binary (release: opt-level "z" + LTO), so the lockfile is committed to
+# pin dependency versions and guarantee reproducible release builds.
+
+# ---- IDE / editor config ----
+.idea/
+.vscode/
+*.suo
+*.user
+
+# ---- Logs & runtime output ----
+*.log
+config/*.local.toml
+
+# ---- Retired-agent-era planning doc (kept local only, out of VCS) ----
+# 计划书.md describes the superseded "LLM Agent workstation" direction dropped in v0.2.0.
+/计划书.md

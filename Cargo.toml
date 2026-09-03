@@ -1,0 +1,73 @@
+[package]
+name = "tltoolbox"
+version = "0.2.0"
+edition = "2021"
+build = "build.rs"
+
+# 架构转型说明（自 0.2.0 起）：TLToolBox 已从「大模型 Agent 工作站」裁撤为
+# 「专注桌面常驻与开关控制的轻量级原生 Windows 工具箱」：
+#   - 移除 LLM / HTTP 依赖（reqwest、serde_json 随 agent 层一并退役）；
+#   - 保留纯本地基础设施：slint（UI）、tokio（异步运行时）、serde + toml
+#     （配置持久化）、tracing（日志）、chrono（时间戳）等核心库；
+#   - windows crate 按「按需启用」原则扩展 Win32_System_Registry 以承载
+#     基于注册表（HKCU\...\CurrentVersion\Run）的开机自启能力。
+
+[dependencies]
+slint = "1.9"
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = "0.4"
+
+# 系统托盘（常驻生命周期核心）：tray-icon 负责 Shell_NotifyIcon 图标与事件回调，
+# muda 负责原生右键菜单。两者版本必须配对——tray-icon 0.19.x 依赖 muda 0.15.x，
+# 类型（Menu / MenuItem）直接互操作，故此处固定该配对；注意 Slint 的 winit 后端
+# 会自引一份更新的 muda（仅服务 Slint 原生菜单栏，与本托盘菜单互不干扰）。
+[target.'cfg(windows)'.dependencies]
+muda = "0.15"
+tray-icon = "0.19"
+
+# 原生 Win32 API 绑定（仅 Windows 目标生效）。feature 精确挑选、避免全量编译膨胀：
+#   - Win32_Foundation            ：HWND / WPARAM / LPARAM / HKEY / WIN32_ERROR 等基础句柄
+#                                 与错误码类型（Registry 与 UI 两路共用）
+#   - Win32_UI_WindowsAndMessaging：GetMessageW / DispatchMessageW / PeekMessageW /
+#                                  PostThreadMessageW / PostMessageW / TranslateMessage、
+#                                  MSG 结构、EVENT_OBJECT_*、WINEVENT_*、WM_* 常量
+#   - Win32_System_Threading      ：GetCurrentThreadId（泵线程注册 / WM_QUIT 定向投递）
+#   - Win32_UI_Accessibility      ：SetWinEventHook / UnhookWinEvent / HWINEVENTHOOK / WINEVENTPROC
+#   - Win32_System_Registry       ：RegOpenKeyExW / RegSetValueExW / RegQueryValueExW /
+#                                  RegDeleteValueW（开机自启读写的注册表 API）
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_System_Registry",
+]
+
+[build-dependencies]
+slint-build = "1.9"
+
+# ---- 发布构建：极致体积压制 ----
+# TLToolBox 交付单文件原生可执行程序（release 为无控制台 GUI 子系统），体积与
+# 冷启动速度优先，故发布配置以“压缩体积”为唯一目标：
+#   - opt-level = "z"   ：以 -Oz 等效语义优化（体积优先于执行速度）；
+#   - lto = true        ：全程序链接期优化（跨 crate 内联 + 死代码裁剪）；
+#   - codegen-units = 1 ：单代码生成单元，最大化 LTO 优化窗口；
+#   - strip = true      ：剥离符号表与调试信息（等价 strip = "symbols"）；
+#   - incremental=false ：发布构建不做增量缓存（避免缓存拖慢单次发布编译）。
+# 说明：刻意不设 panic = "abort"——tokio::spawn 依赖 catch_unwind 把任务内
+# panic 捕获进 JoinHandle；abort 语义会把后台任务的单次崩溃升级为整个进程终止，
+# 与「错误隔离、优雅降级」的常驻工具定位冲突，故保留默认 unwind 语义。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+incremental = false

@@ -1,0 +1,406 @@
+//! # 配置引擎：Serde TOML 持久化（阶段二 · 架构转型后）
+//!
+//! 应用级配置以结构化 TOML 落盘（高可读性、可手改、可纳入版本管理），由
+//! [`ConfigManager`] 提供**异步**的读取与写入能力：
+//!
+//! - 原子写盘：先写同目录临时文件再 `rename` 覆盖，杜绝进程崩溃 / 断电导致的半截文件；
+//! - 写入串行化：内部写锁保证并发 `save` 不互相穿插（仍为 last-write-wins 语义）；
+//! - 字段级向前兼容：旧版配置缺少新增字段时按各字段默认值补齐，而不是整体解析失败；
+//! - 坏配置保护：TOML 解析失败时返回 [`ConfigError::Parse`]，**绝不**静默覆盖用户数据。
+//!
+//! # 常驻行为与注册表同步（架构转型后）
+//!
+//! [`AppConfig`] 的 `auto_start_windows` 是“是否跟随系统开机自启”的**唯一事实源**。
+//! 本模块保持纯净——`load` / `save` 只读写 TOML 文件，不触碰注册表；实际的自启
+//! 镜像由 [`crate::autostart`] 完成：装配层在 **`ConfigManager::load()` 返回后
+//! 立即**调用 [`crate::autostart::synchronize_autostart`]，把配置字段与
+//! `HKCU\...\CurrentVersion\Run` 收敛（配置开启而注册表缺失/路径漂移 → 补写；
+//! 配置关闭而注册表残留 → 删除；已一致 → 空操作）。同步失败仅告警降级，
+//! 不阻断启动（“优雅同步”）。
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use tokio::fs;
+use tokio::sync::Mutex;
+
+/// 默认配置文件相对路径（相对进程工作目录）。
+pub const DEFAULT_CONFIG_PATH: &str = "config/tltoolbox.toml";
+
+/// 应用级配置结构。
+///
+/// 每个字段均带 `#[serde(default = ...)]`：解析时若文件中缺失该键，将回退到
+/// 对应的默认值而非报错，使旧版本配置文件在新增配置项后仍可无缝加载。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppConfig {
+    /// 应用启动后应自动拉起（`toggle(id, true)`）的模块 ID 列表，按序启动。
+    #[serde(default = "AppConfig::default_auto_start_modules")]
+    pub auto_start_modules: Vec<String>,
+    /// 是否跟随系统开机自启（写入注册表 Run 键，见 [`crate::autostart`]）。
+    ///
+    /// 配置为准：启动装配层在配置加载后据此同步注册表实际状态。
+    #[serde(default = "AppConfig::default_auto_start_windows")]
+    pub auto_start_windows: bool,
+    /// 点击窗口关闭按钮时是否仅最小化到托盘而非退出进程（常驻行为；托盘
+    /// 生命周期由后续常驻层消费本字段）。
+    #[serde(default = "AppConfig::default_minimize_to_tray")]
+    pub minimize_to_tray: bool,
+    /// 各模块的自定义参数（模块 ID → 配置值），供模块级扩展配置使用。
+    #[serde(default)]
+    pub module_custom_params: HashMap<String, String>,
+}
+
+impl AppConfig {
+    fn default_auto_start_modules() -> Vec<String> {
+        vec!["popup_blocker".to_string()]
+    }
+
+    fn default_auto_start_windows() -> bool {
+        false
+    }
+
+    fn default_minimize_to_tray() -> bool {
+        true
+    }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            auto_start_modules: Self::default_auto_start_modules(),
+            auto_start_windows: Self::default_auto_start_windows(),
+            minimize_to_tray: Self::default_minimize_to_tray(),
+            module_custom_params: HashMap::new(),
+        }
+    }
+}
+
+/// 配置读写错误（携带失败路径与底层原因，便于 UI / 日志直接展示）。
+#[derive(Debug)]
+pub enum ConfigError {
+    /// 文件系统层错误（读取 / 建目录 / 写临时文件 / 原子替换失败等）。
+    Io {
+        /// 触发错误的文件路径。
+        path: PathBuf,
+        /// 底层 IO 错误。
+        source: std::io::Error,
+    },
+    /// 配置内容不是合法 TOML，或与 `AppConfig` 结构不兼容。
+    Parse {
+        /// 被解析的配置文件路径。
+        path: PathBuf,
+        /// 底层 TOML 解析错误。
+        source: toml::de::Error,
+    },
+    /// 配置序列化为 TOML 失败（理论上仅当出现非字符串键等极端情况）。
+    Serialize {
+        /// 正在写入的配置文件路径。
+        path: PathBuf,
+        /// 底层 TOML 序列化错误。
+        source: toml::ser::Error,
+    },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Io { path, source } => {
+                write!(f, "配置文件 '{}' 访问失败: {source}", path.display())
+            }
+            ConfigError::Parse { path, source } => {
+                write!(f, "配置文件 '{}' 解析失败: {source}", path.display())
+            }
+            ConfigError::Serialize { path, source } => {
+                write!(f, "配置序列化失败（目标 '{}'）: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::Io { source, .. } => Some(source),
+            ConfigError::Parse { source, .. } => Some(source),
+            ConfigError::Serialize { source, .. } => Some(source),
+        }
+    }
+}
+
+/// 配置管理器：负责单个配置文件的异步加载与原子持久化。
+///
+/// 全部方法均为 `&self` 异步调用，内部状态仅含目标路径与写锁，可在任务间以
+/// `Arc<ConfigManager>` 安全共享。
+pub struct ConfigManager {
+    /// 配置文件路径。
+    file_path: PathBuf,
+    /// 串行化并发 `save` 的写锁（防止两份写入互相穿插产生撕裂文件）。
+    write_lock: Mutex<()>,
+}
+
+impl ConfigManager {
+    /// 指向指定路径构造配置管理器。
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        Self {
+            file_path: path.as_ref().to_path_buf(),
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    /// 当前配置文件路径（供日志与 UI 展示）。
+    pub fn path(&self) -> &Path {
+        &self.file_path
+    }
+
+    /// 异步加载配置。
+    ///
+    /// 语义约定：
+    /// - 文件**不存在**（首次运行）→ 生成并落盘默认配置后返回之（启动引导）；
+    /// - 文件**存在但解析失败** → 返回 [`ConfigError::Parse`]，保留原文件内容不动，
+    ///   由调用方决定是上报错误还是回退内存默认值；
+    /// - 其他 IO 错误 → 原样上抛。
+    ///
+    /// 注意：本方法只读 TOML 文件。若调用方需要“加载后同步注册表自启状态”，
+    /// 应在返回值到手后调用 [`crate::autostart::synchronize_autostart`]
+    /// （见模块文档与 `crate::main` 的装配示例）。
+    pub async fn load(&self) -> Result<AppConfig, ConfigError> {
+        match fs::read_to_string(&self.file_path).await {
+            Ok(content) => toml::from_str(&content).map_err(|source| ConfigError::Parse {
+                path: self.file_path.clone(),
+                source,
+            }),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                // 首次运行引导：落盘默认配置。落盘失败不阻断启动——以内存默认值继续，
+                // 等待后续某次 save 成功时再补写。
+                let default_cfg = AppConfig::default();
+                if let Err(save_err) = self.save(&default_cfg).await {
+                    tracing::warn!(
+                        target: "config",
+                        "无法自动创建默认配置文件 '{}': {save_err}（本次以内存默认值运行）",
+                        self.file_path.display()
+                    );
+                }
+                Ok(default_cfg)
+            }
+            Err(source) => Err(ConfigError::Io {
+                path: self.file_path.clone(),
+                source,
+            }),
+        }
+    }
+
+    /// 异步保存配置：临时文件 + 原子替换，保证任意时刻磁盘上都存在一份完整配置。
+    ///
+    /// 写锁仅在本次写入期间持有，且不存在嵌套加锁，无死锁隐患。
+    pub async fn save(&self, config: &AppConfig) -> Result<(), ConfigError> {
+        let _write_guard = self.write_lock.lock().await;
+
+        let content = toml::to_string_pretty(config).map_err(|source| ConfigError::Serialize {
+            path: self.file_path.clone(),
+            source,
+        })?;
+
+        // 确保父目录存在（默认路径为 `config/tltoolbox.toml`，首次写入时目录尚未创建）。
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|source| ConfigError::Io {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+            }
+        }
+
+        // 1) 写入同目录临时文件（保证与目标文件处于同一文件系统，rename 才可能原子）。
+        let tmp_path = self.tmp_path();
+        if let Err(source) = fs::write(&tmp_path, content.as_bytes()).await {
+            return Err(ConfigError::Io {
+                path: tmp_path,
+                source,
+            });
+        }
+
+        // 2) 原子替换目标文件。失败时尽力清理临时文件，避免残留。
+        if let Err(source) = fs::rename(&tmp_path, &self.file_path).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(ConfigError::Io {
+                path: self.file_path.clone(),
+                source,
+            });
+        }
+
+        tracing::debug!(
+            target: "config",
+            "配置已落盘: '{}'",
+            self.file_path.display()
+        );
+        Ok(())
+    }
+
+    /// 与目标文件同目录的临时文件路径（`<文件名>.tmp`）。
+    fn tmp_path(&self) -> PathBuf {
+        let file_name = self
+            .file_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.file_path.with_file_name(format!("{file_name}.tmp"))
+    }
+}
+
+impl Default for ConfigManager {
+    /// 指向默认路径 `config/tltoolbox.toml`。
+    fn default() -> Self {
+        Self::new(DEFAULT_CONFIG_PATH)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 在系统临时目录构造一个本次测试独有的配置文件路径。
+    fn temp_cfg_path(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("系统时钟应晚于 UNIX 纪元")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "tltoolbox-{tag}-{}-{nanos}.toml",
+            std::process::id()
+        ))
+    }
+
+    async fn remove_if_exists(path: &Path) {
+        let _ = fs::remove_file(path).await;
+    }
+
+    #[test]
+    fn default_config_has_expected_values() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.auto_start_modules, vec!["popup_blocker".to_string()]);
+        assert!(!cfg.auto_start_windows, "开机自启默认应为关闭（显式开启才写注册表）");
+        assert!(cfg.minimize_to_tray, "关闭按钮最小化到托盘默认应开启（桌面常驻定位）");
+        assert!(cfg.module_custom_params.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_then_load_roundtrips() {
+        let path = temp_cfg_path("roundtrip");
+        remove_if_exists(&path).await;
+
+        let mgr = ConfigManager::new(&path);
+        let mut cfg = AppConfig::default();
+        cfg.auto_start_modules = vec!["popup_blocker".into(), "fake_module".into()];
+        cfg.auto_start_windows = true;
+        cfg.minimize_to_tray = false;
+        cfg.module_custom_params
+            .insert("popup_blocker".into(), "aggressive".into());
+
+        mgr.save(&cfg).await.expect("保存应成功");
+        let loaded = mgr.load().await.expect("加载应成功");
+        assert_eq!(loaded, cfg, "往返读写应保持一致");
+
+        remove_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn load_on_missing_file_bootstraps_default_config() {
+        let path = temp_cfg_path("bootstrap");
+        remove_if_exists(&path).await;
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("文件缺失时应引导默认配置而非报错");
+        assert_eq!(cfg, AppConfig::default());
+        assert!(path.exists(), "引导后默认配置应已落盘");
+
+        remove_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_toml_returns_parse_error_and_keeps_file() {
+        let path = temp_cfg_path("malformed");
+        remove_if_exists(&path).await;
+        fs::write(&path, "这不是合法 TOML = [").await.unwrap();
+        let original = fs::read_to_string(&path).await.unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let err = mgr.load().await.expect_err("坏配置应返回 Parse 错误");
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "应为 Parse 变体，实际: {err:?}"
+        );
+
+        // 坏文件必须原样保留，禁止静默覆盖。
+        let after = fs::read_to_string(&path).await.unwrap();
+        assert_eq!(after, original, "解析失败时不得改动用户文件");
+
+        remove_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn partial_toml_fills_missing_fields_with_defaults() {
+        let path = temp_cfg_path("partial");
+        remove_if_exists(&path).await;
+        // 精简配置只声明 auto_start_modules：常驻字段应回退默认值，解析不得失败。
+        fs::write(&path, "auto_start_modules = [\"popup_blocker\"]\n")
+            .await
+            .unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("缺字段应回退默认值而非报错");
+        assert_eq!(cfg.auto_start_modules, vec!["popup_blocker".to_string()]);
+        assert_eq!(cfg.auto_start_windows, AppConfig::default().auto_start_windows);
+        assert_eq!(cfg.minimize_to_tray, AppConfig::default().minimize_to_tray);
+        assert!(cfg.module_custom_params.is_empty());
+
+        remove_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_agent_config_with_llm_keys_is_tolerated_and_dropped_on_save() {
+        let path = temp_cfg_path("legacy-agent");
+        remove_if_exists(&path).await;
+        // 旧 Agent 版配置文件含 llm 键：转型后应被容忍（未知键忽略），
+        // 常驻字段回退默认值；且再次序列化时 llm 键不得复现。
+        fs::write(
+            &path,
+            "auto_start_modules = [\"popup_blocker\"]\n\
+             llm_api_base = \"http://127.0.0.1:11434/v1\"\n\
+             llm_model = \"qwen2.5:7b\"\n",
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("旧版 llm 键应被忽略而非报错");
+        assert_eq!(cfg.auto_start_modules, vec!["popup_blocker".to_string()]);
+        assert_eq!(cfg.auto_start_windows, AppConfig::default().auto_start_windows);
+        assert_eq!(cfg.minimize_to_tray, AppConfig::default().minimize_to_tray);
+
+        let serialized = toml::to_string_pretty(&cfg).expect("重新序列化应成功");
+        assert!(
+            !serialized.contains("llm_api_base") && !serialized.contains("llm_model"),
+            "转型后配置不得再携带 llm 字段: {serialized}"
+        );
+
+        remove_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_keys_are_tolerated() {
+        let path = temp_cfg_path("unknown");
+        remove_if_exists(&path).await;
+        // 结构未声明未来版本可能新增的键：应被忽略，不得整体报错。
+        fs::write(&path, "auto_start_windows = true\nfuture_section = { a = 1 }\n")
+            .await
+            .unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("未知键应被容忍");
+        assert!(cfg.auto_start_windows, "已声明键仍应正常解析");
+
+        remove_if_exists(&path).await;
+    }
+}

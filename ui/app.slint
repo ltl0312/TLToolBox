@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// ui/app.slint — TLToolBox「桌面实用工具箱」单栏界面（自双栏重构回归纯工具开关）。
+//
+// 语法目标：Slint 1.9 语言规范（兼容至本仓库 Cargo.lock 锁定的 1.17.x；改动须保持
+// 双向可编译：不引入 1.9 之后新增的语法，也不使用已被后续版本弃用的旧 API）。
+//
+// 布局总览（480 × 560 适中单栏小窗体 · 深色专业风）
+// ┌────────────────────────────────────────────────────────┐
+// │ TLToolBox  [ v0.2.0 ]         全部停用   全部启用        │ ← 顶部系统与全局控制栏
+// │ 原生 Windows 轻量工具箱 · 桌面常驻     开机自启  [开关]   │    标题/小版本号/自启/一键全开全关
+// ├────────────────────────────────────────────────────────┤
+// │  ┌ 模块名（加粗白字）        ●运行中/○已停止  [开关]    ┐ │ ← ScrollView 流式卡片列表
+// │  │ 详细用途描述（淡灰细字）                          │ │
+// │  └───────────────────────────────────────────────────┘ │
+// │  （……更多模块卡片，超出自动滚动……）                       │
+// └────────────────────────────────────────────────────────┘
+//
+// 数据契约（供 Rust 侧 include_modules! 后经 VecModel 填充）：
+//   - modules:          ModuleItem 列表（id/name/desc/enabled）
+//   - autostart_enabled: 全局开机自启当前生效状态（注册表为准）
+//   - app-version:       界面小版本号（默认与 Cargo.toml 对齐，可由装配层覆盖）
+// 回调契约：
+//   - toggle_module(id, enabled)     ← 模块卡片 Switch 拨动
+//   - toggle_autostart(enabled)      ← 全局「开机自启」Switch 拨动
+//   - toggle_all_modules(enabled)    ← 「全部启用 / 全部停用」按钮点击
+//
+// 注：随双栏日志控制台退役，LogEntry 已从本文件移除；运行日志改由 tracing 承载。
+
+import { Switch, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+// —— 模块列表条目：与调度层 ModuleMeta 一一对应 ——
+export struct ModuleItem {
+    id: string,
+    name: string,
+    desc: string,
+    enabled: bool,
+}
+
+// —— 全局暗色主题令牌（zinc 底 + 翡翠强调；统一取色，避免魔法数字散落） ——
+export global Theme {
+    in-out property <color> window-bg: #18181b;       // 窗口底
+    in-out property <color> card-bg: #27272a;         // 卡片底
+    in-out property <color> card-bg-hover: #2e2e33;   // 卡片悬停底
+    in-out property <color> card-border: #34343a;     // 卡片描边
+    in-out property <color> card-border-hover: #4c4c55;
+    in-out property <color> divider: #26262b;         // 顶栏分隔线
+    in-out property <color> text-strong: #ffffff;     // 标题 / 模块名
+    in-out property <color> text-primary: #e4e4e7;    // 一般正文
+    in-out property <color> text-secondary: #a1a1aa;  // 描述
+    in-out property <color> text-muted: #71717a;      // 弱化辅助文字
+    in-out property <color> accent-strong: #34d399;   // 强调（运行态文字）
+    in-out property <color> running-dot: #4ade80;     // 运行中绿点
+    in-out property <color> stopped-dot: #52525b;     // 已停止灰点
+    in-out property <color> pill-bg: #10b9811a;       // 版本徽标底
+    in-out property <color> pill-border: #10b98140;
+    in-out property <color> pill-text: #6ee7b7;
+    in-out property <color> btn-bg: #1d1d21;          // 轻量按钮底
+    in-out property <color> btn-bg-hover: #26262b;
+    in-out property <color> btn-bg-pressed: #323238;
+    in-out property <color> btn-border: #3f3f46;
+    in-out property <color> btn-border-hover: #62626b;
+}
+
+// —— 轻量操作按钮：全部启用 / 全部停用（幽灵样式，低打扰） ——
+component GhostButton inherits Rectangle {
+    in property <string> text: "";
+    callback clicked;
+
+    width: 76px;
+    height: 26px;
+    border-radius: 7px;
+    border-width: 1px;
+    background: Theme.btn-bg;
+    border-color: Theme.btn-border;
+
+    states [
+        hover when ghost-touch.has-hover && !ghost-touch.pressed : {
+            background: Theme.btn-bg-hover;
+            border-color: Theme.btn-border-hover;
+        }
+        pressed when ghost-touch.pressed : {
+            background: Theme.btn-bg-pressed;
+            border-color: Theme.btn-border-hover;
+        }
+    ]
+    animate background, border-color { duration: 100ms; }
+
+    Text {
+        text: root.text;
+        font-size: 12px;
+        font-weight: 600;
+        color: Theme.text-primary;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ghost-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 模块卡片：名称 / 描述 / 状态徽标 / 物理开关 ——
+component ModuleCard inherits Rectangle {
+    in property <ModuleItem> module;
+    callback toggled(bool);
+
+    height: 62px;
+    background: Theme.card-bg;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.card-border;
+
+    states [
+        hover when card-hover.has-hover : {
+            background: Theme.card-bg-hover;
+            border-color: Theme.card-border-hover;
+        }
+    ]
+    animate background, border-color { duration: 120ms; }
+
+    // 悬停感应层置于最底层：不拦截上层 Switch / 文本区域的点击。
+    card-hover := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    HorizontalBox {
+        padding-left: 14px;
+        padding-right: 12px;
+        spacing: 12px;
+
+        // 名称（加粗白字）+ 描述（淡灰细字）：宽度弹性吸收，保证右侧控件恒靠右
+        VerticalBox {
+            spacing: 3px;
+            horizontal-stretch: 1;
+            alignment: center; // 主轴（纵向）居中：文本块在 62px 卡片内垂直居中
+
+            Text {
+                text: root.module.name;
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text-strong;
+                overflow: elide;
+                min-height: 19px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.module.desc;
+                font-size: 10.5px;
+                color: Theme.text-secondary;
+                overflow: elide;
+                min-height: 15px;
+                vertical-alignment: center;
+            }
+        }
+
+        // 右侧控件组：状态徽标 + 物理开关（各自内容垂直居中，天然对齐同一中线）
+        HorizontalBox {
+            spacing: 12px;
+            alignment: center;
+
+            // 状态徽标：运行中绿点 / 已停止灰点（跟随调度层真实运行态着色）
+            HorizontalBox {
+                spacing: 6px;
+
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 4px;
+                    background: root.module.enabled ? Theme.running-dot : Theme.stopped-dot;
+                }
+                Text {
+                    text: root.module.enabled ? "运行中" : "已停止";
+                    font-size: 10px;
+                    color: root.module.enabled ? Theme.accent-strong : Theme.text-muted;
+                    vertical-alignment: center;
+                }
+            }
+
+            // 硬开关：状态以 modules 模型为唯一真源；点击即上报回调，底层落定后的
+            // 权威状态（含失败回滚）由 Rust 经事件总线刷新模型驱动本绑定收敛。
+            Switch {
+                checked: root.module.enabled;
+                toggled => {
+                    root.toggled(self.checked);
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "TLToolBox - 桌面实用工具箱";
+    width: 480px;
+    height: 560px;
+    background: Theme.window-bg;
+    // 界面文案为中英混排（模块名 / 描述含中文），统一使用覆盖 CJK 的 UI 字体；
+    // 若偏好在纯西文环境还原原生观感，可改回 "Segoe UI"。
+    default-font-family: "Microsoft YaHei UI";
+
+    // ===== 对外暴露的只读数据（由 Rust 装配层注入） =====
+    in property <[ModuleItem]> modules;
+    in property <bool> autostart_enabled;
+    in property <string> app-version: "0.2.0";
+
+    // ===== 对外回调（由 Rust 装配层实现） =====
+    callback toggle_module(string, bool);
+    callback toggle_autostart(bool);
+    callback toggle_all_modules(bool);
+
+    // ============================================================
+    //  顶部系统与全局控制栏 + 单栏模块卡片流
+    // ============================================================
+    VerticalBox {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 18px;
+        padding-bottom: 14px;
+        spacing: 12px;
+
+        // ─── 行 1：品牌标题 / 小版本号 / 一键全开全关 ───
+        // 行内元素高度由行自然高度决定（默认交叉轴拉伸填充）；
+        // 固定尺寸的小元素以 y 公式垂直居中，撑满行的文本用垂直居中排字。
+        HorizontalBox {
+            spacing: 10px;
+
+            Text {
+                text: "TLToolBox";
+                font-size: 19px;
+                font-weight: 700;
+                color: Theme.text-strong;
+                min-height: 26px;
+                vertical-alignment: center;
+            }
+
+            // 小版本号徽标（固定 20px 高，y 公式垂直居中）
+            Rectangle {
+                width: 66px;
+                height: 20px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 10px;
+                background: Theme.pill-bg;
+                border-width: 1px;
+                border-color: Theme.pill-border;
+
+                Text {
+                    text: "v" + root.app-version;
+                    font-size: 10.5px;
+                    font-weight: 600;
+                    color: Theme.pill-text;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            GhostButton {
+                text: "全部停用";
+                clicked => { root.toggle_all_modules(false); }
+            }
+            GhostButton {
+                text: "全部启用";
+                clicked => { root.toggle_all_modules(true); }
+            }
+        }
+
+        // ─── 行 2：副标题 + 全局开机自启开关 ───
+        HorizontalBox {
+            spacing: 10px;
+
+            Text {
+                text: "原生 Windows 轻量工具箱 · 桌面常驻";
+                font-size: 11px;
+                color: Theme.text-muted;
+                vertical-alignment: center;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Text {
+                text: "开机自启";
+                font-size: 12px;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+            Switch {
+                checked: root.autostart_enabled;
+                toggled => {
+                    root.toggle_autostart(self.checked);
+                }
+            }
+        }
+
+        // 分隔线：控制栏与卡片区之间的层级边界
+        Rectangle {
+            height: 1px;
+            background: Theme.divider;
+        }
+
+        // ─── 核心功能卡片区：ScrollView 流式滚动列表 ───
+        module-scroll := ScrollView {
+            vertical-stretch: 1;
+
+            VerticalBox {
+                padding-right: 8px; // 预留纵向滚动条悬浮带
+                padding-bottom: 4px;
+                spacing: 10px;
+                width: module-scroll.visible-width; // 卡片宽度钉住视口，滚动条不横向挤压内容
+
+                for item in modules: ModuleCard {
+                    module: item;
+                    toggled(checked) => {
+                        root.toggle_module(item.id, checked);
+                    }
+                }
+            }
+        }
+    }
+}
