@@ -26,7 +26,7 @@
 //! 4. **总线装配**：`EventBus`（`tokio::sync::broadcast`，容量 256）注入模块管理器
 //!    作为广播出口；
 //! 5. **模块注册**：注册内置常驻守护模块（[`PopupBlockerModule`] 弹窗拦截、
-//!    [`KeepAwakeModule`] 系统防休眠）；
+//!    [`KeepAwakeModule`] 系统防休眠、[`ClipboardPurifierModule`] 剪贴板纯文本净化）；
 //! 6. **自动启动模块**：按配置对 `auto_start_modules` 执行 `toggle(id, true)`——
 //!    **先于 UI 装配**，启动期广播事件因尚无订阅者而被总线按设计丢弃，随后以调度
 //!    层**真实状态快照**填充 UI 初始模型，保证“界面即事实”；
@@ -60,6 +60,7 @@ use tltoolbox::autostart;
 use tltoolbox::bus::{AppEvent, EventBus, TrayAction};
 use tltoolbox::config::ConfigManager;
 use tltoolbox::manager::{ModuleManager, SharedManager};
+use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::PopupBlockerModule;
 use tltoolbox::tray::{self, TrayControl};
@@ -325,6 +326,9 @@ async fn main() -> Result<(), AppError> {
     //      默认自动启动列表——阻止系统睡眠属「显式开启才合理」的电源行为改变，避免
     //      首次安装即静默改写用户机器的空闲休眠策略（由用户在 UI / 托盘手动开启）。
     module_mgr.register(Arc::new(KeepAwakeModule::new()));
+    //      剪贴板纯文本净化模块：无参构造即可注册。同样**不**进入默认自动启动列表——
+    //      剪贴板行为改写（自动剥离富文本格式）属用户预期敏感的操作，显式开启才合理。
+    module_mgr.register(Arc::new(ClipboardPurifierModule::new()));
     let shared_mgr: SharedManager = Arc::new(module_mgr);
     let registered_modules: Vec<&str> = shared_mgr
         .get_metadata_list()

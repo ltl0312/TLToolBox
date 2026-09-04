@@ -43,6 +43,12 @@ tray-icon = "0.19"
 #                                  RegDeleteValueW（开机自启读写的注册表 API）
 #   - Win32_System_Power          ：SetThreadExecutionState / EXECUTION_STATE / ES_*
 #                                  （系统防休眠模块阻止睡眠与熄屏的执行状态 API）
+#   - Win32_System_DataExchange   ：AddClipboardFormatListener / RemoveClipboardFormatListener /
+#                                  OpenClipboard / CloseClipboard / EmptyClipboard /
+#                                  GetClipboardData / SetClipboardData / RegisterClipboardFormatW
+#                                  （剪贴板纯文本净化模块的监听与净化 API）
+#   - Win32_System_Memory         ：GlobalAlloc / GlobalLock / GlobalUnlock / GlobalSize /
+#                                  GMEM_MOVEABLE（净化时分配 / 锁定跨进程 HGLOBAL 文本块）
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
@@ -52,6 +58,8 @@ features = [
     "Win32_UI_Accessibility",
     "Win32_System_Registry",
     "Win32_System_Power",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ]
 
 [build-dependencies]

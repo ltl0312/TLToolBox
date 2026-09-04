@@ -58,3 +58,6 @@ pub mod keep_awake;
 
 /// Win32 弹窗拦截模块（阶段一原生落地实现）。
 pub mod popup_blocker;
+
+/// 剪贴板纯文本净化模块（阶段三原生落地：第三个常驻守护模块）。
+pub mod clipboard_purifier;
