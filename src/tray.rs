@@ -9,7 +9,7 @@
 //!   此处读取帧目录并解码 DIB 帧；资源缺失或格式异常时降级为**程序化生成的
 //!   备用嵌入图标**——纯代码像素绘制，零额外资源文件）；
 //! - 构建原生右键菜单（`muda` crate）：`显示主窗口` / `全部模块：开启/关闭` /
-//!   `退出程序`；
+//!   （未提权时额外渲染）`以管理员身份重启` / `退出程序`；
 //! - 监听托盘事件（菜单点击、双击图标），把用户意图以
 //!   [`AppEvent::TrayAction`] 发布到事件总线，由装配层的“生命周期控制器”
 //!   消费执行——托盘代码**不直接触碰** UI 与模块调度器。
@@ -81,8 +81,15 @@ use std::thread::JoinHandle;
 pub const MENU_ID_SHOW_WINDOW: &str = "show-window";
 /// “全部模块：开启 / 关闭”菜单项 ID（文案随聚合状态动态切换）。
 pub const MENU_ID_TOGGLE_ALL: &str = "toggle-all";
+/// “以管理员身份重启”菜单项 ID（**仅未提权**运行形态下渲染，见 [`spawn`] 的
+/// `elevated` 参数）。点击后发布 [`TrayAction::RestartAsAdmin`]，由装配层的
+/// 生命周期控制器执行 [`crate::platform::restart_as_admin`]（UAC 确认 → 平滑收尾）。
+pub const MENU_ID_RESTART_ADMIN: &str = "restart-admin";
 /// “退出程序”菜单项 ID。
 pub const MENU_ID_EXIT: &str = "exit-app";
+
+/// “以管理员身份重启”菜单项文案。
+pub const MENU_LABEL_RESTART_ADMIN: &str = "以管理员身份重启";
 
 /// “全部模块”菜单项文案（当前聚合状态为“全部开启”时）。
 pub const MENU_LABEL_TOGGLE_OFF: &str = "全部模块：关闭";
@@ -241,18 +248,30 @@ impl Drop for TrayHandle {
 /// 启动系统托盘（创建托盘图标 + 右键菜单 + 后台消息泵线程）。
 ///
 /// - `bus`：托盘事件（[`TrayAction`]）的发布出口；
-/// - `all_modules_enabled`：装配时刻“全部模块”的聚合状态，用于菜单初始文案。
+/// - `all_modules_enabled`：装配时刻“全部模块”的聚合状态，用于菜单初始文案；
+/// - `elevated`：当前进程是否处于**提权（管理员）**状态。为 `false`（常规运行，
+///   受 UIPI 限制无法向高权限窗口投递关闭消息）时，右键菜单额外渲染
+///   「以管理员身份重启」项（[`MENU_ID_RESTART_ADMIN`]）；为 `true` 时隐藏该项
+///   ——已提权的实例不需要也无权再自我提权，避免无意义地重复弹 UAC。
 ///
 /// 返回 [`TrayHandle`]；初始化失败（通知区不可用等）返回 [`TrayError`]，
 /// 由调用方决定降级（无托盘继续运行）而非崩溃。
 #[cfg(windows)]
-pub fn spawn(bus: EventBus, all_modules_enabled: bool) -> Result<TrayHandle, TrayError> {
-    platform::spawn_impl(bus, all_modules_enabled)
+pub fn spawn(
+    bus: EventBus,
+    all_modules_enabled: bool,
+    elevated: bool,
+) -> Result<TrayHandle, TrayError> {
+    platform::spawn_impl(bus, all_modules_enabled, elevated)
 }
 
 /// 非 Windows 兜底：系统托盘不可用（见 [`TrayError::UnsupportedPlatform`]）。
 #[cfg(not(windows))]
-pub fn spawn(_bus: EventBus, _all_modules_enabled: bool) -> Result<TrayHandle, TrayError> {
+pub fn spawn(
+    _bus: EventBus,
+    _all_modules_enabled: bool,
+    _elevated: bool,
+) -> Result<TrayHandle, TrayError> {
     Err(TrayError::UnsupportedPlatform)
 }
 
@@ -331,8 +350,9 @@ mod platform {
         ///
         /// 任一环节失败（图标 / 菜单 / 系统通知区不可用）返回 [`TrayError`]，
         /// 托盘线程据此上报初始化失败并退出，调用方降级为无托盘模式。
-        fn new(bus: EventBus, all_enabled: bool) -> Result<Self, TrayError> {
-            // 1) 右键菜单：显示主窗口 / 分隔 / 全部模块 / 分隔 / 退出程序。
+        fn new(bus: EventBus, all_enabled: bool, elevated: bool) -> Result<Self, TrayError> {
+            // 1) 右键菜单：显示主窗口 / 分隔 / 全部模块 / 分隔 /
+            //    （未提权时：以管理员身份重启 /）退出程序。
             let menu = Menu::new();
             let show_item = MenuItem::with_id(MENU_ID_SHOW_WINDOW, "显示主窗口", true, None);
             let separator_a = PredefinedMenuItem::separator();
@@ -343,14 +363,12 @@ mod platform {
                 None,
             );
             let separator_b = PredefinedMenuItem::separator();
-            let exit_item = MenuItem::with_id(MENU_ID_EXIT, "退出程序", true, None);
 
             for item in [
                 &show_item as &dyn muda::IsMenuItem,
                 &separator_a,
                 &toggle_item,
                 &separator_b,
-                &exit_item,
             ] {
                 menu.append(item)
                     .map_err(|err| TrayError::Init {
@@ -358,7 +376,29 @@ mod platform {
                     })?;
             }
 
-            // 2) 图标：优先从 exe 内嵌图标资源（build.rs 嵌入的 res/app.ico）
+            // 2) 提权入口：仅在未提权（受 UIPI 限制、拦截高权限窗口可能失败）时
+            //    渲染；已提权实例隐藏该项——菜单在启动装配时按 `elevated` 快照
+            //    一次性定型，进程生命周期内提权状态不会漂移，无需运行期增删。
+            if !elevated {
+                let restart_item = MenuItem::with_id(
+                    MENU_ID_RESTART_ADMIN,
+                    MENU_LABEL_RESTART_ADMIN,
+                    true,
+                    None,
+                );
+                menu.append(&restart_item)
+                    .map_err(|err| TrayError::Init {
+                        reason: format!("右键菜单装配失败: {err}"),
+                    })?;
+            }
+
+            let exit_item = MenuItem::with_id(MENU_ID_EXIT, "退出程序", true, None);
+            menu.append(&exit_item)
+                .map_err(|err| TrayError::Init {
+                    reason: format!("右键菜单装配失败: {err}"),
+                })?;
+
+            // 3) 图标：优先从 exe 内嵌图标资源（build.rs 嵌入的 res/app.ico）
             //    解码 32×32 帧；资源缺失 / 非 32bpp DIB / 解析失败时降级为
             //    纯代码像素绘制的备用图标，保证托盘任何构建形态下都有图标。
             let icon = match load_embedded_app_icon() {
@@ -375,7 +415,7 @@ mod platform {
                 }
             };
 
-            // 3) 托盘图标：绑定菜单；左键单击**不**弹出菜单（仅右键弹出，
+            // 4) 托盘图标：绑定菜单；左键单击**不**弹出菜单（仅右键弹出，
             //    左键保留给双击 → 显示主窗口）。
             let tray_icon = TrayIconBuilder::new()
                 .with_tooltip("TLToolBox")
@@ -414,6 +454,10 @@ mod platform {
                 let target = !self.all_enabled;
                 self.set_all_enabled(target);
                 Some(TrayAction::ToggleAllModules(target))
+            } else if event.id == MENU_ID_RESTART_ADMIN {
+                // 提权重启（仅未提权菜单渲染该项）：发布到总线，由装配层生命周期
+                // 控制器执行 restart_as_admin（UAC 确认 → 成功则平滑收尾退出）。
+                Some(TrayAction::RestartAsAdmin)
             } else if event.id == MENU_ID_EXIT {
                 Some(TrayAction::ExitApp)
             } else {
@@ -519,6 +563,7 @@ mod platform {
     fn run_tray_thread(
         bus: EventBus,
         all_enabled: bool,
+        elevated: bool,
         cmd_rx: mpsc::Receiver<TrayCommand>,
         init_tx: mpsc::Sender<Result<(), String>>,
         thread_id: Arc<AtomicU32>,
@@ -535,7 +580,7 @@ mod platform {
         // 供消息泵识别「再次启动 exe」投递来的 HWND_BROADCAST 唤醒消息。
         let wakeup_message_id = crate::single_instance::register_wakeup_message();
 
-        let result = TrayManager::new(bus, all_enabled);
+        let result = TrayManager::new(bus, all_enabled, elevated);
         if let Err(err) = &result {
             tracing::warn!(target: "tray", "托盘初始化失败: {err}");
         }
@@ -555,6 +600,7 @@ mod platform {
     pub(super) fn spawn_impl(
         bus: EventBus,
         all_enabled: bool,
+        elevated: bool,
     ) -> Result<TrayHandle, TrayError> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<TrayCommand>();
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
@@ -565,7 +611,7 @@ mod platform {
             .spawn({
                 let init_tx = init_tx.clone();
                 let thread_id = Arc::clone(&thread_id);
-                move || run_tray_thread(bus, all_enabled, cmd_rx, init_tx, thread_id)
+                move || run_tray_thread(bus, all_enabled, elevated, cmd_rx, init_tx, thread_id)
             })
             .map_err(|source| TrayError::SpawnThread { source })?;
 

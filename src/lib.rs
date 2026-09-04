@@ -5,6 +5,7 @@
 //! 不再存在网络依赖。工程维持「库 + 二进制」双目标：
 //!
 //! - **库（本文件）**：承载全部本地业务基础设施——注册表开机自启（[`autostart`]）、
+//!   平台权限门面（[`platform`]：管理员权限检测与提权重启）、
 //!   事件总线（[`bus`]）、配置引擎（[`config`]）、日志子系统（[`logging`]，
 //!   按天滚动落盘 + WorkerGuard 刷盘守卫）、模块调度器（[`manager`]）、
 //!   系统托盘与常驻生命周期（[`tray`]）、单实例守护（[`single_instance`]）与常驻守护模块（[`modules`]）。`tests/` 下的集成测试与 `src/main.rs`
@@ -25,5 +26,6 @@ pub mod config;
 pub mod logging;
 pub mod manager;
 pub mod modules;
+pub mod platform;
 pub mod single_instance;
 pub mod tray;

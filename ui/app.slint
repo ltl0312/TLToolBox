@@ -22,15 +22,23 @@
 //   - popup_rules:        弹窗拦截黑名单关键词（规则弹窗的列表数据源）
 //   - show_rules_modal:   「规则管理」弹窗展示开关（由 Rust 装配层驱动）
 //   - autostart_enabled:  全局开机自启当前生效状态（注册表为准）
+//   - elevated:           提权（管理员）状态（启动装配层注入）：true = 标题旁渲染
+//                         「管理员 (Admin)」翡翠徽标并隐藏提权入口；false = 渲染醒目
+//                         盾牌提权按钮（突破 UIPI 拦截限制的入口）
 //   - app-version:        界面小版本号（默认与 Cargo.toml 对齐，可由装配层覆盖）
+//   - toast_message:      Toast 提示文案（Rust 侧统一 show_toast 写入）
+//   - show_toast:         Toast 显示开关（置 true 弹入，2.5s 后自动收回 / 点击胶囊即提前关闭）
 // 回调契约：
 //   - toggle_module(id, enabled)      ← 模块卡片 Switch 拨动
 //   - toggle_autostart(enabled)       ← 全局「开机自启」Switch 拨动
 //   - toggle_all_modules(enabled)     ← 「全部启用 / 全部停用」按钮点击
+//   - request_elevate()               ← 盾牌提权按钮点击（Rust 侧经 UAC 确认后以管理员
+//                                       身份重启，见 crate::platform::restart_as_admin）
 //   - open_rules_modal()              ← 模块卡片齿轮点击（Rust 灌入最新规则后置 show=true）
 //   - close_rules_modal()             ← 弹窗「×」/ 遮罩空白点击
 //   - add_rule(keyword)               ← 弹窗底部「添加」（含输入框回车）
 //   - remove_rule(index)              ← 规则行右侧红色删除按钮
+//   - trigger_toast(string)           （预留）UI 内任意元素请求 Toast（Rust 侧与 show_toast 同入口）
 //
 // 注：随双栏日志控制台退役，LogEntry 已从本文件移除；运行日志改由 tracing 承载。
 
@@ -70,6 +78,17 @@ export global Theme {
     in-out property <color> btn-border: #3f3f46;
     in-out property <color> btn-border-hover: #62626b;
 
+    // —— 管理员徽标 / 提权盾牌按钮（UIPI 突围入口）专用令牌 ——
+    in-out property <color> admin-badge-bg: #10b98121;        // 管理员徽标底（翡翠淡底）
+    in-out property <color> admin-badge-border: #10b98159;    // 管理员徽标描边
+    in-out property <color> admin-badge-text: #6ee7b7;        // 管理员徽标文字（翡翠色）
+    in-out property <color> elevate-bg: #f59e0b1f;            // 盾牌按钮底（琥珀淡底，醒目）
+    in-out property <color> elevate-bg-hover: #f59e0b38;
+    in-out property <color> elevate-bg-pressed: #f59e0b52;
+    in-out property <color> elevate-border: #f59e0b80;
+    in-out property <color> elevate-border-hover: #fbbf24b3;
+    in-out property <color> elevate-icon: #fbbf24;            // 盾牌图形着色（琥珀金）
+
     // —— 规则管理弹窗专用令牌 ——
     in-out property <color> overlay-scrim: #0b0b0ecc;    // 遮罩半透明黑
     in-out property <color> dialog-bg: #202024;          // 弹窗卡片底
@@ -84,6 +103,11 @@ export global Theme {
     in-out property <color> accent-fg: #06281a;          // 实底按钮上的文字
     in-out property <color> accent-bg-disabled: #10b98133;
     in-out property <color> accent-fg-disabled: #a1a1aa;
+
+    // —— Toast 轻量操作反馈专用令牌 ——
+    in-out property <color> toast-bg: #27272ae6;    // 胶囊底：zinc-800(#27272a) 派生，~90% 不透明（浮于内容上轻微透底）
+    in-out property <color> toast-border: #3f3f46;  // 胶囊细描边
+    in-out property <color> toast-text: #ffffff;    // 胶囊正文（纯白）
 }
 
 // —— 轻量操作按钮：全部启用 / 全部停用（幽灵样式，低打扰） ——
@@ -126,6 +150,71 @@ component GhostButton inherits Rectangle {
         width: parent.width;
         height: parent.height;
         clicked => { root.clicked(); }
+    }
+}
+
+// —— 提权盾牌按钮：标题旁的醒目提权入口（仅未提权形态渲染） ——
+// 琥珀金描边 + 淡琥珀底，与全界面锌灰/翡翠基调刻意区分——它在视觉上宣告
+// “当前运行权限受限，点击可一键提权重启以突破 UIPI 弹窗拦截限制”。
+component ElevateButton inherits Rectangle {
+    callback clicked;
+
+    width: 28px;
+    height: 26px;
+    border-radius: 8px;
+    background: Theme.elevate-bg;
+    border-width: 1px;
+    border-color: Theme.elevate-border;
+
+    states [
+        hover when elevate-touch.has-hover && !elevate-touch.pressed : {
+            background: Theme.elevate-bg-hover;
+            border-color: Theme.elevate-border-hover;
+        }
+        pressed when elevate-touch.pressed : {
+            background: Theme.elevate-bg-pressed;
+            border-color: Theme.elevate-border-hover;
+        }
+    ]
+    animate background, border-color { duration: 100ms; }
+
+    Image {
+        source: @image-url("icons/shield.svg");
+        colorize: Theme.elevate-icon;
+        width: 15px;
+        height: 15px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    elevate-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 管理员徽标：标题 / 版本旁的翡翠色小徽标（仅已提权形态渲染） ——
+// 与版本号徽标同高同族的“翡翠胶囊”；存在即向用户确认“当前实例已以管理员权限
+// 运行，弹窗拦截已突破 UIPI 限制”，同时提权按钮 / 托盘提权菜单随之隐藏。
+component AdminBadge inherits Rectangle {
+    width: 104px;
+    height: 20px;
+    border-radius: 10px;
+    background: Theme.admin-badge-bg;
+    border-width: 1px;
+    border-color: Theme.admin-badge-border;
+
+    Text {
+        text: "管理员 (Admin)";
+        font-size: 10px;
+        font-weight: 600;
+        color: Theme.admin-badge-text;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 }
 
@@ -557,6 +646,59 @@ component RulesModal inherits Rectangle {
     }
 }
 
+// —— Toast 轻量操作反馈：窗口底部居中的半透明悬浮胶囊 ——
+//
+// 输入架构（沿用 RulesModal 的「常驻挂载 + 状态驱动」思路，规避隐藏层拦截交互）：
+//   - 组件根铺满窗口但完全透明、不含任何 TouchArea —— 纯定位容器，鼠标事件天然穿透；
+//   - 真正可视的胶囊仅在自身区域内放置 TouchArea，且 `enabled: root.show`
+//     （Slint 语义：disabled 的 TouchArea 把事件穿透给下层元素），因此 Toast 隐藏时
+//     绝不在窗口底部形成点击 / 滚轮黑洞；
+//   - 展示与收回均走 150ms 过渡：opacity 淡入淡出 + y 轴 8px 轻微位移（入场轻微上浮、
+//     离场轻微下沉），动画只作用于胶囊本体，透明定位层无感知；
+//   - 点击胶囊本体 → 上抛 dismissed，由装配点（MainWindow）复位 show_toast 提前关闭；
+//     2.5s 自动收回由 Rust 侧 Tokio 延迟任务驱动（复位同一属性，对已隐藏态幂等）。
+component Toast inherits Rectangle {
+    in property <string> message: "";
+    in property <bool> show: false;
+    callback dismissed;
+
+    background: transparent;
+
+    capsule := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 24px + (root.show ? 0px : 8px);
+        width: 200px;
+        height: 34px;
+        border-radius: 17px;
+        background: Theme.toast-bg;
+        border-width: 1px;
+        border-color: Theme.toast-border;
+        opacity: root.show ? 1.0 : 0.0;
+        animate opacity, y { duration: 150ms; easing: ease-out; }
+
+        Text {
+            text: root.message;
+            font-size: 12px;
+            font-weight: 500;
+            color: Theme.toast-text;
+            overflow: elide;
+            width: parent.width;
+            height: parent.height;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        toast-touch := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            enabled: root.show;
+            clicked => { root.dismissed(); }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "TLToolBox - 桌面实用工具箱";
     width: 480px;
@@ -571,12 +713,20 @@ export component MainWindow inherits Window {
     in property <[string]> popup_rules;
     in property <bool> show_rules_modal: false;
     in property <bool> autostart_enabled;
+    // 提权（管理员）状态：true → 标题旁「管理员 (Admin)」翡翠徽标；false → 盾牌提权按钮。
+    in property <bool> elevated: false;
     in property <string> app-version: "0.2.0";
+
+    // ===== Toast 轻量操作反馈（Rust 侧经统一 show_toast 驱动；UI 点击胶囊可提前关闭） =====
+    in-out property <string> toast_message: "";
+    in-out property <bool> show_toast: false;
+    callback trigger_toast(string);
 
     // ===== 对外回调（由 Rust 装配层实现） =====
     callback toggle_module(string, bool);
     callback toggle_autostart(bool);
     callback toggle_all_modules(bool);
+    callback request_elevate();
     callback open_rules_modal();
     callback close_rules_modal();
     callback add_rule(string);
@@ -592,7 +742,7 @@ export component MainWindow inherits Window {
         padding-bottom: 14px;
         spacing: 12px;
 
-        // ─── 行 1：品牌标题 / 小版本号 / 一键全开全关 ───
+        // ─── 行 1：品牌标题 / 小版本号 / 提权状态指示 / 一键全开全关 ───
         // 行内元素高度由行自然高度决定（默认交叉轴拉伸填充）；
         // 固定尺寸的小元素以 y 公式垂直居中，撑满行的文本用垂直居中排字。
         HorizontalBox {
@@ -607,8 +757,9 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
             }
 
-            // 小版本号徽标（固定 20px 高，y 公式垂直居中）
-            Rectangle {
+            // 小版本号徽标（固定 20px 高，y 公式垂直居中）。提权形态下让位给
+            // 「管理员 (Admin)」徽标（版本号仍可从 About / exe 属性查得）。
+            if !root.elevated : Rectangle {
                 width: 66px;
                 height: 20px;
                 y: (parent.height - self.height) / 2;
@@ -628,6 +779,16 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                 }
             }
+
+            // —— 提权状态指示 / 提权入口（UIPI 突围，与托盘菜单联动） ——
+            // 未提权：渲染琥珀盾牌按钮（醒目提权入口：点击 → UAC 确认 → 以管理员
+            //         身份重启，突破「向高权限窗口投递 WM_CLOSE 被静默丢弃」限制）；
+            // 已提权：渲染翡翠「管理员 (Admin)」徽标并隐藏入口——已提权的实例
+            //         不需要也无意义再自我提权。
+            if !root.elevated : ElevateButton {
+                clicked => { root.request_elevate(); }
+            }
+            if root.elevated : AdminBadge { }
 
             Rectangle { horizontal-stretch: 1; }
 
@@ -709,5 +870,19 @@ export component MainWindow inherits Window {
         close-requested => { root.close_rules_modal(); }
         add-requested(keyword) => { root.add_rule(keyword); }
         remove-requested(index) => { root.remove_rule(index); }
+    }
+
+    // ============================================================
+    //  根层级 Toast 悬浮胶囊（声明在规则遮罩之后 → 层级最高：即使弹窗开着，
+    //  操作反馈也始终浮在最上层，不被遮罩 / 弹窗卡片遮挡）
+    // ============================================================
+    toast := Toast {
+        width: root.width;
+        height: root.height;
+        message: root.toast_message;
+        show: root.show_toast;
+
+        // 点击胶囊本体 → 提前关闭（复位显隐；Rust 侧定时收回对已隐藏态幂等）。
+        dismissed => { root.show_toast = false; }
     }
 }

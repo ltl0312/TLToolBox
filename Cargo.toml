@@ -63,6 +63,11 @@ tray-icon = "0.19"
 #                                  （剪贴板纯文本净化模块的监听与净化 API）
 #   - Win32_System_Memory         ：GlobalAlloc / GlobalLock / GlobalUnlock / GlobalSize /
 #                                  GMEM_MOVEABLE（净化时分配 / 锁定跨进程 HGLOBAL 文本块）
+#   - Win32_UI_Shell              ：ShellExecuteW（提权重启：以 "runas" 动词经 UAC 拉起
+#                                  高权限副本，见 src/platform.rs）。注意 windows 0.58 的
+#                                  ShellExecuteW 本体按 Win32_UI_WindowsAndMessaging 门控，
+#                                  但 Win32::UI::Shell 模块路径本身须启用本 feature 才存在，
+#                                  故二者缺一不可。
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
 features = [
@@ -76,6 +81,7 @@ features = [
     "Win32_System_Power",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_UI_Shell",
 ]
 
 [build-dependencies]

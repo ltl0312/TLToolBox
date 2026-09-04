@@ -58,7 +58,8 @@
 //! 9. **回调绑定**：模块开关 `toggle_module` 派发异步启停；全局「开机自启」
 //!    `toggle_autostart` 写注册表并持久化配置后回读收敛；「全部启用 / 全部停用」
 //!    `toggle_all_modules` 复用托盘的全量切换路径——三者落定后的真实状态均回流
-//!    UI（失败场景自然回滚开关）；弹窗拦截额外注册**规则管理闭环**：齿轮点击
+//!    UI（失败场景自然回滚开关）；四类动作在**成功落定 / 生效**后另经统一 `show_toast`
+//!    弹出底部 Toast 轻量反馈气泡（2.5s 自动淡出 / 点击即关，见函数体 8.0）；弹窗拦截额外注册**规则管理闭环**：齿轮点击
 //!    拉取 `current_rules` 灌入弹窗；新增 / 删除同步热更新模块内 RuleStore、
 //!    经单写者通道异步落盘 `popup_blacklist`、再回读归一化结果刷新弹窗列表——
 //!    规则事实源始终是模块内存态，配置与 UI 均自其收敛（详见函数体 8.4）；
@@ -69,10 +70,18 @@
 //!     “显示主窗口”经 `invoke_from_event_loop` 在 UI 线程还原窗口，“全部模块：开启/
 //!     关闭”逐模块 toggle，“退出程序”调度 `slint::quit_event_loop` 进入收尾；模块
 //!     状态事件回写托盘菜单文案（`TrayControl::sync_all_modules`，非阻塞投递）。
+//! 11. **权限提权整合**（UIPI 突围）：启动早期 0.3 读取一次 [`platform::is_elevated`]
+//!     快照——**未提权**时 UI 顶部渲染盾牌提权按钮、托盘菜单渲染「以管理员身份重启」；
+//!     **已提权**时标题旁渲染“管理员 (Admin)”翡翠徽标、两处入口均隐藏。入口经
+//!     [`trigger_admin_restart`]（单飞 + `spawn_blocking`）执行
+//!     [`platform::restart_as_admin`]：`ShellExecuteW("runas")` 拉起提权副本后，本
+//!     进程调度 `quit_event_loop` 平滑收尾退出；新副本凭 `RESTART_MARKER_ARG` 跳过
+//!     单实例「第二实例退出」路径（见 0.2 特例）完成接管。
 
 slint::include_modules!();
 
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, VecModel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
@@ -81,6 +90,7 @@ use tltoolbox::bus::{AppEvent, EventBus, TrayAction};
 use tltoolbox::config::{AppConfig, ConfigManager};
 use tltoolbox::logging;
 use tltoolbox::manager::{ModuleManager, SharedManager};
+use tltoolbox::platform;
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::PopupBlockerModule;
@@ -160,6 +170,122 @@ fn deliver_popup_rules_refresh(ui_weak: &slint::Weak<MainWindow>, rules: Vec<Str
     if queued.is_err() {
         tracing::warn!(target: "main", "无法投递规则列表刷新：UI 事件循环已不可用");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Toast 轻量操作反馈（统一入口：任意线程可调用；事件循环内显隐 + Tokio 定时收回）
+// ---------------------------------------------------------------------------
+
+/// Toast 展示时长：2.5s 后由延迟任务自动收回（收回即触发 Slint 侧 150ms 淡出动画）。
+const TOAST_DISPLAY_DURATION: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Toast 世代号：每次触发自增，供「定时收回」任务判别自己是否已被更新的触发取代。
+///
+/// 为什么需要：连续快速操作会先后展示多条 Toast（如增删规则、全量启停）。若无世代
+/// 判别，前一条 Toast 的 2.5s 收回定时器到期时会无差别地把**后一条**正在展示的
+/// Toast 提前关掉。世代号在触发时前进，旧任务的收回回调醒来后发现世代号已过即放弃，
+/// 让新 Toast 完整展示自己的时长。
+static TOAST_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 【任意线程可调用】在窗口底部中央展示一条 Toast（轻量操作反馈气泡）。
+///
+/// 职责与线程模型（与本文件其它 UI 投递一致，见 [`deliver_module_sync`]）：
+///   1. 经 [`slint::invoke_from_event_loop`] 把「写入文案 + `show_toast = true`」
+///      排队到 UI 线程 —— 跨线程载荷仅 `Weak<MainWindow>`（Slint 保证 `Send`）
+///      与 `SharedString`，模型 / 窗口对象从不跨线程移动；
+///   2. 另起 Tokio 延迟任务：`TOAST_DISPLAY_DURATION`（2.5s）后再次经事件循环
+///      复位 `show_toast = false`，Slint 侧随之播放 150ms 淡出 / 下沉离场过渡。
+///
+/// 提前关闭：点击 Toast 胶囊由 Slint 侧直接复位 `show_toast`（不占用本函数）；其后的
+/// 定时收回对已隐藏状态是幂等空操作。调用方须在动作**成功落定 / 生效后**才调用本函数，
+/// 失败路径仅告警回滚，不弹 Toast。
+fn show_toast(ui_weak: &slint::Weak<MainWindow>, message: &str) {
+    // 世代号先行自增：本次触发即宣告所有更早的「定时收回」任务过期。
+    let epoch = TOAST_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // 转拥有态：事件循环闭包要求 'static，文案须随闭包移动而非借用调用方栈。
+    let message = SharedString::from(message);
+
+    // 1) 展示：写入文案并亮起胶囊（排队到 UI 线程执行）。
+    let show_weak = ui_weak.clone();
+    let queued = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = show_weak.upgrade() {
+            ui.set_toast_message(message);
+            ui.set_show_toast(true);
+        }
+    });
+    if queued.is_err() {
+        tracing::warn!(target: "main", "无法投递 Toast 展示：UI 事件循环已不可用");
+        return;
+    }
+
+    // 2) 自动收回：2.5s 后复位显隐；若期间已有更新的 Toast 触发（世代号前进）则放弃，
+    //    避免把新提示提前关掉。事件循环已退出时投递失败静默忽略（进程正在收尾）。
+    let hide_weak = ui_weak.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(TOAST_DISPLAY_DURATION).await;
+        if TOAST_EPOCH.load(Ordering::Relaxed) != epoch {
+            return;
+        }
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = hide_weak.upgrade() {
+                ui.set_show_toast(false);
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 提权重启（突破 UIPI 的核心入口：UI 盾牌按钮与托盘菜单共用）
+// ---------------------------------------------------------------------------
+
+/// 「以管理员身份重启」请求的单飞守卫。
+///
+/// [`platform::restart_as_admin`] 会同步阻塞在 UAC 确认框上；若不闭锁，用户
+/// 在确认框停留期间的连点会堆叠出多个 UAC 提示。首次请求置位后即闭锁，直到
+/// 请求**落定**：成功 → 进程即将退出（无需复位）；失败（用户取消等）→ 复位，
+/// 允许用户稍后再次发起新一轮提权请求。
+static ADMIN_RESTART_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// 【任意线程可调用】以管理员身份重启当前实例（UI 盾牌按钮 / 托盘菜单共用入口）。
+///
+/// 流程：
+/// 1. 单飞检查：已有一份提权重启请求在途（UAC 确认框打开中）时静默忽略重复触发；
+/// 2. [`tokio::task::spawn_blocking`] 执行 [`platform::restart_as_admin`]——同步
+///    Win32 调用移出 UI 线程与 Tokio 工作线程，UAC 确认期间应用其余部分照常响应；
+/// 3. 成功（`ShellExecuteW("runas")` 已拉起提权实例）→ 调度 `slint::quit_event_loop`：
+///    主线程沿既有平滑收尾路径（逆序停模块 → 关托盘 → 释放单实例互斥）退出旧进程；
+///    新实例凭 [`platform::RESTART_MARKER_ARG`] 完成单实例握手接管；
+/// 4. 失败（用户取消 UAC / 账户无权提权 / 系统错误）→ 复位单飞闭锁并给出告警 +
+///    Toast 反馈，应用原样继续运行，用户可再次发起。
+fn trigger_admin_restart(ui_weak: &slint::Weak<MainWindow>) {
+    if ADMIN_RESTART_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        tracing::debug!(target: "main", "忽略重复的提权重启请求（已有请求在途）");
+        return;
+    }
+    let weak = ui_weak.clone();
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(platform::restart_as_admin).await {
+            Ok(Ok(())) => {
+                tracing::info!(target: "main", "提权实例已确认启动，调度旧进程平滑收尾");
+                let _ = slint::invoke_from_event_loop(|| {
+                    let _ = slint::quit_event_loop();
+                });
+            }
+            Ok(Err(err)) => {
+                // 最常见的失败 = 用户在 UAC 确认框选择“否”/直接取消（错误码 1223）；
+                // 此时应用必须原样存活，仅向用户反馈原因，并复位闭锁允许重试。
+                ADMIN_RESTART_IN_FLIGHT.store(false, Ordering::SeqCst);
+                tracing::warn!(target: "main", "以管理员身份重启失败（应用继续运行）: {err}");
+                show_toast(&weak, &format!("以管理员身份重启失败：{err}"));
+            }
+            Err(err) => {
+                ADMIN_RESTART_IN_FLIGHT.store(false, Ordering::SeqCst);
+                tracing::error!(target: "main", "提权重启阻塞任务执行异常: {err}");
+                show_toast(&weak, "以管理员身份重启任务异常，请重试");
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +470,12 @@ async fn lifecycle_controller(
                         let _ = slint::quit_event_loop();
                     });
                 }
+                TrayAction::RestartAsAdmin => {
+                    // 托盘「以管理员身份重启」（仅未提权菜单渲染该项）：与 UI 盾牌
+                    // 按钮共用 trigger_admin_restart——成功则经平滑收尾退出旧进程，
+                    // 提权副本凭 RESTART_MARKER_ARG 完成单实例握手接管。
+                    trigger_admin_restart(&ui_weak);
+                }
             },
             Ok(AppEvent::AppLogAppended { .. }) => {
                 // 双栏日志控制台已退役：运行日志由 tracing 承载，此处忽略。
@@ -393,6 +525,18 @@ async fn main() -> Result<(), AppError> {
     //          b) 立即退出本进程（return Ok(())，无任何资源被二次注册）。
     //          主实例的互斥句柄由 `_instance_guard` 守卫持有到 main 作用域结束
     //          （进程平滑收尾时 Drop → CloseHandle 自动释放）。
+    //          特例——提权重启握手期（命令行含 RESTART_MARKER_ARG）：新（高权限）
+    //          实例由旧实例的 ShellExecuteW("runas") 拉起，而旧实例尚持有互斥、要等
+    //          平滑收尾才释放；此时“检测到既有实例”不是重复启动而是预期的交接，
+    //          故跳过 b) 的退出路径、降级为无互斥继续装配（旧实例必然随即退出）。
+    let restarting_elevated = std::env::args().any(|arg| arg == platform::RESTART_MARKER_ARG);
+    if restarting_elevated {
+        tracing::info!(
+            target: "main",
+            "检测到 {0}：本进程为提权重启的后继实例",
+            platform::RESTART_MARKER_ARG
+        );
+    }
     let _instance_guard = match single_instance::acquire() {
         Ok(single_instance::SingleInstanceOutcome::Primary(guard)) => {
             tracing::info!(
@@ -400,6 +544,15 @@ async fn main() -> Result<(), AppError> {
                 "单实例守护已就绪：本进程为唯一实例，互斥句柄持有至退出"
             );
             Some(guard)
+        }
+        Ok(single_instance::SingleInstanceOutcome::Secondary { .. }) if restarting_elevated => {
+            // 提权重启交接：既有（旧权限）实例仍短暂持有互斥，但已进入收尾退出
+            // 流程。本进程不夺互斥（夺到也会在旧实例退出后失效），直接无守护继续。
+            tracing::info!(
+                target: "main",
+                "提权重启握手期：既有实例即将退出并释放互斥，本实例跳过「第二实例退出」路径继续装配"
+            );
+            None
         }
         Ok(single_instance::SingleInstanceOutcome::Secondary {
             wakeup_delivered,
@@ -421,6 +574,17 @@ async fn main() -> Result<(), AppError> {
             None
         }
     };
+
+    //      0.3 提权状态快照：读取一次（进程生命周期内不会漂移），供托盘菜单与 UI
+    //          决定「以管理员身份重启」入口的展示形态——未提权展示入口（UIPI 限制
+    //          下拦截高权限弹窗可能失败），已提权展示“管理员”徽标并隐藏入口。
+    let elevated = platform::is_elevated();
+    tracing::info!(
+        target: "main",
+        elevated,
+        "管理员权限状态：{}（提权后可拦截高完整性进程弹窗）",
+        if elevated { "已提权" } else { "未提权" }
+    );
 
     // ---- 1. 配置加载：首次运行自动落盘默认 TOML，随后异步加载。 ----
     let config_mgr = Arc::new(ConfigManager::default());
@@ -519,10 +683,14 @@ async fn main() -> Result<(), AppError> {
     ui.set_modules(ModelRc::new(VecModel::from(module_items_from_manager(&shared_mgr))));
     ui.set_autostart_enabled(autostart::is_autostart_enabled());
     ui.set_app_version(SharedString::from(env!("CARGO_PKG_VERSION")));
+    // 提权状态驱动 UI 展示形态：elevated = true → 标题旁「管理员 (Admin)」翡翠徽标、
+    // 隐藏提权按钮；false → 渲染醒目的盾牌提权按钮（见 ui/app.slint）。
+    ui.set_elevated(elevated);
     tracing::info!(
         target: "main",
-        "UI 已实例化，初始注入 {} 个模块",
-        ui.get_modules().row_count()
+        "UI 已实例化，初始注入 {} 个模块（提权展示形态: {}）",
+        ui.get_modules().row_count(),
+        if elevated { "管理员徽标" } else { "提权按钮" }
     );
 
     // ---- 7. 总线 → UI 桥：订阅总线并启动常驻转发任务（模块状态 → UI 刷新）。 ----
@@ -537,6 +705,17 @@ async fn main() -> Result<(), AppError> {
     // ---- 8. 回调绑定：UI 控件 → 异步动作；落定后的真实状态回流刷新（含失败回滚）。 ----
     //      回调在 UI 线程触发；实际动作派发到 Tokio 任务执行，形成
     //      “请求 → 事实 → 视图”闭环。
+
+    // 8.0 Toast 触发回调：Slint 侧 `trigger_toast(string)` 与统一 `show_toast` 同入口。
+    //     Rust 内部动作落定后直接调用 show_toast（见下述 8.2 / 8.3 / 8.4.x）；本绑定
+    //     仅为把 UI 声明的回调面接通，供未来 UI 内任意元素请求一条 Toast。
+    let toast_ui = ui.as_weak();
+    ui.on_trigger_toast(move |msg| show_toast(&toast_ui, msg.as_str()));
+
+    // 8.0.1 盾牌提权按钮（仅未提权形态渲染）→ 与托盘菜单共用提权重启入口。
+    //       点击后进入 UAC 确认；成功则旧进程平滑收尾退出、提权副本接管。
+    let elevate_ui = ui.as_weak();
+    ui.on_request_elevate(move || trigger_admin_restart(&elevate_ui));
 
     // 8.1 模块开关拨动 → 异步调度模块启停。
     let manager_for_toggle = Arc::clone(&shared_mgr);
@@ -572,7 +751,8 @@ async fn main() -> Result<(), AppError> {
                     false
                 }
             };
-            // 2) 写入成功 → 把用户意图持久化到配置（配置为准：下次启动据此收敛注册表）。
+            // 2) 写入成功 → 把用户意图持久化到配置（配置为准：下次启动据此收敛注册表），
+            //    并弹出 Toast 反馈（已开启 / 已关闭开机自启）。
             if applied {
                 let snapshot = {
                     let mut cfg = cfg_lock.lock().await;
@@ -582,6 +762,7 @@ async fn main() -> Result<(), AppError> {
                 if let Err(err) = mgr.save(&snapshot).await {
                     tracing::error!(target: "main", "自启意图写入配置失败: {err}");
                 }
+                show_toast(&weak, if enable { "已开启开机自启" } else { "已关闭开机自启" });
             }
             // 3) 回读注册表真实状态刷新开关：失败路径自然回弹为原状态。
             let _ = slint::invoke_from_event_loop(move || {
@@ -592,12 +773,16 @@ async fn main() -> Result<(), AppError> {
         });
     });
 
-    // 8.3 「全部启用 / 全部停用」→ 与托盘全量切换共用同一实现。
+    // 8.3 「全部启用 / 全部停用」→ 与托盘全量切换共用同一实现；批量切换完成后弹出
+    //     Toast 反馈（文案与目标状态一致；个别模块失败仅告警不阻断，故仍按目标态提示）。
     let all_mgr = Arc::clone(&shared_mgr);
+    let all_ui = ui.as_weak();
     ui.on_toggle_all_modules(move |enable| {
         let mgr = Arc::clone(&all_mgr);
+        let weak = all_ui.clone();
         tokio::spawn(async move {
             set_all_modules(&mgr, enable).await;
+            show_toast(&weak, if enable { "已全部启动" } else { "已全部停止" });
         });
     });
 
@@ -645,6 +830,8 @@ async fn main() -> Result<(), AppError> {
         let normalized = add_blocker.current_rules();
         let _ = add_persist.send(normalized.clone());
         deliver_popup_rules_refresh(&add_ui, normalized);
+        // 生效反馈：RuleStore 已热更新并立即生效（拦截泵按新黑名单匹配）、持久化已排队落盘。
+        show_toast(&add_ui, "拦截规则已添加并生效");
     });
 
     // 8.4.4 删除规则（按弹窗行号；行号与 current_rules 顺序一致）。
@@ -678,14 +865,23 @@ async fn main() -> Result<(), AppError> {
         let _ = remove_persist.send(normalized.clone());
         tracing::info!(target: "main", "已删除拦截关键词 \"{removed}\"（剩余 {} 条）", normalized.len());
         deliver_popup_rules_refresh(&remove_ui, normalized);
+        // 生效反馈：RuleStore 已热更新并立即生效、持久化已排队落盘。
+        show_toast(&remove_ui, "拦截规则已删除");
     });
 
     // ---- 9. 托盘装配与生命周期控制（桌面常驻核心机制）。 ----
-    let tray_handle = match tray::spawn(event_bus.clone(), all_modules_enabled(&shared_mgr)) {
+    //      第三个参数 elevated 决定托盘菜单是否渲染「以管理员身份重启」：
+    //      未提权渲染（UIPI 突围入口），已提权隐藏。
+    let tray_handle = match tray::spawn(
+        event_bus.clone(),
+        all_modules_enabled(&shared_mgr),
+        elevated,
+    ) {
         Ok(handle) => {
             tracing::info!(
                 target: "main",
-                "系统托盘已就绪（右键菜单：显示主窗口 / 全部模块 / 退出程序）"
+                "系统托盘已就绪（右键菜单：显示主窗口 / 全部模块 / {}退出程序）",
+                if elevated { "" } else { "以管理员身份重启 / " }
             );
             Some(handle)
         }
