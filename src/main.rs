@@ -14,7 +14,11 @@
 //! 物理开关）；带设置项的模块（当前为弹窗拦截）卡片上另有齿轮按钮，点击弹出
 //! **「黑名单规则管理」弹窗**（根层级 Overlay：查看 / 新增 / 删除拦截关键词，
 //! 经 `update_rules` 热更新并持久化到配置，全程无需手写 TOML）；
-//! 双栏时代的内嵌运行日志控制台已退役，日志改由 `tracing` 承载。
+//! 双栏时代的内嵌运行日志控制台已退役，日志改由 `tracing` 承载，并在本函数第一句
+//! 装配（见 [`tltoolbox::logging`]）：debug 构建双写 控制台 + 按天滚动文件；
+//! release 构建（无控制台黑框）仅写文件。日志目录锚定 **exe 同级 `logs/`**
+//! （与配置同源，规避自启时 CWD 偏移），守卫句柄（`WorkerGuard`）由本函数持有至
+//! 退出，保证任何退出路径都先完整刷盘再结束进程。
 //! 装配顺序与职责：
 //!
 //! 0. **启动前置 · 单实例守护**（在配置 / 模块 / UI 装配之前执行，见函数体 0.2）：
@@ -75,6 +79,7 @@ use tokio::sync::Mutex;
 use tltoolbox::autostart;
 use tltoolbox::bus::{AppEvent, EventBus, TrayAction};
 use tltoolbox::config::{AppConfig, ConfigManager};
+use tltoolbox::logging;
 use tltoolbox::manager::{ModuleManager, SharedManager};
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
@@ -360,9 +365,18 @@ type AppError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // ---- 日志装配（最先执行）：tracing → 按天滚动文件 +（debug 构建）控制台。 ----
+    //      日志目录经 config::resolve_app_path 锚定到 exe 同级 logs/，与 CWD 解耦；
+    //      返回的 WorkerGuard 由 `_log_guard` 持有到本函数作用域结束——正常收尾、
+    //      单实例二次启动提前 return、panic 展开等任何退出路径都会先触发刷盘。
+    let _log_guard = logging::init();
+    tracing::info!(
+        target: "main",
+        log_dir = %logging::log_directory().display(),
+        file_logging = _log_guard.is_file_logging_active(),
+        "日志子系统已就绪：debug 双写控制台/文件，release 仅文件（按天滚动，保留 {} 份）",
+        logging::MAX_LOG_FILES
+    );
 
     // ---- 0. 启动前置：静默自启识别（0.1）与单实例守护（0.2）。 ----
     //      0.1 静默启动识别：注册表 Run 键自启时携带 --silent（常驻层据此抑制打扰）。

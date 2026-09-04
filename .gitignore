@@ -13,6 +13,7 @@
 
 # ---- Logs & runtime output ----
 *.log
+/logs/
 config/*.local.toml
 
 # ---- Retired-agent-era planning doc (kept local only, out of VCS) ----

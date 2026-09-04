@@ -21,6 +21,10 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# 日志按天滚动落盘（自 0.3.0 起）：release 为无控制台 GUI 子系统，运行日志改经
+# tracing-appender 写入 exe 同级 logs/ 目录（每日一个文件，如 tltoolbox.2026-09-04.log），
+# WorkerGuard 由日志装配层持有至进程退出，保证退出前缓冲区完全刷盘。
+tracing-appender = "0.2"
 chrono = "0.4"
 
 # 系统托盘（常驻生命周期核心）：tray-icon 负责 Shell_NotifyIcon 图标与事件回调，
