@@ -6,7 +6,7 @@
 //!
 //! - **库（本文件）**：承载全部本地业务基础设施——注册表开机自启（[`autostart`]）、
 //!   事件总线（[`bus`]）、配置引擎（[`config`]）、模块调度器（[`manager`]）、
-//!   系统托盘与常驻生命周期（[`tray`]）与常驻守护模块（[`modules`]）。`tests/` 下的集成测试与 `src/main.rs`
+//!   系统托盘与常驻生命周期（[`tray`]）、单实例守护（[`single_instance`]）与常驻守护模块（[`modules`]）。`tests/` 下的集成测试与 `src/main.rs`
 //!   可执行程序都以 `tltoolbox` 为依赖，确保 `cargo test` 能在**脱离 GUI
 //!   会话**的前提下验证模块调度与配置/自启链路；
 //! - **二进制（`src/main.rs`）**：最终装配点——加载配置并同步注册表自启状态、
@@ -22,4 +22,5 @@ pub mod bus;
 pub mod config;
 pub mod manager;
 pub mod modules;
+pub mod single_instance;
 pub mod tray;

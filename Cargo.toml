@@ -36,8 +36,15 @@ tray-icon = "0.19"
 #                                 与错误码类型（Registry 与 UI 两路共用）
 #   - Win32_UI_WindowsAndMessaging：GetMessageW / DispatchMessageW / PeekMessageW /
 #                                  PostThreadMessageW / PostMessageW / TranslateMessage、
-#                                  MSG 结构、EVENT_OBJECT_*、WINEVENT_*、WM_* 常量
+#                                  RegisterWindowMessageW / HWND_BROADCAST、MSG 结构、
+#                                  EVENT_OBJECT_*、WINEVENT_*、WM_* 常量
+#                                  （PostMessageW / RegisterWindowMessageW / HWND_BROADCAST
+#                                  供单实例守护的「广播唤醒既有实例」使用）
 #   - Win32_System_Threading      ：GetCurrentThreadId（泵线程注册 / WM_QUIT 定向投递）
+#   - Win32_Security              ：SECURITY_ATTRIBUTES 结构（windows-0.58 把该结构生成在
+#                                 Security 命名空间；CreateMutexW 的签名引用它，因此单实例
+#                                 守护的具名互斥需额外启用本 feature——实际调用传 None，
+#                                 不使用任何安全描述符；不启用则 CreateMutexW 整体不可见）
 #   - Win32_UI_Accessibility      ：SetWinEventHook / UnhookWinEvent / HWINEVENTHOOK / WINEVENTPROC
 #   - Win32_System_Registry       ：RegOpenKeyExW / RegSetValueExW / RegQueryValueExW /
 #                                  RegDeleteValueW（开机自启读写的注册表 API）
@@ -55,6 +62,7 @@ features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    "Win32_Security",
     "Win32_UI_Accessibility",
     "Win32_System_Registry",
     "Win32_System_Power",

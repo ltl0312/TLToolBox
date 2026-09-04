@@ -24,8 +24,39 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::sync::Mutex;
 
-/// 默认配置文件相对路径（相对进程工作目录）。
+/// 默认配置文件相对路径（相对**可执行文件所在目录**，见 [`resolve_app_path`]）。
 pub const DEFAULT_CONFIG_PATH: &str = "config/tltoolbox.toml";
+
+/// 把应用资源相对路径解析为「以可执行文件目录为基准」的绝对路径。
+///
+/// # 背景（路径锚定的必要性）
+/// 经 Windows 注册表 Run 键自启 / 用户双击拉起时，进程工作目录（CWD）可能落在
+/// `C:\Windows\System32` 或任意目录；若直接使用相对路径 `config/tltoolbox.toml`
+/// 读写配置，将指向错误位置、甚至因 `System32` 无写权限而落盘失败。因此应用
+/// 资源的基准目录统一取 `std::env::current_exe()` 所在目录（exe 同级），与 CWD
+/// 彻底解耦——无论从何处启动，配置始终锚定在程序自己的安装目录旁。
+///
+/// # 解析规则
+/// - `sub_path` 本身为绝对路径 → 原样返回（显式绝对路径优先，不改写调用方意图）；
+/// - 否则优先取 `current_exe()` 的父目录作为基准拼接；
+/// - `current_exe()` 不可用（极罕见，如句柄异常）→ 兜底原样返回相对路径，
+///   退化为「相对 CWD」的历史行为，保证调用方总能拿到一个可用路径。
+///
+/// # 测试自由度
+/// 本函数只影响 [`ConfigManager::default`] 等**默认**入口；需要相对路径 / 临时
+/// 路径的单元测试一律经 [`ConfigManager::new`] 显式指定路径，锚定逻辑不干扰测试。
+pub fn resolve_app_path(sub_path: &Path) -> PathBuf {
+    if sub_path.is_absolute() {
+        return sub_path.to_path_buf();
+    }
+    match std::env::current_exe() {
+        Ok(exe) => exe
+            .parent()
+            .map(|exe_dir| exe_dir.join(sub_path))
+            .unwrap_or_else(|| sub_path.to_path_buf()),
+        Err(_) => sub_path.to_path_buf(),
+    }
+}
 
 /// 应用级配置结构。
 ///
@@ -220,7 +251,8 @@ impl ConfigManager {
             source,
         })?;
 
-        // 确保父目录存在（默认路径为 `config/tltoolbox.toml`，首次写入时目录尚未创建）。
+        // 确保父目录存在（默认路径为 exe 同级目录下的 `config/tltoolbox.toml`，
+        // 首次写入时 config 目录尚未创建；经 resolve_app_path 锚定后此目录必然可写）。
         if let Some(parent) = self.file_path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)
@@ -270,9 +302,13 @@ impl ConfigManager {
 }
 
 impl Default for ConfigManager {
-    /// 指向默认路径 `config/tltoolbox.toml`。
+    /// 指向**可执行文件同级目录**下的默认配置 `config/tltoolbox.toml`。
+    ///
+    /// 经 [`resolve_app_path`] 把默认相对路径锚定到 exe 目录：注册表 Run 键自启
+    /// （CWD = `System32`）、资源管理器双击等任意工作目录下，都能稳定定位到
+    /// 安装目录旁的 `config/tltoolbox.toml` 并具备写入权限。
     fn default() -> Self {
-        Self::new(DEFAULT_CONFIG_PATH)
+        Self::new(resolve_app_path(Path::new(DEFAULT_CONFIG_PATH)))
     }
 }
 
@@ -295,6 +331,66 @@ mod tests {
     async fn remove_if_exists(path: &Path) {
         let _ = fs::remove_file(path).await;
     }
+
+    // ---- 路径锚定（resolve_app_path / default()）：系统级隐患「Run 键自启时
+    //      CWD 为 System32」的回归防线 ----
+
+    #[test]
+    fn resolve_app_path_keeps_explicit_absolute_path() {
+        // 绝对路径必须原样返回（显式指定优先，不得被重定向到 exe 目录）。
+        let abs = std::env::temp_dir().join("tltoolbox-explicit-absolute.toml");
+        assert_eq!(
+            resolve_app_path(&abs),
+            abs,
+            "绝对路径应原样返回而不做 exe 目录拼接"
+        );
+    }
+
+    #[test]
+    fn resolve_app_path_anchors_relative_subpath_to_exe_dir() {
+        let resolved = resolve_app_path(Path::new(DEFAULT_CONFIG_PATH));
+        assert!(
+            resolved.is_absolute(),
+            "exe 目录锚定应产出绝对路径，实际: {}",
+            resolved.display()
+        );
+        assert!(
+            resolved.ends_with(Path::new(DEFAULT_CONFIG_PATH)),
+            "路径应以 config/tltoolbox.toml 收尾，实际: {}",
+            resolved.display()
+        );
+
+        // 锚定基准必须是「当前进程可执行文件目录」，而非进程工作目录（CWD）——
+        // 这正是注册表 Run 键自启场景（CWD = System32）下避免写错位置的关键。
+        let exe_path = std::env::current_exe().expect("current_exe 应可用");
+        let exe_dir = exe_path.parent().expect("exe 必有父目录");
+        let expected = exe_dir.join("config");
+        assert_eq!(
+            resolved.parent().map(|p| p.to_path_buf()),
+            Some(expected),
+            "基准目录应为 exe 同级目录下的 config/，实际: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn default_config_manager_anchors_to_exe_dir() {
+        // ConfigManager::default() 是 main.rs 的装配入口：其路径必须锚定 exe 目录，
+        // 保证自启 / 双击等任意 CWD 下首次运行都能自动落盘并读回同一份配置。
+        let mgr = ConfigManager::default();
+        assert!(
+            mgr.path().is_absolute(),
+            "默认配置路径应为绝对路径（exe 目录锚定），实际: {}",
+            mgr.path().display()
+        );
+        assert!(
+            mgr.path().ends_with(Path::new(DEFAULT_CONFIG_PATH)),
+            "默认配置路径应指向 config/tltoolbox.toml，实际: {}",
+            mgr.path().display()
+        );
+    }
+
+    // ---- 配置内容与持久化语义 ----
 
     #[test]
     fn default_config_has_expected_values() {

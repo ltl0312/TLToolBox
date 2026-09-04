@@ -17,11 +17,21 @@
 //! 双栏时代的内嵌运行日志控制台已退役，日志改由 `tracing` 承载。
 //! 装配顺序与职责：
 //!
+//! 0. **启动前置 · 单实例守护**（在配置 / 模块 / UI 装配之前执行，见函数体 0.2）：
+//!    经 Windows 会话级具名互斥（[`single_instance`](tltoolbox::single_instance)，
+//!    `CreateMutexW` + `GetLastError == ERROR_ALREADY_EXISTS` 探测）拦截二次启动——
+//!    检测到既有实例时向 `HWND_BROADCAST` 广播唤醒消息并**立即退出本进程**；主
+//!    实例的托盘消息泵监听该消息，收到后发布 [`AppEvent::TrayAction`] 的
+//!    `ShowWindow`，把静默常驻的主窗口还原前置。互斥句柄由守卫持有至进程收尾；
 //! 1. **静默启动识别**：解析命令行 `--silent`（系统经注册表 Run 键拉起本程序时
 //!    附加，见 [`autostart::SILENT_ARG`](tltoolbox::autostart::SILENT_ARG)）；
 //!    常驻层据此抑制前台打扰，托盘最小化行为由常驻层消费；
 //! 2. **配置加载**：`ConfigManager::default().load()` 负责首次运行自动落盘默认
-//!    `config/tltoolbox.toml`，随后异步加载（自启标志 / 托盘行为 / 自动启动模块列表）；
+//!    配置——默认路径已锚定到**可执行文件同级目录**下的
+//!    `config/tltoolbox.toml`（见
+//!    [`config::resolve_app_path`](tltoolbox::config::resolve_app_path)，规避
+//!    Run 键自启时 CWD = `System32` 导致的找不到 / 无权限问题），随后异步加载
+//!    （自启标志 / 托盘行为 / 自动启动模块列表）；
 //! 3. **注册表自启同步**：配置为准——`auto_start_windows` 与实际注册表
 //!    `HKCU\...\CurrentVersion\Run` 状态不一致时立即收敛（配置开而缺失/路径漂移
 //!    → 补写「当前 exe --silent」；配置关而残留 → 删除）。同步失败仅告警降级，
@@ -70,6 +80,7 @@ use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::PopupBlockerModule;
 use tltoolbox::modules::ToolModule;
+use tltoolbox::single_instance;
 use tltoolbox::tray::{self, TrayControl};
 
 // ---------------------------------------------------------------------------
@@ -353,11 +364,49 @@ async fn main() -> Result<(), AppError> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    // ---- 0. 静默启动识别：注册表 Run 键自启时携带 --silent（常驻层据此抑制打扰）。 ----
+    // ---- 0. 启动前置：静默自启识别（0.1）与单实例守护（0.2）。 ----
+    //      0.1 静默启动识别：注册表 Run 键自启时携带 --silent（常驻层据此抑制打扰）。
     let silent_launch = std::env::args().any(|arg| arg == autostart::SILENT_ARG);
     if silent_launch {
         tracing::info!(target: "main", "检测到 --silent：本次由系统开机自启拉起");
     }
+
+    //      0.2 单实例守护：最先于一切有副作用的装配（配置落盘 / 模块启动 / UI /
+    //          托盘 / 钩子注册）执行——用户再次双击 exe 或系统重复自启时，检测到
+    //          既有实例持有会话级具名互斥（CreateMutexW + ERROR_ALREADY_EXISTS）：
+    //          a) 向 HWND_BROADCAST 广播唤醒消息（既有实例托盘消息泵收到后发布
+    //             TrayAction::ShowWindow，还原静默主窗口）并记录日志；
+    //          b) 立即退出本进程（return Ok(())，无任何资源被二次注册）。
+    //          主实例的互斥句柄由 `_instance_guard` 守卫持有到 main 作用域结束
+    //          （进程平滑收尾时 Drop → CloseHandle 自动释放）。
+    let _instance_guard = match single_instance::acquire() {
+        Ok(single_instance::SingleInstanceOutcome::Primary(guard)) => {
+            tracing::info!(
+                target: "main",
+                "单实例守护已就绪：本进程为唯一实例，互斥句柄持有至退出"
+            );
+            Some(guard)
+        }
+        Ok(single_instance::SingleInstanceOutcome::Secondary {
+            wakeup_delivered,
+        }) => {
+            tracing::info!(
+                target: "main",
+                wakeup_delivered,
+                "检测到 TLToolBox 已在运行：已向既有实例广播唤醒消息，本进程立即退出"
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            // 互斥创建硬失败（非 ALREADY_EXISTS 路径）：无法判定唯一性，降级为
+            // 无守护继续运行——仅告警，绝不让应用因守护自身故障而无法启动。
+            tracing::warn!(
+                target: "main",
+                "单实例互斥创建失败，本次降级为允许并行运行: {err}"
+            );
+            None
+        }
+    };
 
     // ---- 1. 配置加载：首次运行自动落盘默认 TOML，随后异步加载。 ----
     let config_mgr = Arc::new(ConfigManager::default());

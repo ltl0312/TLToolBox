@@ -37,7 +37,15 @@
 //!    送回托盘线程。两个方向都是**单向、无应答、无等待**的投递；
 //! 3. **零跨线程锁**：本模块不引入任何 `Mutex`/`RwLock`。唯一的共享可变状态
 //!    是“全部模块聚合开关”缓存与菜单文案，全部位于托盘线程内部；总线事件是
-//!    值语义快照（[`AppEvent`] `Clone`），线程之间只传递值，不共享引用。
+//!    值语义快照（[`AppEvent`] `Clone`），线程之间只传递值，不共享引用；
+//! 4. **单实例唤醒接收**：消息泵除 `WM_TRAY_CONTROL` 外还比对
+//!    [`single_instance::register_wakeup_message`](crate::single_instance) 注册的
+//!    广播编号（`TLTOOLBOX_WAKEUP_EXISTING_INSTANCE`，见
+//!    [`crate::single_instance`]）——用户再次双击 exe 时，第二实例向
+//!    `HWND_BROADCAST` 投递该消息（tray-icon 的隐藏窗口是**顶层**窗口，必然收到
+//!    广播），本泵识别后经总线发布
+//!    [`AppEvent::TrayAction(TrayAction::ShowWindow)`]，把静默常驻的主窗口还原
+//!    前置——与托盘菜单「显示主窗口」/ 双击共用同一条唤醒管线。
 //!
 //! # 为什么不会死锁
 //!
@@ -425,7 +433,12 @@ mod platform {
         }
 
         /// 运行 Win32 消息泵直至停机（消费本结构体，退出时自动释放图标）。
-        fn run(mut self, cmd_rx: mpsc::Receiver<TrayCommand>) {
+        ///
+        /// `wakeup_message_id`：第二实例的唤醒广播编号（
+        /// [`crate::single_instance::register_wakeup_message`]，`0` = 未注册成功）。
+        /// 广播经 `HWND_BROADCAST` 投递到托盘线程创建的顶层隐藏窗口，泵在此
+        /// 识别并发布 [`AppEvent::TrayAction(TrayAction::ShowWindow)`]。
+        fn run(mut self, cmd_rx: mpsc::Receiver<TrayCommand>, wakeup_message_id: u32) {
             tracing::debug!(target: "tray", "托盘消息泵已启动");
             loop {
                 // 1) 控制指令（可被 WM_TRAY_CONTROL 唤醒后到达）。
@@ -446,8 +459,15 @@ mod platform {
                     tracing::warn!(target: "tray", "GetMessageW 失败，托盘消息泵退出");
                     break;
                 }
-                if msg.message != WM_TRAY_CONTROL {
+
+                if msg.message == WM_TRAY_CONTROL {
                     // 唤醒消息只用于跳出 GetMessageW，本身无载荷，无需分发。
+                } else if wakeup_message_id != 0 && msg.message == wakeup_message_id {
+                    // 第二实例的唤醒广播（单实例守护）：把静默常驻的主窗口还原
+                    // 前置。发布 AppEvent::TrayAction(ShowWindow)，由生命周期
+                    // 控制器经 invoke_from_event_loop 在 UI 线程执行。
+                    self.bus.publish(AppEvent::TrayAction(TrayAction::ShowWindow));
+                } else {
                     unsafe {
                         let _ = TranslateMessage(&msg);
                         let _ = DispatchMessageW(&msg);
@@ -480,6 +500,10 @@ mod platform {
         }
         thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
 
+        // 注册第二实例的唤醒广播编号（同一字符串系统内唯一、跨进程一致），
+        // 供消息泵识别「再次启动 exe」投递来的 HWND_BROADCAST 唤醒消息。
+        let wakeup_message_id = crate::single_instance::register_wakeup_message();
+
         let result = TrayManager::new(bus, all_enabled);
         if let Err(err) = &result {
             tracing::warn!(target: "tray", "托盘初始化失败: {err}");
@@ -492,7 +516,7 @@ mod platform {
         let _ = init_tx.send(outcome);
 
         if let Ok(manager) = result {
-            manager.run(cmd_rx);
+            manager.run(cmd_rx, wakeup_message_id);
         }
     }
 
