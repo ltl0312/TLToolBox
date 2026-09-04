@@ -9,24 +9,32 @@
 // │ TLToolBox  [ v0.2.0 ]         全部停用   全部启用        │ ← 顶部系统与全局控制栏
 // │ 原生 Windows 轻量工具箱 · 桌面常驻     开机自启  [开关]   │    标题/小版本号/自启/一键全开全关
 // ├────────────────────────────────────────────────────────┤
-// │  ┌ 模块名（加粗白字）        ●运行中/○已停止  [开关]    ┐ │ ← ScrollView 流式卡片列表
-// │  │ 详细用途描述（淡灰细字）                          │ │
-// │  └───────────────────────────────────────────────────┘ │
+// │  ┌ 模块名（加粗白字）        ●运行中/○已停止 [⚙][开关] ┐ │ ← ScrollView 流式卡片列表
+// │  │ 详细用途描述（淡灰细字）                          │ │    有设置项的卡片在开关左侧
+// │  └───────────────────────────────────────────────────┘ │    显示齿轮入口（轻量按钮）
 // │  （……更多模块卡片，超出自动滚动……）                       │
+// ├────────────────────────────────────────────────────────┤
+// │  （规则管理遮罩层：点击齿轮淡入；半透明遮罩 + 居中弹窗）   │ ← 根层级 Overlay（弹窗拦截专用）
 // └────────────────────────────────────────────────────────┘
 //
 // 数据契约（供 Rust 侧 include_modules! 后经 VecModel 填充）：
-//   - modules:          ModuleItem 列表（id/name/desc/enabled）
-//   - autostart_enabled: 全局开机自启当前生效状态（注册表为准）
-//   - app-version:       界面小版本号（默认与 Cargo.toml 对齐，可由装配层覆盖）
+//   - modules:            ModuleItem 列表（id/name/desc/enabled/has_settings）
+//   - popup_rules:        弹窗拦截黑名单关键词（规则弹窗的列表数据源）
+//   - show_rules_modal:   「规则管理」弹窗展示开关（由 Rust 装配层驱动）
+//   - autostart_enabled:  全局开机自启当前生效状态（注册表为准）
+//   - app-version:        界面小版本号（默认与 Cargo.toml 对齐，可由装配层覆盖）
 // 回调契约：
-//   - toggle_module(id, enabled)     ← 模块卡片 Switch 拨动
-//   - toggle_autostart(enabled)      ← 全局「开机自启」Switch 拨动
-//   - toggle_all_modules(enabled)    ← 「全部启用 / 全部停用」按钮点击
+//   - toggle_module(id, enabled)      ← 模块卡片 Switch 拨动
+//   - toggle_autostart(enabled)       ← 全局「开机自启」Switch 拨动
+//   - toggle_all_modules(enabled)     ← 「全部启用 / 全部停用」按钮点击
+//   - open_rules_modal()              ← 模块卡片齿轮点击（Rust 灌入最新规则后置 show=true）
+//   - close_rules_modal()             ← 弹窗「×」/ 遮罩空白点击
+//   - add_rule(keyword)               ← 弹窗底部「添加」（含输入框回车）
+//   - remove_rule(index)              ← 规则行右侧红色删除按钮
 //
 // 注：随双栏日志控制台退役，LogEntry 已从本文件移除；运行日志改由 tracing 承载。
 
-import { Switch, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Switch, ScrollView, VerticalBox, HorizontalBox, LineEdit } from "std-widgets.slint";
 
 // —— 模块列表条目：与调度层 ModuleMeta 一一对应 ——
 export struct ModuleItem {
@@ -34,6 +42,8 @@ export struct ModuleItem {
     name: string,
     desc: string,
     enabled: bool,
+    // 是否有「设置面板」：为真时卡片在 Switch 左侧渲染齿轮按钮（当前仅弹窗拦截）。
+    has_settings: bool,
 }
 
 // —— 全局暗色主题令牌（zinc 底 + 翡翠强调；统一取色，避免魔法数字散落） ——
@@ -59,6 +69,21 @@ export global Theme {
     in-out property <color> btn-bg-pressed: #323238;
     in-out property <color> btn-border: #3f3f46;
     in-out property <color> btn-border-hover: #62626b;
+
+    // —— 规则管理弹窗专用令牌 ——
+    in-out property <color> overlay-scrim: #0b0b0ecc;    // 遮罩半透明黑
+    in-out property <color> dialog-bg: #202024;          // 弹窗卡片底
+    in-out property <color> dialog-border: #3f3f46;      // 弹窗卡片描边
+    in-out property <color> row-bg-hover: #2b2b30;       // 规则行悬停底
+    in-out property <color> danger: #f87171;             // 删除红
+    in-out property <color> danger-hover-bg: #f8717126;
+    in-out property <color> danger-pressed-bg: #f8717140;
+    in-out property <color> accent-bg: #10b981;          // 「添加」实底按钮
+    in-out property <color> accent-bg-hover: #34d399;
+    in-out property <color> accent-bg-pressed: #059669;
+    in-out property <color> accent-fg: #06281a;          // 实底按钮上的文字
+    in-out property <color> accent-bg-disabled: #10b98133;
+    in-out property <color> accent-fg-disabled: #a1a1aa;
 }
 
 // —— 轻量操作按钮：全部启用 / 全部停用（幽灵样式，低打扰） ——
@@ -104,10 +129,94 @@ component GhostButton inherits Rectangle {
     }
 }
 
-// —— 模块卡片：名称 / 描述 / 状态徽标 / 物理开关 ——
+// —— 轻量图标按钮：模块齿轮入口 / 弹窗右上角关闭（透明底 + 悬停微亮） ——
+component GhostIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <color> icon-color: Theme.text-secondary;
+    in property <length> icon-size: 15px;
+    callback clicked;
+
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: transparent;
+
+    states [
+        hover when icon-touch.has-hover && !icon-touch.pressed : {
+            background: Theme.btn-bg-hover;
+        }
+        pressed when icon-touch.pressed : {
+            background: Theme.btn-bg-pressed;
+        }
+    ]
+    animate background { duration: 100ms; }
+
+    Image {
+        source: root.icon;
+        colorize: root.icon-color;
+        width: root.icon-size;
+        height: root.icon-size;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    icon-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 实底主按钮：「添加」规则（空输入时禁用态） ——
+component PrimaryButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: 92px;
+    height: 32px;
+    border-radius: 8px;
+    background: Theme.accent-bg;
+
+    states [
+        disabled when !root.enabled : {
+            background: Theme.accent-bg-disabled;
+        }
+        hover when root.enabled && touch.has-hover && !touch.pressed : {
+            background: Theme.accent-bg-hover;
+        }
+        pressed when root.enabled && touch.pressed : {
+            background: Theme.accent-bg-pressed;
+        }
+    ]
+    animate background { duration: 100ms; }
+
+    Text {
+        text: root.text;
+        font-size: 12px;
+        font-weight: 700;
+        color: root.enabled ? Theme.accent-fg : Theme.accent-fg-disabled;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 模块卡片：名称 / 描述 / 状态徽标 / 设置齿轮（可选）/ 物理开关 ——
 component ModuleCard inherits Rectangle {
     in property <ModuleItem> module;
     callback toggled(bool);
+    callback settings-clicked;
 
     height: 62px;
     background: Theme.card-bg;
@@ -123,7 +232,7 @@ component ModuleCard inherits Rectangle {
     ]
     animate background, border-color { duration: 120ms; }
 
-    // 悬停感应层置于最底层：不拦截上层 Switch / 文本区域的点击。
+    // 悬停感应层置于最底层：不拦截上层 Switch / 齿轮 / 文本区域的点击。
     card-hover := TouchArea {
         x: 0;
         y: 0;
@@ -161,9 +270,9 @@ component ModuleCard inherits Rectangle {
             }
         }
 
-        // 右侧控件组：状态徽标 + 物理开关（各自内容垂直居中，天然对齐同一中线）
+        // 右侧控件组：状态徽标 + 设置齿轮（按需）+ 物理开关
         HorizontalBox {
-            spacing: 12px;
+            spacing: 10px;
             alignment: center;
 
             // 状态徽标：运行中绿点 / 已停止灰点（跟随调度层真实运行态着色）
@@ -185,12 +294,263 @@ component ModuleCard inherits Rectangle {
                 }
             }
 
+            // 设置齿轮：仅在模块声明 has_settings 时渲染；点击上抛，由 Rust 装配层
+            // 拉取最新规则并打开「规则管理」弹窗。
+            if root.module.has_settings : GhostIconButton {
+                icon: @image-url("icons/settings.svg");
+                icon-size: 14px;
+                icon-color: Theme.text-secondary;
+                width: 24px;
+                height: 24px;
+                clicked => { root.settings-clicked(); }
+            }
+
             // 硬开关：状态以 modules 模型为唯一真源；点击即上报回调，底层落定后的
             // 权威状态（含失败回滚）由 Rust 经事件总线刷新模型驱动本绑定收敛。
             Switch {
                 checked: root.module.enabled;
                 toggled => {
                     root.toggled(self.checked);
+                }
+            }
+        }
+    }
+}
+
+// —— 规则行：关键词文本 + 行尾红色删除按钮（悬停整行微亮） ——
+component RuleRow inherits Rectangle {
+    in property <string> rule;
+    callback remove-requested;
+
+    height: 36px;
+    border-radius: 8px;
+    background: transparent;
+
+    states [
+        hover when row-hover.has-hover : {
+            background: Theme.row-bg-hover;
+        }
+    ]
+    animate background { duration: 90ms; }
+
+    // 悬停感应层（置于内容之下，不拦截删除按钮的点击）。
+    row-hover := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    HorizontalBox {
+        padding-left: 12px;
+        padding-right: 8px;
+        spacing: 10px;
+        alignment: center;
+
+        Text {
+            text: root.rule;
+            font-size: 12px;
+            color: Theme.text-primary;
+            overflow: elide;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+        }
+
+        // 删除按钮：常态即红色警示（与整行悬停区分）；点击上抛行号由装配层删除。
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            border-radius: 6px;
+            background: transparent;
+
+            states [
+                hover when del-touch.has-hover && !del-touch.pressed : {
+                    background: Theme.danger-hover-bg;
+                }
+                pressed when del-touch.pressed : {
+                    background: Theme.danger-pressed-bg;
+                }
+            ]
+            animate background { duration: 90ms; }
+
+            Image {
+                source: @image-url("icons/trash.svg");
+                colorize: Theme.danger;
+                width: 14px;
+                height: 14px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+            del-touch := TouchArea {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.remove-requested(); }
+            }
+        }
+    }
+}
+
+// —— 弹窗拦截 · 黑名单规则管理（根层级 Overlay：遮罩 + 居中弹窗卡片） ——
+//
+// 输入 / 动画架构（避免“隐藏弹层拦截主界面交互”）：
+//   - 遮罩层常驻挂载、仅以 opacity 渐变进出：隐藏态其全部 TouchArea 经 enabled
+//     关闭（Slint 语义：disabled 的 TouchArea 把事件原样穿透给下层元素），因此
+//     纯视觉层不会形成点击 / 滚轮黑洞；
+//   - 弹窗卡片（含 std-widgets ScrollView 的 Flickable 滚动逻辑）**只在展示期
+//     挂载**（`if root.show`）：ScrollView 隐藏后即从树中移除，杜绝“隐藏态滚轮
+//     仍被 Flickable 消费、主列表滚动失灵”的陷阱。代价是卡片无离场过渡——由
+//     遮罩的淡出动画承接视觉收尾，整体观感干净利落。
+component RulesModal inherits Rectangle {
+    in property <bool> show;
+    in property <[string]> rules;
+    callback close-requested;
+    callback add-requested(string);
+    callback remove-requested(int);
+
+    // 半透明遮罩底：透明度随 show 渐变（入场淡入 / 关闭淡出）。
+    // 注意：本组件根元素的宽高在装配点（MainWindow）以窗口尺寸显式给出，
+    // 组件自身不绑定 `parent`（组件根没有组件内父级可引用）。
+    background: Theme.overlay-scrim;
+    opacity: root.show ? 1.0 : 0.0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    // 遮罩点击层：点击弹窗之外的空白 → 请求关闭；同时吞没滚轮，
+    // 防止滚轮穿透到被遮罩的主界面滚动列表。
+    backdrop := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.show;
+        clicked => { root.close-requested(); }
+        scroll-event(event) => { return accept; }
+    }
+
+    // 居中弹窗卡片（仅展示期挂载，见组件文档的输入架构说明）。
+    if root.show : dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(440px, parent.width - 32px);
+        height: min(462px, parent.height - 48px);
+        border-radius: 14px;
+        background: Theme.dialog-bg;
+        border-width: 1px;
+        border-color: Theme.dialog-border;
+        clip: true;
+
+        // 卡片空白区吞没层：防止点击 / 滚动穿透到遮罩层造成误关闭。
+        body-catcher := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+            scroll-event(event) => { return accept; }
+        }
+
+        VerticalBox {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 12px;
+
+            // —— 标题行：弹窗标题 + 关闭按钮 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                Text {
+                    text: "桌面弹窗拦截 - 黑名单规则管理";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                GhostIconButton {
+                    icon: @image-url("icons/close.svg");
+                    icon-size: 13px;
+                    icon-color: Theme.text-muted;
+                    clicked => { root.close-requested(); }
+                }
+            }
+
+            // —— 匹配语义提示 ——
+            Text {
+                text: "拦截窗口标题或类名包含关键词的弹窗（子串匹配 · 忽略大小写）；增删即时生效并自动保存。";
+                font-size: 11px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            // 分隔线
+            Rectangle {
+                height: 1px;
+                background: Theme.divider;
+            }
+
+            // —— 规则列表：纵向滚动（仅展示期挂载，避免隐藏态占用滚动事件） ——
+            rules-scroll := ScrollView {
+                vertical-stretch: 1;
+
+                VerticalBox {
+                    padding-right: 8px; // 预留纵向滚动条悬浮带
+                    padding-top: 2px;
+                    padding-bottom: 2px;
+                    spacing: 4px;
+                    width: rules-scroll.visible-width;
+
+                    // 空列表引导态
+                    if root.rules.length == 0 : Rectangle {
+                        height: 150px;
+
+                        Text {
+                            text: "暂无规则\n在下方输入关键词并点击「添加」，建立第一条拦截规则";
+                            font-size: 11px;
+                            color: Theme.text-muted;
+                            width: parent.width;
+                            height: parent.height;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    for rule[index] in root.rules : RuleRow {
+                        rule: rule;
+                        remove-requested => { root.remove-requested(index); }
+                    }
+                }
+            }
+
+            // —— 底部：单行输入 + 添加按钮 ——
+            HorizontalBox {
+                spacing: 10px;
+                alignment: center;
+
+                input := LineEdit {
+                    placeholder-text: "输入要拦截的窗口标题 / 类名关键词…";
+                    font-size: 12px;
+                    horizontal-stretch: 1;
+                    accepted(text) => {
+                        if (text != "") {
+                            root.add-requested(text);
+                            input.text = "";
+                        }
+                    }
+                }
+                PrimaryButton {
+                    text: "添加";
+                    enabled: input.text != "";
+                    clicked => {
+                        if (input.text != "") {
+                            root.add-requested(input.text);
+                            input.text = "";
+                        }
+                    }
                 }
             }
         }
@@ -208,6 +568,8 @@ export component MainWindow inherits Window {
 
     // ===== 对外暴露的只读数据（由 Rust 装配层注入） =====
     in property <[ModuleItem]> modules;
+    in property <[string]> popup_rules;
+    in property <bool> show_rules_modal: false;
     in property <bool> autostart_enabled;
     in property <string> app-version: "0.2.0";
 
@@ -215,6 +577,10 @@ export component MainWindow inherits Window {
     callback toggle_module(string, bool);
     callback toggle_autostart(bool);
     callback toggle_all_modules(bool);
+    callback open_rules_modal();
+    callback close_rules_modal();
+    callback add_rule(string);
+    callback remove_rule(int);
 
     // ============================================================
     //  顶部系统与全局控制栏 + 单栏模块卡片流
@@ -323,8 +689,25 @@ export component MainWindow inherits Window {
                     toggled(checked) => {
                         root.toggle_module(item.id, checked);
                     }
+                    settings-clicked => {
+                        root.open_rules_modal();
+                    }
                 }
             }
         }
+    }
+
+    // ============================================================
+    //  根层级规则管理遮罩层（覆盖于全部内容之上；见 RulesModal 输入架构说明）
+    // ============================================================
+    rules-modal := RulesModal {
+        width: root.width;
+        height: root.height;
+        show: root.show_rules_modal;
+        rules: root.popup_rules;
+
+        close-requested => { root.close_rules_modal(); }
+        add-requested(keyword) => { root.add_rule(keyword); }
+        remove-requested(index) => { root.remove_rule(index); }
     }
 }

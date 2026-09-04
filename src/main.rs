@@ -11,7 +11,10 @@
 //! `slint::include_modules!()` 引入）串成完整的常驻桌面应用。UI 为 480 × 560
 //! 的**单栏「桌面实用工具箱」**：顶部全局控制栏（标题/小版本号/开机自启/
 //! 一键全开全关）+ ScrollView 流式模块卡片列表（名称 / 描述 / 运行状态徽标 /
-//! 物理开关）；双栏时代的内嵌运行日志控制台已退役，日志改由 `tracing` 承载。
+//! 物理开关）；带设置项的模块（当前为弹窗拦截）卡片上另有齿轮按钮，点击弹出
+//! **「黑名单规则管理」弹窗**（根层级 Overlay：查看 / 新增 / 删除拦截关键词，
+//! 经 `update_rules` 热更新并持久化到配置，全程无需手写 TOML）；
+//! 双栏时代的内嵌运行日志控制台已退役，日志改由 `tracing` 承载。
 //! 装配顺序与职责：
 //!
 //! 1. **静默启动识别**：解析命令行 `--silent`（系统经注册表 Run 键拉起本程序时
@@ -41,7 +44,10 @@
 //! 9. **回调绑定**：模块开关 `toggle_module` 派发异步启停；全局「开机自启」
 //!    `toggle_autostart` 写注册表并持久化配置后回读收敛；「全部启用 / 全部停用」
 //!    `toggle_all_modules` 复用托盘的全量切换路径——三者落定后的真实状态均回流
-//!    UI（失败场景自然回滚开关）；
+//!    UI（失败场景自然回滚开关）；弹窗拦截额外注册**规则管理闭环**：齿轮点击
+//!    拉取 `current_rules` 灌入弹窗；新增 / 删除同步热更新模块内 RuleStore、
+//!    经单写者通道异步落盘 `popup_blacklist`、再回读归一化结果刷新弹窗列表——
+//!    规则事实源始终是模块内存态，配置与 UI 均自其收敛（详见函数体 8.4）；
 //! 10. **托盘装配与生命周期控制**（桌面常驻核心）：`tray::spawn` 派生**独立托盘
 //!     线程**（Win32 消息泵），把菜单 / 双击指令发布为 [`AppEvent::TrayAction`]；
 //!     关闭按钮按 `minimize_to_tray` 配置**隐藏到托盘**（`CloseRequestResponse`）；
@@ -58,16 +64,26 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tltoolbox::autostart;
 use tltoolbox::bus::{AppEvent, EventBus, TrayAction};
-use tltoolbox::config::ConfigManager;
+use tltoolbox::config::{AppConfig, ConfigManager};
 use tltoolbox::manager::{ModuleManager, SharedManager};
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::PopupBlockerModule;
+use tltoolbox::modules::ToolModule;
 use tltoolbox::tray::{self, TrayControl};
 
 // ---------------------------------------------------------------------------
 // UI 模型辅助（仅允许在 UI 主线程执行）
 // ---------------------------------------------------------------------------
+
+/// 模块是否在卡片上提供「设置齿轮」（点击弹出模块级配置面板）。
+///
+/// 仅当模块装配层为其实现了设置面板入口回调时才返回 `true`；当前只有弹窗拦截
+/// 模块具备「黑名单规则管理」弹窗，其余模块（如 keep_awake）不渲染齿轮。
+/// 未来新增带设置面板的模块时在此扩展。
+fn module_has_settings(id: &str) -> bool {
+    matches!(id, "popup_blocker")
+}
 
 /// 把调度层元数据快照转换为 UI 模块列表条目。
 fn module_items_from_manager(manager: &ModuleManager) -> Vec<ModuleItem> {
@@ -79,6 +95,7 @@ fn module_items_from_manager(manager: &ModuleManager) -> Vec<ModuleItem> {
             name: SharedString::from(meta.display_name),
             desc: SharedString::from(meta.description),
             enabled: meta.running,
+            has_settings: module_has_settings(meta.id),
         })
         .collect()
 }
@@ -95,6 +112,75 @@ fn refresh_modules_model(ui: &MainWindow, manager: &ModuleManager) {
     if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<ModuleItem>>() {
         vec_model.set_vec(items);
     }
+}
+
+/// 【UI 线程内】整体替换弹窗规则列表模型（`popup_rules` in-property）。
+///
+/// 采用 `set_popup_rules`（模型 reset 语义）而非逐行更新：规则增删后行号必须与
+/// 弹窗展示顺序严格一致，reset 会令 `for` 中继重建行元素并把（删除按钮）回调里的
+/// `index` 重新绑定到新行号上。规则数量级为个位数到数十条，重建成本可忽略。
+fn set_popup_rules_model(ui: &MainWindow, rules: Vec<String>) {
+    let model = VecModel::from(
+        rules
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<SharedString>>(),
+    );
+    ui.set_popup_rules(ModelRc::new(model));
+}
+
+/// 【任意线程可调用】把最新的规则列表异步刷入 UI 的 `popup_rules` 模型。
+///
+/// 经 `slint::invoke_from_event_loop` 排队到 UI 线程执行。为何不直接在回调里同步
+/// 改写：删除回调由「被删除行自身的按钮」触发，同步重建模型会销毁正在派发事件的
+/// 行元素；排队到下一轮事件循环即可让当前事件干净收尾后再重建列表。
+fn deliver_popup_rules_refresh(ui_weak: &slint::Weak<MainWindow>, rules: Vec<String>) {
+    let weak = ui_weak.clone();
+    let queued = slint::invoke_from_event_loop(move || {
+        if let Some(ui) = weak.upgrade() {
+            set_popup_rules_model(&ui, rules);
+        }
+    });
+    if queued.is_err() {
+        tracing::warn!(target: "main", "无法投递规则列表刷新：UI 事件循环已不可用");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 配置持久化（弹窗规则的黑名单落盘：单写者串行化，保证最终写入为最后一次操作）
+// ---------------------------------------------------------------------------
+
+/// 配置持久化通道的发送端句柄：投递一份「最新黑名单」即触发一次异步落盘。
+///
+/// 落盘由一个常驻任务串行消费（先进先出），因此即便用户在弹窗里快速连续增删，
+/// 最后一次操作对应的黑名单也必然最后写盘——避免并发 `save` 的 last-write-wins
+/// 乱序把较早快照覆盖到较新状态上。发送端被 UI 回调持有（进程生命周期内不关闭），
+/// 任务在通道关闭（进程收尾）时自然退出。
+type ConfigBlacklistSender = tokio::sync::mpsc::UnboundedSender<Vec<String>>;
+
+/// 派生配置持久化任务：接收「最新黑名单」→ 更新运行期配置并异步原子落盘。
+fn spawn_blacklist_persister(
+    config_mgr: Arc<ConfigManager>,
+    runtime_config: Arc<Mutex<AppConfig>>,
+) -> ConfigBlacklistSender {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    tokio::spawn(async move {
+        while let Some(blacklist) = rx.recv().await {
+            // 1) 更新内存中的运行期配置（加锁后整份克隆快照，随即释放锁）。
+            let snapshot = {
+                let mut cfg = runtime_config.lock().await;
+                cfg.popup_blacklist = blacklist;
+                cfg.clone()
+            };
+            // 2) 异步原子写盘（ConfigManager::save 自带写锁串行化）。
+            if let Err(err) = config_mgr.save(&snapshot).await {
+                tracing::error!(target: "main", "黑名单规则写入配置失败: {err}");
+            } else {
+                tracing::debug!(target: "main", "黑名单规则已持久化到 tltoolbox.toml");
+            }
+        }
+    });
+    tx
 }
 
 // ---------------------------------------------------------------------------
@@ -312,11 +398,17 @@ async fn main() -> Result<(), AppError> {
     // ---- 4. 模块管理器装配：先注册全部内置常驻守护模块。 ----
     //      弹窗拦截模块的初始黑名单取自配置 `popup_blacklist`（含默认广告关键词），
     //      运行期可经 `PopupBlockerModule::update_rules` 热更新而无需重启原生泵线程。
+    //      同时保留强类型句柄（`Arc<PopupBlockerModule>`）：规则管理弹窗的回调需要
+    //      直接读取 / 热更新黑名单（`current_rules` / `update_rules` 为模块专用方法，
+    //      不在 [`ToolModule`](tltoolbox::modules::ToolModule) 契约上）。
     let mut module_mgr = ModuleManager::new(event_bus.clone());
-    let popup_rules_count = app_config.popup_blacklist.len();
-    module_mgr.register(Arc::new(PopupBlockerModule::with_rules(
+    let popup_blocker = Arc::new(PopupBlockerModule::with_rules(
         app_config.popup_blacklist.clone(),
-    )));
+    ));
+    let popup_rules_count = app_config.popup_blacklist.len();
+    // 显式升级为 trait 对象：先克隆具体类型再经 unsize 强转，避免推理歧义。
+    let popup_module: Arc<dyn ToolModule> = popup_blocker.clone();
+    module_mgr.register(popup_module);
     tracing::info!(
         target: "main",
         "弹窗拦截黑名单已注入 PopupBlockerModule（{} 条关键词，运行期可热更新）",
@@ -444,6 +536,85 @@ async fn main() -> Result<(), AppError> {
         tokio::spawn(async move {
             set_all_modules(&mgr, enable).await;
         });
+    });
+
+    // 8.4 弹窗拦截 · 黑名单规则管理闭环（卡片齿轮 → 规则弹窗查看 / 新增 / 删除）。
+    //     规则的事实源始终是 PopupBlockerModule 内部的 RuleStore（写入即归一化 +
+    //     去重 + 热更新生效），配置（tltoolbox.toml）与 UI 列表都从它回读收敛，
+    //     三者永不产生分支状态。持久化经单写者通道串行落盘（见
+    //     spawn_blacklist_persister），避免连续操作写盘乱序。
+    let blacklist_persister = spawn_blacklist_persister(
+        Arc::clone(&config_mgr),
+        Arc::clone(&runtime_config),
+    );
+
+    // 8.4.1 齿轮点击 → 从模块读取最新规则灌入 UI 模型并展示弹窗。
+    let open_blocker = Arc::clone(&popup_blocker);
+    let open_ui = ui.as_weak();
+    ui.on_open_rules_modal(move || {
+        let Some(ui) = open_ui.upgrade() else { return };
+        set_popup_rules_model(&ui, open_blocker.current_rules());
+        ui.set_show_rules_modal(true);
+    });
+
+    // 8.4.2 弹窗关闭（右上角 × / 点击遮罩空白）。
+    let close_ui = ui.as_weak();
+    ui.on_close_rules_modal(move || {
+        if let Some(ui) = close_ui.upgrade() {
+            ui.set_show_rules_modal(false);
+        }
+    });
+
+    // 8.4.3 新增规则：热更新 RuleStore → 顺序持久化 → 回读归一化结果刷新 UI。
+    //       （空白输入由 Slint 侧按钮禁用 + 此处 trim 双保险；去重由 RuleStore
+    //         统一完成，重复关键词在此静默合并、UI 列表不变。）
+    let add_blocker = Arc::clone(&popup_blocker);
+    let add_persist = blacklist_persister.clone();
+    let add_ui = ui.as_weak();
+    ui.on_add_rule(move |text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut rules = add_blocker.current_rules();
+        rules.push(trimmed.to_string());
+        add_blocker.update_rules(rules);
+        let normalized = add_blocker.current_rules();
+        let _ = add_persist.send(normalized.clone());
+        deliver_popup_rules_refresh(&add_ui, normalized);
+    });
+
+    // 8.4.4 删除规则（按弹窗行号；行号与 current_rules 顺序一致）。
+    //
+    // 采用「文本匹配优先、行号兜底」的策略：以用户**当前看到的那一行**的文字为准，
+    // 从 RuleStore 中找到同一条目删除。即便上一条操作的 UI 刷新仍在排队（列表尚未
+    // 重排、行号短暂滞后），点击也只会删掉用户目之所及的那条规则，绝不错删。
+    let remove_blocker = Arc::clone(&popup_blocker);
+    let remove_persist = blacklist_persister.clone();
+    let remove_ui = ui.as_weak();
+    ui.on_remove_rule(move |index| {
+        let idx = index as usize;
+        // 1) 读当前可见行的文字（UI 线程内同步读取模型是安全的）。
+        let visible_text = remove_ui
+            .upgrade()
+            .and_then(|ui| ui.get_popup_rules().row_data(idx))
+            .map(|text| text.to_string());
+
+        let mut rules = remove_blocker.current_rules();
+        let remove_at = visible_text
+            .as_deref()
+            .and_then(|text| rules.iter().position(|rule| rule.as_str() == text))
+            .unwrap_or(idx); // 文本匹配失败（异常状态）→ 退化为按行号删除
+        if remove_at >= rules.len() {
+            tracing::warn!(target: "main", "删除规则越界：index={index}，当前共 {} 条", rules.len());
+            return;
+        }
+        let removed = rules.remove(remove_at);
+        remove_blocker.update_rules(rules);
+        let normalized = remove_blocker.current_rules();
+        let _ = remove_persist.send(normalized.clone());
+        tracing::info!(target: "main", "已删除拦截关键词 \"{removed}\"（剩余 {} 条）", normalized.len());
+        deliver_popup_rules_refresh(&remove_ui, normalized);
     });
 
     // ---- 9. 托盘装配与生命周期控制（桌面常驻核心机制）。 ----
