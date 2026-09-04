@@ -1,0 +1,139 @@
+# TLToolBox 自动发布流水线（GitHub Actions · Windows）
+#
+# 触发条件：
+#   1. 推送形如 v0.2.0 / v0.2.0-rc.1 的 Git Tag（refs/tags/v*）；
+#   2. 仓库 Actions 页手动触发（workflow_dispatch，便于演练/补发）。
+#
+# 说明：发布动作以 Tag 为锚点——只有 Tag 推送事件才创建 GitHub Release，
+# 手动触发的运行只执行「测试 + 编译 + 打包」，产物以 Actions Artifact 留存，
+# 不会误建 Release。
+#
+# Windows 构建依赖事实（与 Slint 官方 CI 一致）：
+#   - Slint 的 Rust 桌面栈（winit 事件循环 + femtovg/软件渲染器）在 Windows 上
+#     无独立系统级安装包（Linux 才需要 apt 安装 libxkbcommon/libegl 等），
+#     其编译期依赖全部经 cargo 解析；
+#   - 需要的是 MSVC 工具链：windows-latest 镜像已预装 VS2022 Build Tools 与
+#     Windows SDK，本流水线额外激活 vcvars 环境，保证 cargo 链接阶段的 link.exe
+#     以及 build.rs（winresource 内嵌 manifest / exe 图标）所需的 rc.exe 可被发现。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # 创建 GitHub Release 并上传 zip / SHA256 资产
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  release:
+    name: Build & publish tltoolbox (Windows x86_64)
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout 源码
+        uses: actions/checkout@v4
+
+      # stable MSVC Rust：windows-latest 的 rustup 默认宿主即 x86_64-pc-windows-msvc。
+      - name: 安装 Rust 工具链（stable · MSVC）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 恢复 Cargo 缓存（Cargo.lock 驱动，加速 LTO 全量编译）
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64-release
+
+      # 激活 MSVC 构建工具环境：把 link.exe / rc.exe 等加入 PATH。
+      # windows-latest 自带 VS2022 Build Tools，本步仅做 vcvars 环境初始化。
+      - name: 配置 MSVC 构建工具环境（vcvars64）
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Slint 构建依赖在 Windows 上无系统级安装项，依赖随 cargo 解析；
+      # 此处预拉取整棵依赖树（slint / slint-build 等），把网络阶段与编译阶段
+      # 分离，便于缓存命中与失败定位。
+      - name: 准备 Slint 构建依赖（预拉取依赖树）
+        shell: pwsh
+        run: |
+          cargo fetch
+          Write-Host "Slint 依赖树就绪（cargo fetch 完成，无 Windows 系统级依赖）"
+
+      # 集成测试已在 tests/ 中确认可“无图形会话”离线执行（仅依赖 tokio）。
+      - name: 运行测试（cargo test --release --all-targets）
+        shell: pwsh
+        run: cargo test --release --all-targets
+
+      - name: 编译发布二进制（cargo build --release）
+        shell: pwsh
+        run: cargo build --release
+
+      - name: 校验构建产物
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'target/release/tltoolbox.exe'
+          if (-not (Test-Path $exe)) { throw "构建产物缺失: $exe" }
+          $item = Get-Item $exe
+          Write-Host "tltoolbox.exe: $($item.Length) bytes ($([math]::Round($item.Length / 1MB, 2)) MB)"
+
+      # 打包：zip 内保留仓库相对布局（config/ 子目录），与运行时
+      # “config/tltoolbox.toml 相对当前目录解析”的契约一致。
+      - name: 打包产物并生成 SHA256 校验和
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifact = 'tltoolbox-windows-x86_64'
+          $exe  = 'target/release/tltoolbox.exe'
+          $toml = 'config/tltoolbox.toml'
+
+          foreach ($f in @($exe, $toml)) {
+            if (-not (Test-Path -LiteralPath $f)) { throw "缺少打包产物: $f" }
+          }
+
+          $stage = Join-Path $env:RUNNER_TEMP "$artifact-stage"
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'config') | Out-Null
+
+          Copy-Item -LiteralPath $exe  -Destination (Join-Path $stage 'tltoolbox.exe')
+          Copy-Item -LiteralPath $toml -Destination (Join-Path $stage 'config/tltoolbox.toml')
+
+          $zip = "$artifact.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
+
+          # sha256sum 兼容格式：<小写哈希>  <文件名>
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          "$hash  $zip" | Set-Content -Encoding ascii -NoNewline -Path "$zip.sha256"
+
+          Write-Host "--- 打包完成 ---"
+          Get-ChildItem -LiteralPath $zip, "$zip.sha256" | Select-Object Name, Length
+
+      - name: 上传构建产物（Actions Artifact，手动触发时可下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: tltoolbox-windows-x86_64
+          path: |
+            tltoolbox-windows-x86_64.zip
+            tltoolbox-windows-x86_64.zip.sha256
+          if-no-files-found: error
+
+      # 仅 Tag 推送事件创建 GitHub Release（softprops/action-gh-release v3）。
+      - name: 创建 GitHub Release 并上传 zip 与 SHA256
+        uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            tltoolbox-windows-x86_64.zip
+            tltoolbox-windows-x86_64.zip.sha256
+          generate_release_notes: true
+          # 形如 v0.2.0-rc.1 的 Tag 自动标记为预发布（prerelease）。
+          prerelease: ${{ contains(github.ref_name, '-') }}
