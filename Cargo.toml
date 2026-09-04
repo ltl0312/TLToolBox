@@ -45,6 +45,9 @@ tray-icon = "0.19"
 #                                 Security 命名空间；CreateMutexW 的签名引用它，因此单实例
 #                                 守护的具名互斥需额外启用本 feature——实际调用传 None，
 #                                 不使用任何安全描述符；不启用则 CreateMutexW 整体不可见）
+#   - Win32_System_LibraryLoader  ：GetModuleHandleW / FindResourceW / LoadResource /
+#                                  LockResource / SizeofResource（托盘运行期从 exe 资源段
+#                                  读取 build.rs 内嵌的 RT_GROUP_ICON / RT_ICON 图标帧）
 #   - Win32_UI_Accessibility      ：SetWinEventHook / UnhookWinEvent / HWINEVENTHOOK / WINEVENTPROC
 #   - Win32_System_Registry       ：RegOpenKeyExW / RegSetValueExW / RegQueryValueExW /
 #                                  RegDeleteValueW（开机自启读写的注册表 API）
@@ -63,6 +66,7 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
     "Win32_Security",
+    "Win32_System_LibraryLoader",
     "Win32_UI_Accessibility",
     "Win32_System_Registry",
     "Win32_System_Power",

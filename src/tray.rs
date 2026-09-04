@@ -4,8 +4,10 @@
 //! （System Tray），由托盘图标承载右键菜单与双击唤醒。本模块是常驻层的
 //! 底层机制，负责：
 //!
-//! - 创建托盘图标（优先使用应用图标资源，缺失时退化为**程序化生成的备用嵌入
-//!   图标**——纯代码像素绘制，零额外资源文件）；
+//! - 创建托盘图标（优先从**可执行文件内嵌图标资源**解码 32×32 应用图标——
+//!   `build.rs` 已把 `res/app.ico` 经 winresource 编译为 RT_GROUP_ICON/RT_ICON，
+//!   此处读取帧目录并解码 DIB 帧；资源缺失或格式异常时降级为**程序化生成的
+//!   备用嵌入图标**——纯代码像素绘制，零额外资源文件）；
 //! - 构建原生右键菜单（`muda` crate）：`显示主窗口` / `全部模块：开启/关闭` /
 //!   `退出程序`；
 //! - 监听托盘事件（菜单点击、双击图标），把用户意图以
@@ -275,7 +277,11 @@ mod platform {
 
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
-    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HGLOBAL, HMODULE, HRSRC, HWND, LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::{
+        FindResourceW, GetModuleHandleW, LoadResource, LockResource, SizeofResource,
+    };
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, PostThreadMessageW,
@@ -287,6 +293,17 @@ mod platform {
 
     /// 备用嵌入图标的规格（32×32，Windows 托盘按 DPI 缩放）。
     const ICON_SIZE: usize = 32;
+
+    // ---- 内嵌图标资源常量（与 build.rs 的 winresource 嵌入约定一致） ----
+
+    /// RT_ICON 资源类型（winuser.h 预定义 #3）。
+    const RT_ICON: u16 = 3;
+    /// RT_GROUP_ICON 资源类型（winuser.h 预定义 #14）。
+    const RT_GROUP_ICON: u16 = 14;
+    /// winresource::set_icon 固定把图标组写为资源名 "1"（应用图标约定）。
+    const APP_ICON_GROUP_ID: u16 = 1;
+    /// 托盘图标目标边长（32 px；帧目录按此就近选帧，DPI 缩放交给系统）。
+    const TRAY_ICON_PX: u32 = 32;
 
     // ------------------------------------------------------------------
     // 托盘管理器（托盘线程独享；非 Send —— 内部为 Rc 句柄）
@@ -341,8 +358,22 @@ mod platform {
                     })?;
             }
 
-            // 2) 图标：备用嵌入图标（纯代码像素绘制，见 build_fallback_icon）。
-            let icon = build_fallback_icon()?;
+            // 2) 图标：优先从 exe 内嵌图标资源（build.rs 嵌入的 res/app.ico）
+            //    解码 32×32 帧；资源缺失 / 非 32bpp DIB / 解析失败时降级为
+            //    纯代码像素绘制的备用图标，保证托盘任何构建形态下都有图标。
+            let icon = match load_embedded_app_icon() {
+                Ok(icon) => {
+                    tracing::debug!(target: "tray", "托盘图标：已从 exe 内嵌图标资源加载 32×32 帧");
+                    icon
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "tray",
+                        "托盘图标资源加载失败，降级为程序化备用图标: {err}"
+                    );
+                    build_fallback_icon()?
+                }
+            };
 
             // 3) 托盘图标：绑定菜单；左键单击**不**弹出菜单（仅右键弹出，
             //    左键保留给双击 → 显示主窗口）。
@@ -585,14 +616,88 @@ mod platform {
     }
 
     // ------------------------------------------------------------------
+    // 内嵌应用图标加载（优先路径）
+    // ------------------------------------------------------------------
+    //
+    // build.rs 把 res/app.ico 经 winresource 编译成两级 PE 资源：
+    //   - RT_GROUP_ICON(14)，名 "1"：帧目录，记录各尺寸帧（宽/高/色深）与
+    //     对应 RT_ICON 资源的数字 ID（GRPICONDIRENTRY 尾部 2 字节 wID）；
+    //   - RT_ICON(3)，名 = wID：单帧原始字节（<256px 为 32bpp DIB/BMP 帧，
+    //     256px 一般为 PNG 压缩帧）。
+    // 托盘只需 32×32 帧：读组目录 → 就近选 32bpp 帧 → 读 RT_ICON 字节 →
+    // 自行解码 DIB 为 RGBA（纯函数见模块尾部，带单元测试）。任何一步失败
+    // 都返回 Err，由调用方降级到 build_fallback_icon，绝不因图标问题阻断托盘。
+
+    /// 读取当前进程模块内一个数字 ID 资源的原始字节。
+    ///
+    /// `name` / `r#type` 均为资源数字 ID（`MAKEINTRESOURCE` 语义）。
+    unsafe fn load_resource_bytes(module: HMODULE, name: u16, r#type: u16) -> Result<Vec<u8>, String> {
+        // 数字 ID → 伪指针（低 16 位即 ID，等同 MAKEINTRESOURCEW）。
+        let name_ptr = PCWSTR(name as usize as *const u16);
+        let type_ptr = PCWSTR(r#type as usize as *const u16);
+        let hres: HRSRC = FindResourceW(module, name_ptr, type_ptr);
+        if hres.is_invalid() {
+            return Err(format!("FindResourceW 未找到资源 #{}（类型 #{})", name, r#type));
+        }
+        let hglobal: HGLOBAL = LoadResource(module, hres).map_err(|err| err.to_string())?;
+        if hglobal.is_invalid() {
+            return Err(format!("LoadResource 失败（资源 #{name}）"));
+        }
+        let size = SizeofResource(module, hres) as usize;
+        let ptr = LockResource(hglobal);
+        if ptr.is_null() {
+            return Err(format!("LockResource 返回空指针（资源 #{name}）"));
+        }
+        Ok(std::slice::from_raw_parts(ptr as *const u8, size).to_vec())
+    }
+
+    /// 主入口：从 exe 内嵌图标资源取托盘用 32×32 图标。
+    fn load_embedded_app_icon() -> Result<Icon, TrayError> {
+        let fail = |step: &str, reason: String| TrayError::Init {
+            reason: format!("exe 内嵌图标资源不可用（{step}）: {reason}"),
+        };
+
+        let (rgba, width, height) = (|| -> Result<(Vec<u8>, u32, u32), TrayError> {
+            unsafe {
+                // 1) exe 主模块句柄（NULL 模块名 = 当前进程可执行文件）。
+                let module = GetModuleHandleW(None).map_err(|err| {
+                    fail("GetModuleHandleW", format!("无法取得进程模块句柄: {err}"))
+                })?;
+
+                // 2) 读组目录并按“就近于 32px、32bpp 优先”排定候选帧。
+                let group = load_resource_bytes(module, APP_ICON_GROUP_ID, RT_GROUP_ICON)
+                    .map_err(|reason| fail("RT_GROUP_ICON(#1)", reason))?;
+                let frame_ids = super::preferred_icon_frame_ids(&group, TRAY_ICON_PX)
+                    .ok_or_else(|| {
+                        fail("帧目录解析", "组图标不含任何合法帧条目".into())
+                    })?;
+
+                // 3) 依序尝试各候选帧：DIB 解码成功即用（256px PNG 帧天然解码
+                //    失败、自动跳过，不影响 32px DIB 帧命中）。
+                for frame_id in frame_ids {
+                    let dib = load_resource_bytes(module, frame_id, RT_ICON)
+                        .map_err(|reason| fail("RT_ICON 读取", reason))?;
+                    if let Some(decoded) = super::decode_bmp_frame_to_rgba(&dib) {
+                        return Ok(decoded);
+                    }
+                }
+                Err(fail("RT_ICON 解码", "候选帧均非可解码的 32bpp DIB".into()))
+            }
+        })()?;
+
+        Icon::from_rgba(rgba, width, height).map_err(|err| TrayError::Init {
+            reason: format!("内嵌图标转托盘 Icon 失败: {err}"),
+        })
+    }
+
+    // ------------------------------------------------------------------
     // 备用嵌入图标（程序化像素绘制）
     // ------------------------------------------------------------------
 
     /// 生成备用托盘图标：品牌蓝圆角方块 + 白色 “T” 字形。
     ///
-    /// 纯代码逐像素绘制（零资源文件、零解码依赖）；若未来引入应用图标资源
-    /// （`.ico` 经 `include_bytes!` + 解码，或 `.rc` 编译进资源），可在此处
-    /// 优先加载、本函数降级为兜底。
+    /// 纯代码逐像素绘制（零资源文件、零解码依赖），仅当 exe 内嵌图标资源
+    /// 无法解码（如无资源构建 / 帧目录异常）时作为兜底路径被调用。
     fn build_fallback_icon() -> Result<Icon, TrayError> {
         let mut rgba = vec![0u8; ICON_SIZE * ICON_SIZE * 4];
         for y in 0..ICON_SIZE {
@@ -672,6 +777,142 @@ pub(crate) fn pixel_color(x: i32, y: i32) -> Option<(u8, u8, u8)> {
 }
 
 // ---------------------------------------------------------------------------
+// 内嵌图标帧解析纯函数（Windows 托盘图标资源解码；单测见下方模块）
+// ---------------------------------------------------------------------------
+
+/// RT_GROUP_ICON 帧目录条目长度（GRPICONDIRENTRY = 14 字节；与磁盘 .ico 的
+/// 16 字节 ICONDIRENTRY 差在结尾：组条目是 2 字节 wID 而非 4 字节数据偏移）。
+#[cfg(windows)]
+const GRP_ENTRY_LEN: usize = 14;
+/// ICO/BMP 帧的 BITMAPINFOHEADER 长度（32bpp、无调色板）。
+#[cfg(windows)]
+const BMP_HEADER_LEN: usize = 40;
+
+/// RT_GROUP_ICON 帧目录中的一条帧记录。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct IconFrameEntry {
+    /// 帧宽（组目录中 0 表示 256）。选帧逻辑按“就近于目标宽”使用。
+    width: u32,
+    /// 帧高（0 表示 256）。当前选帧只按宽就近；高度保留供校验与未来
+    /// 逐监视器 DPI 选帧策略使用。
+    #[allow(dead_code)]
+    height: u32,
+    /// 每像素位数（32 = 含 alpha 的 DIB / PNG 帧）。
+    bit_count: u16,
+    /// 指向 RT_ICON 资源的数字 ID。
+    id: u16,
+}
+
+/// 解析 RT_GROUP_ICON 帧目录字节（布局同磁盘 .ico 的 ICONDIR，条目为组格式）。
+#[cfg(windows)]
+fn parse_group_entries(group: &[u8]) -> Option<Vec<IconFrameEntry>> {
+    if group.len() < 6 {
+        return None;
+    }
+    let count = u16::from_le_bytes(group[4..6].try_into().ok()?) as usize;
+    if group.len() < 6 + count * GRP_ENTRY_LEN {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let e = 6 + i * GRP_ENTRY_LEN;
+        entries.push(IconFrameEntry {
+            width: if group[e] == 0 { 256 } else { group[e] as u32 },
+            height: if group[e + 1] == 0 { 256 } else { group[e + 1] as u32 },
+            bit_count: u16::from_le_bytes(group[e + 6..e + 8].try_into().ok()?),
+            id: u16::from_le_bytes(group[e + 12..e + 14].try_into().ok()?),
+        });
+    }
+    Some(entries)
+}
+
+/// 依“32bpp 优先；就近不小于 `target` 的帧升序，全小于则大帧优先兜底”的
+/// 规则，排定候选帧的 RT_ICON ID 序列。目录为空/非法返回 `None`。
+#[cfg(windows)]
+fn preferred_icon_frame_ids(group: &[u8], target: u32) -> Option<Vec<u16>> {
+    let entries = parse_group_entries(group)?;
+    if entries.is_empty() {
+        return None;
+    }
+    // 1) 优先 32bpp 池；组内没有 32bpp 帧时退而求其次使用全部帧。
+    let bpp32: Vec<&IconFrameEntry> = entries
+        .iter()
+        .filter(|entry| entry.bit_count == 32)
+        .collect();
+    let pool = if bpp32.is_empty() {
+        entries.iter().collect()
+    } else {
+        bpp32
+    };
+    // 2) 排序：先试“不小于 target”的最小帧（避免把小帧放大发虚）；
+    //    全部不足时按宽降序（取最大帧兜底），仍未中则整表尝试。
+    let mut ordered: Vec<IconFrameEntry> = pool.into_iter().cloned().collect();
+    ordered.sort_by_key(|entry| entry.width);
+    let split = ordered.partition_point(|entry| entry.width < target);
+    let mut ids: Vec<u16> = Vec::with_capacity(ordered.len());
+    ids.extend(ordered[split..].iter().map(|entry| entry.id));
+    ids.extend(ordered[..split].iter().rev().map(|entry| entry.id));
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+/// 把一段 RT_ICON 的 32bpp DIB（BITMAPINFOHEADER + BGRA XOR 像素，尾部可附
+/// AND 掩码，此处忽略）解码为 RGBA。仅接受 BI_RGB + 32bpp；256px 的 PNG
+/// 压缩帧在此解码失败（`None`），由调用方跳过该候选。
+#[cfg(windows)]
+fn decode_bmp_frame_to_rgba(dib: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if dib.len() < BMP_HEADER_LEN {
+        return None;
+    }
+    let bi_size = u32::from_le_bytes(dib[0..4].try_into().ok()?) as usize;
+    if bi_size < BMP_HEADER_LEN || dib.len() < bi_size {
+        return None;
+    }
+    let width = i32::from_le_bytes(dib[4..8].try_into().ok()?);
+    let height_raw = i32::from_le_bytes(dib[8..12].try_into().ok()?);
+    if width <= 0 || height_raw == 0 {
+        return None;
+    }
+    let bit_count = u16::from_le_bytes(dib[14..16].try_into().ok()?);
+    let compression = u32::from_le_bytes(dib[16..20].try_into().ok()?);
+    if bit_count != 32 || compression != 0 {
+        return None;
+    }
+    let w = width as u32;
+    let h = height_raw.unsigned_abs();
+    let top_down = height_raw < 0;
+    let row_bytes = w as usize * 4;
+    if dib.len() < bi_size + row_bytes * h as usize {
+        return None;
+    }
+    let mut rgba = vec![0u8; row_bytes * h as usize];
+    for y in 0..h as usize {
+        // ICO 内 DIB 帧默认自底向上（biHeight > 0）；自顶向下（<0）原样拷贝。
+        let src_row = if top_down { y } else { h as usize - 1 - y };
+        let src = bi_size + src_row * row_bytes;
+        let dst = y * row_bytes;
+        for x in 0..w as usize {
+            let o = src + x * 4;
+            let alpha = dib[o + 3];
+            if alpha == 0 {
+                // 全透明像素清色，避免托盘合成时残留脏色。
+                rgba[dst + x * 4..dst + x * 4 + 4].fill(0);
+            } else {
+                rgba[dst + x * 4] = dib[o + 2]; // B → R
+                rgba[dst + x * 4 + 1] = dib[o + 1];
+                rgba[dst + x * 4 + 2] = dib[o]; // R → B
+                rgba[dst + x * 4 + 3] = alpha;
+            }
+        }
+    }
+    Some((rgba, w, h))
+}
+
+// ---------------------------------------------------------------------------
 // 单元测试（纯函数层，跨平台）
 // ---------------------------------------------------------------------------
 
@@ -722,5 +963,125 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- 内嵌图标帧解析（Windows 构建产物形态的合成字节） ----
+
+    /// 构造 RT_GROUP_ICON 帧目录字节（仅宽/色深/ID 字段参与选择逻辑）。
+    #[cfg(windows)]
+    fn synth_group(entries: &[(u8, u16, u16)]) -> Vec<u8> {
+        // entries: (宽度字节 0=256, 色深, wID)
+        let mut bytes = vec![0u8, 0, 1, 0];
+        bytes.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (width, bpp, id) in entries {
+            bytes.push(*width); // bWidth
+            bytes.push(*width); // bHeight（同宽，正方形帧）
+            bytes.push(0); // bColorCount
+            bytes.push(0); // bReserved
+            bytes.extend_from_slice(&1u16.to_le_bytes()); // wPlanes
+            bytes.extend_from_slice(&bpp.to_le_bytes()); // wBitCount
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // dwBytesInRes（选择逻辑不读）
+            bytes.extend_from_slice(&id.to_le_bytes()); // wID
+        }
+        bytes
+    }
+
+    /// 构造 32bpp DIB 帧字节：`bi_height` 为正（自底向上）或负（自顶向下）；
+    /// 内容为每条边沿像素的红/绿/蓝三原色 + 白角，便于校验通道与翻转。
+    #[cfg(windows)]
+    fn synth_dib(size: u32, bi_height: i32) -> Vec<u8> {
+        let mut dib = vec![0u8; BMP_HEADER_LEN + (size as usize) * (size as usize) * 4];
+        dib[0..4].copy_from_slice(&(BMP_HEADER_LEN as u32).to_le_bytes());
+        dib[4..8].copy_from_slice(&(size as i32).to_le_bytes());
+        dib[8..12].copy_from_slice(&bi_height.to_le_bytes());
+        dib[12..14].copy_from_slice(&1u16.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        let row = size as usize * 4;
+        for y in 0..size as usize {
+            for x in 0..size as usize {
+                let dst_row = if bi_height > 0 {
+                    size as usize - 1 - y
+                } else {
+                    y
+                };
+                let o = BMP_HEADER_LEN + dst_row * row + x * 4;
+                // BGRA：红列 / 绿行 / 蓝对角线 / 白角（右下）。
+                let (r, g, b) = if x == (size as usize - 1) && y == (size as usize - 1) {
+                    (255, 255, 255)
+                } else if x == y {
+                    (0, 0, 255)
+                } else if x == size as usize - 1 {
+                    (255, 0, 0)
+                } else if y == size as usize - 1 {
+                    (0, 255, 0)
+                } else {
+                    (10, 20, 30)
+                };
+                dib[o] = b;
+                dib[o + 1] = g;
+                dib[o + 2] = r;
+                dib[o + 3] = 255;
+            }
+        }
+        dib
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn group_picker_prefers_32bpp_then_nearest_not_smaller() {
+        // 32bpp：16(#2)/32(#3)/256(#4)；24bpp：48(#5)。target=32 应首选 #3，
+        // 且 256 帧（PNG、解码会失败）排在 16 帧之前仍无碍——选择只看尺寸。
+        let group = synth_group(&[(16, 32, 2), (32, 32, 3), (0, 32, 4), (48, 24, 5)]);
+        let ids = preferred_icon_frame_ids(&group, 32).expect("帧目录应合法");
+        assert_eq!(ids[0], 3, "32px 32bpp 帧应排在首位");
+        // 无 32bpp 时退回全部帧，且大帧（48）优先于小帧兜底。
+        let group24 = synth_group(&[(16, 24, 2), (48, 24, 5)]);
+        let ids24 = preferred_icon_frame_ids(&group24, 32).expect("帧目录应合法");
+        assert_eq!(ids24[0], 5, "48px 24bpp 应作为最接近 32px 的兜底首选");
+        // 非法目录（截断）→ None。
+        assert!(preferred_icon_frame_ids(&[0u8, 0], 32).is_none());
+        assert!(parse_group_entries(&[0u8; 0]).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dib_decoder_flips_rows_and_swaps_channels() {
+        for (size, bi_height) in [(2u32, 2i32), (2, -2), (3, 3)] {
+            let dib = synth_dib(size, bi_height);
+            let (rgba, w, h) = decode_bmp_frame_to_rgba(&dib).expect("32bpp DIB 应可解码");
+            assert_eq!((w, h), (size, size));
+            let at = |x: usize, y: usize| {
+                let o = (y * size as usize + x) * 4;
+                (rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3])
+            };
+            let last = size as usize - 1;
+            // 右下角白（合成器先判白角，再判对角线）。
+            assert_eq!(at(last, last), (255, 255, 255, 255), "右下角应为白");
+            // 右列红 / 底行绿：验证 BGRA → RGBA 通道互换 + 自底向上翻转到原位。
+            assert_eq!(at(last, 0), (255, 0, 0, 255), "右列应为红");
+            assert_eq!(at(0, last), (0, 255, 0, 255), "底行应为绿");
+            // 主对角线蓝（含 (0,0)）。
+            assert_eq!(at(0, 0), (0, 0, 255, 255), "(0,0) 位于对角线应为蓝");
+            if size >= 3 {
+                assert_eq!(at(1, 1), (0, 0, 255, 255), "内部对角像素应为蓝");
+                assert_eq!(at(1, 0), (10, 20, 30, 255), "内部普通像素保持底色");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dib_decoder_rejects_non_32bpp_and_truncated() {
+        // 非 32bpp（24bpp）与截断字节 → None。
+        let mut dib = synth_dib(2, 2);
+        dib[14] = 24;
+        assert!(decode_bmp_frame_to_rgba(&dib).is_none());
+        let mut short = synth_dib(2, 2);
+        short.truncate(30);
+        assert!(decode_bmp_frame_to_rgba(&short).is_none());
+        // PNG 魔数开头的 256 帧（非 DIB）→ None。
+        let png_like = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        assert!(decode_bmp_frame_to_rgba(&png_like).is_none());
     }
 }

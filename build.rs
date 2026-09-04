@@ -7,7 +7,9 @@
 //!   2. **Windows 平台资源嵌入**：经 `winresource`（winres 的维护版分支）把
 //!      `app.manifest` 编译为 RT_MANIFEST（资源 ID 1）内嵌进 exe，携带
 //!      asInvoker 执行级别、Per-Monitor V2 DPI 感知与 Common-Controls v6
-//!      声明；`res/app.ico` 图标为预留位——文件一旦放入即自动嵌入。
+//!      声明；`res/app.ico`（由 `scripts/generate-app-icon.ps1` 生成，含
+//!      16/32/48/256 四帧）编译为 RT_GROUP_ICON/RT_ICON（组 ID 1）——托盘
+//!      运行期即从该组资源解码 32×32 帧（见 `src/tray.rs`）。
 //!
 //! 语法目标说明：`ui/app.slint` 按 Slint 1.9 语言规范书写（兼容本仓库 Cargo.lock
 //! 锁定的 1.17.x，改动须保持双向可编译：不引入 1.9 之后新增的语法，也不使用已被
@@ -27,15 +29,16 @@ fn main() {
     slint_build::compile("ui/app.slint").expect("Slint UI 编译失败");
 }
 
-/// Windows 目标专属：把应用清单（及就绪后的应用图标）嵌入最终 exe。
+/// Windows 目标专属：把应用清单与应用图标嵌入最终 exe。
 ///
 /// - `app.manifest`：必需，缺失即构建失败（清单语义见该文件头部注释）；
-/// - `res/app.ico`：可选预留位，文件存在即嵌入为 exe 默认图标（建议含
-///   16/24/32/48/64/128/256 等多尺寸 ICO 帧）；缺失时跳过、不影响构建。
+/// - `res/app.ico`：应用图标（仓库自带，由 `scripts/generate-app-icon.ps1`
+///   生成，含 16/32/48/256 四帧）；缺失时跳过嵌入、不影响构建——托盘运行
+///   期会因此降级为程序化备用图标（见 `src/tray.rs`）。
 ///
-/// 产出资源段：RT_MANIFEST(1) +（可选）ICON(1)。`winresource` 内部生成 .rc
-/// 后调用 MSVC 工具链的 rc.exe（按 Windows SDK 标准路径自动发现）编译，最终
-/// 由链接器并入 exe。
+/// 产出资源段：RT_MANIFEST(1) + RT_GROUP_ICON(14,名 1)/RT_ICON(3)。`winresource`
+/// 内部生成 .rc 后调用 MSVC 工具链的 rc.exe（按 Windows SDK 标准路径自动
+/// 发现）编译，最终由链接器并入 exe。
 #[cfg(windows)]
 fn embed_windows_resources() {
     use winresource::WindowsResource;
@@ -51,7 +54,8 @@ fn embed_windows_resources() {
     // 1) 应用清单（UAC asInvoker / Per-Monitor V2 DPI / Common-Controls v6）。
     res.set_manifest_file("app.manifest");
 
-    // 2) 应用图标（预留位）：res/app.ico 一旦放入即自动嵌入，无需再改本脚本。
+    // 2) 应用图标：res/app.ico 存在即自动嵌入（winresource 固定以组 ID "1"
+    //    写入 RT_GROUP_ICON，托盘运行期按此读取），无需再改本脚本。
     let icon = std::path::Path::new("res/app.ico");
     if icon.exists() {
         println!("cargo:rerun-if-changed=res/app.ico");
