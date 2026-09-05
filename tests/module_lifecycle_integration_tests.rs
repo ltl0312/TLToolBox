@@ -42,9 +42,7 @@ fn fixture() -> (EventBus, SharedManager, Arc<PopupBlockerModule>) {
 }
 
 /// 在超时窗口内从总线读取下一条事件并断言其为模块状态广播，返回 (id, is_running)。
-async fn expect_module_status_event(
-    rx: &mut broadcast::Receiver<AppEvent>,
-) -> (String, bool) {
+async fn expect_module_status_event(rx: &mut broadcast::Receiver<AppEvent>) -> (String, bool) {
     let event = tokio::time::timeout(EVENT_TIMEOUT, rx.recv())
         .await
         .expect("等待总线事件超时：模块状态事件未送达")
@@ -95,7 +93,10 @@ async fn idempotent_toggle_still_syncs_bus_with_current_state() {
     let (_bus, shared, module) = fixture();
     let mut rx = _bus.subscribe();
 
-    shared.toggle("popup_blocker", true).await.expect("启动失败");
+    shared
+        .toggle("popup_blocker", true)
+        .await
+        .expect("启动失败");
     let (_id, _running) = expect_module_status_event(&mut rx).await;
 
     // 重复请求启动：模块已在运行 → changed=false（不二次启动），但事件照发。
@@ -129,10 +130,7 @@ async fn unknown_module_toggle_errors_without_broadcast() {
         "错误信息应点名模块 ID: {err}"
     );
     assert!(
-        matches!(
-            rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ),
+        matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
         "未知模块不得产生任何总线事件"
     );
 }

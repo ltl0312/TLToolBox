@@ -83,20 +83,20 @@ slint::include_modules!();
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use tokio::sync::Mutex;
 use tltoolbox::autostart;
 use tltoolbox::bus::{AppEvent, EventBus, TrayAction};
 use tltoolbox::config::{AppConfig, ConfigManager};
 use tltoolbox::logging;
 use tltoolbox::manager::{ModuleManager, SharedManager};
-use tltoolbox::platform;
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::PopupBlockerModule;
 use tltoolbox::modules::ToolModule;
+use tltoolbox::platform;
 use tltoolbox::single_instance;
 use tltoolbox::tray::{self, TrayControl};
+use tokio::sync::broadcast;
+use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // UI 模型辅助（仅允许在 UI 主线程执行）
@@ -554,9 +554,7 @@ async fn main() -> Result<(), AppError> {
             );
             None
         }
-        Ok(single_instance::SingleInstanceOutcome::Secondary {
-            wakeup_delivered,
-        }) => {
+        Ok(single_instance::SingleInstanceOutcome::Secondary { wakeup_delivered }) => {
             tracing::info!(
                 target: "main",
                 wakeup_delivered,
@@ -680,7 +678,9 @@ async fn main() -> Result<(), AppError> {
         format!("Slint 界面初始化失败（当前会话可能缺少可用的图形环境）: {err}").into()
     })?;
 
-    ui.set_modules(ModelRc::new(VecModel::from(module_items_from_manager(&shared_mgr))));
+    ui.set_modules(ModelRc::new(VecModel::from(module_items_from_manager(
+        &shared_mgr,
+    ))));
     ui.set_autostart_enabled(autostart::is_autostart_enabled());
     ui.set_app_version(SharedString::from(env!("CARGO_PKG_VERSION")));
     // 提权状态驱动 UI 展示形态：elevated = true → 标题旁「管理员 (Admin)」翡翠徽标、
@@ -740,17 +740,18 @@ async fn main() -> Result<(), AppError> {
         let weak = autostart_ui.clone();
         tokio::spawn(async move {
             // 1) 注册表镜像（同步 API 走 spawn_blocking，不占用 UI / 运行时工作线程）。
-            let applied = match tokio::task::spawn_blocking(move || autostart::set_autostart(enable)).await {
-                Ok(Ok(())) => true,
-                Ok(Err(err)) => {
-                    tracing::error!(target: "main", "开机自启写入失败: {err}");
-                    false
-                }
-                Err(err) => {
-                    tracing::error!(target: "main", "开机自启任务执行失败: {err}");
-                    false
-                }
-            };
+            let applied =
+                match tokio::task::spawn_blocking(move || autostart::set_autostart(enable)).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(err)) => {
+                        tracing::error!(target: "main", "开机自启写入失败: {err}");
+                        false
+                    }
+                    Err(err) => {
+                        tracing::error!(target: "main", "开机自启任务执行失败: {err}");
+                        false
+                    }
+                };
             // 2) 写入成功 → 把用户意图持久化到配置（配置为准：下次启动据此收敛注册表），
             //    并弹出 Toast 反馈（已开启 / 已关闭开机自启）。
             if applied {
@@ -762,7 +763,14 @@ async fn main() -> Result<(), AppError> {
                 if let Err(err) = mgr.save(&snapshot).await {
                     tracing::error!(target: "main", "自启意图写入配置失败: {err}");
                 }
-                show_toast(&weak, if enable { "已开启开机自启" } else { "已关闭开机自启" });
+                show_toast(
+                    &weak,
+                    if enable {
+                        "已开启开机自启"
+                    } else {
+                        "已关闭开机自启"
+                    },
+                );
             }
             // 3) 回读注册表真实状态刷新开关：失败路径自然回弹为原状态。
             let _ = slint::invoke_from_event_loop(move || {
@@ -782,7 +790,14 @@ async fn main() -> Result<(), AppError> {
         let weak = all_ui.clone();
         tokio::spawn(async move {
             set_all_modules(&mgr, enable).await;
-            show_toast(&weak, if enable { "已全部启动" } else { "已全部停止" });
+            show_toast(
+                &weak,
+                if enable {
+                    "已全部启动"
+                } else {
+                    "已全部停止"
+                },
+            );
         });
     });
 
@@ -791,10 +806,8 @@ async fn main() -> Result<(), AppError> {
     //     去重 + 热更新生效），配置（tltoolbox.toml）与 UI 列表都从它回读收敛，
     //     三者永不产生分支状态。持久化经单写者通道串行落盘（见
     //     spawn_blacklist_persister），避免连续操作写盘乱序。
-    let blacklist_persister = spawn_blacklist_persister(
-        Arc::clone(&config_mgr),
-        Arc::clone(&runtime_config),
-    );
+    let blacklist_persister =
+        spawn_blacklist_persister(Arc::clone(&config_mgr), Arc::clone(&runtime_config));
 
     // 8.4.1 齿轮点击 → 从模块读取最新规则灌入 UI 模型并展示弹窗。
     let open_blocker = Arc::clone(&popup_blocker);
@@ -919,16 +932,14 @@ async fn main() -> Result<(), AppError> {
     if keep_window_hidden {
         tracing::info!(target: "main", "静默启动：主窗口保持隐藏，由系统托盘接管常驻");
     } else {
-        ui.show().map_err(|err| -> AppError {
-            format!("Slint 主窗口显示失败: {err}").into()
-        })?;
+        ui.show()
+            .map_err(|err| -> AppError { format!("Slint 主窗口显示失败: {err}").into() })?;
         tracing::info!(target: "main", "主窗口已显示，TLToolBox 进入前台运行");
     }
 
     tracing::info!(target: "main", "TLToolBox 启动完毕，进入事件循环");
-    slint::run_event_loop().map_err(|err| -> AppError {
-        format!("Slint 事件循环运行失败: {err}").into()
-    })?;
+    slint::run_event_loop()
+        .map_err(|err| -> AppError { format!("Slint 事件循环运行失败: {err}").into() })?;
     tracing::info!(target: "main", "UI 事件循环已退出，开始平滑收尾");
 
     // ---- 11. 收尾：先逆序停止全部仍在运行的模块（平滑卸载 Win32 钩子等
@@ -937,7 +948,9 @@ async fn main() -> Result<(), AppError> {
         if meta.running {
             match shared_mgr.toggle(meta.id, false).await {
                 Ok(_) => tracing::info!(target: "main", "收尾：模块 {0} 已停止", meta.id),
-                Err(err) => tracing::error!(target: "main", "收尾：停止模块 {0} 失败: {err}", meta.id),
+                Err(err) => {
+                    tracing::error!(target: "main", "收尾：停止模块 {0} 失败: {err}", meta.id)
+                }
             }
         }
     }

@@ -172,9 +172,7 @@ fn init_to(directory: &Path) -> LoggingGuard {
                 let console_layer = fmt::layer()
                     .with_writer(io::stdout)
                     .with_filter(LevelFilter::from_level(CONSOLE_MAX_LEVEL));
-                tracing_subscriber::registry()
-                    .with(console_layer)
-                    .init();
+                tracing_subscriber::registry().with(console_layer).init();
             }
             LoggingGuard { _worker: None }
         }
@@ -210,9 +208,7 @@ fn build_file_writer(directory: &Path) -> io::Result<(NonBlocking, WorkerGuard)>
                     "无法打开日志文件 '{}'（目录: {}）: {err}",
                     format!(
                         "{}.{}.{}",
-                        DEFAULT_LOG_PREFIX,
-                        "YYYY-MM-DD",
-                        DEFAULT_LOG_SUFFIX
+                        DEFAULT_LOG_PREFIX, "YYYY-MM-DD", DEFAULT_LOG_SUFFIX
                     ),
                     directory.display()
                 ),
@@ -265,7 +261,9 @@ mod tests {
             resolved.display()
         );
         assert_eq!(
-            resolved.file_name().map(|n| n.to_string_lossy().into_owned()),
+            resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
             Some(DEFAULT_LOG_DIR.to_string()),
             "末级目录应为 logs/，实际: {}",
             resolved.display()
@@ -346,10 +344,7 @@ mod tests {
         let dir = temp_subdir("e2e");
         let guard = init_to(&dir);
 
-        assert!(
-            guard.is_file_logging_active(),
-            "临时目录下文件日志应可用"
-        );
+        assert!(guard.is_file_logging_active(), "临时目录下文件日志应可用");
         tracing::info!(target: "logging_test", "e2e-guard-flush-sentinel");
         drop(guard);
 

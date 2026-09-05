@@ -106,14 +106,16 @@ fn quote_exe_path(exe: &str) -> String {
 ///
 /// 输出形如：`"C:\Program Files\TLToolBox\tltoolbox.exe" --silent`。
 fn build_run_value(exe_path: &Path) -> String {
-    format!("{} {SILENT_ARG}", quote_exe_path(&exe_path.to_string_lossy()))
+    format!(
+        "{} {SILENT_ARG}",
+        quote_exe_path(&exe_path.to_string_lossy())
+    )
 }
 
 /// 由当前进程可执行文件构造期望的 Run 键值。
 fn expected_run_value() -> Result<String, AutostartError> {
-    let exe_path = std::env::current_exe().map_err(|source| {
-        AutostartError::CurrentExeUnavailable { source }
-    })?;
+    let exe_path = std::env::current_exe()
+        .map_err(|source| AutostartError::CurrentExeUnavailable { source })?;
     Ok(build_run_value(&exe_path))
 }
 
@@ -123,7 +125,9 @@ fn expected_run_value() -> Result<String, AutostartError> {
 /// - 值指向旧路径 / 旧版本命令（缺 `--silent`）一律视为“不是我们”，促使
 ///   `auto_start_windows = true` 时重写。
 fn value_matches_exe(stored: &str, exe_path: &Path) -> bool {
-    stored.trim().eq_ignore_ascii_case(&build_run_value(exe_path))
+    stored
+        .trim()
+        .eq_ignore_ascii_case(&build_run_value(exe_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -152,9 +156,8 @@ pub fn synchronize_autostart(enable: bool) -> AutostartResult {
 pub fn set_autostart(enable: bool) -> AutostartResult {
     #[cfg(windows)]
     {
-        win32::set_autostart_impl(enable).map_err(|err| -> Box<dyn Error + Send + Sync> {
-            Box::new(err)
-        })
+        win32::set_autostart_impl(enable)
+            .map_err(|err| -> Box<dyn Error + Send + Sync> { Box::new(err) })
     }
     #[cfg(not(windows))]
     {
@@ -204,10 +207,7 @@ mod win32 {
     /// 以 `\0` 结尾的 UTF-16LE 单元序列 → 字节切片（`REG_SZ` 写入载荷，
     /// 字节序固定为小端以匹配 Windows 内存布局）。
     fn units_to_bytes(units: &[u16]) -> Vec<u8> {
-        units
-            .iter()
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect()
+        units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
     }
 
     /// 字节载荷 → 字符串（截断尾随 `\0`，非法代理对按 U+FFFD 容忍——注册表
@@ -381,8 +381,14 @@ mod tests {
 
     #[test]
     fn path_without_spaces_is_not_quoted() {
-        assert_eq!(quote_exe_path(r"C:\Tools\tltoolbox.exe"), r"C:\Tools\tltoolbox.exe");
-        assert_eq!(quote_exe_path(r"C:\ProgramFiles\tltoolbox.exe"), r"C:\ProgramFiles\tltoolbox.exe");
+        assert_eq!(
+            quote_exe_path(r"C:\Tools\tltoolbox.exe"),
+            r"C:\Tools\tltoolbox.exe"
+        );
+        assert_eq!(
+            quote_exe_path(r"C:\ProgramFiles\tltoolbox.exe"),
+            r"C:\ProgramFiles\tltoolbox.exe"
+        );
     }
 
     #[test]
@@ -425,7 +431,10 @@ mod tests {
     fn comparison_is_case_insensitive_and_trims_whitespace() {
         let exe_path = exe(r"C:\Program Files\TLToolBox\tltoolbox.exe");
         let stored = r#"  "C:\PROGRAM FILES\TLTOOLBOX\TLTOOLBOX.EXE" --SILENT  "#;
-        assert!(value_matches_exe(stored, &exe_path), "大小写与首尾空白应被容忍");
+        assert!(
+            value_matches_exe(stored, &exe_path),
+            "大小写与首尾空白应被容忍"
+        );
     }
 
     #[test]

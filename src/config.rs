@@ -27,6 +27,9 @@ use tokio::sync::Mutex;
 /// 默认配置文件相对路径（相对**可执行文件所在目录**，见 [`resolve_app_path`]）。
 pub const DEFAULT_CONFIG_PATH: &str = "config/tltoolbox.toml";
 
+/// 终端日志目录的默认相对路径（相对 exe 同级目录；`terminal_log_dir` 缺省时使用）。
+pub const DEFAULT_TERMINAL_LOG_DIR: &str = "logs/terminals";
+
 /// 把应用资源相对路径解析为「以可执行文件目录为基准」的绝对路径。
 ///
 /// # 背景（路径锚定的必要性）
@@ -85,6 +88,24 @@ pub struct AppConfig {
     /// 生命周期由后续常驻层消费本字段）。
     #[serde(default = "AppConfig::default_minimize_to_tray")]
     pub minimize_to_tray: bool,
+    /// 终端交互日志的落盘目录（终端日志模块配置；`None` → 消费方回退为
+    /// exe 同级 `logs/terminals`，见 [`DEFAULT_TERMINAL_LOG_DIR`]）。
+    ///
+    /// `None`（缺省 / 旧配置无此键）即采用默认布局；显式给出时按
+    /// [`resolve_app_path`] 语义锚定：绝对路径原样使用，相对路径以 exe 同级
+    /// 目录为基准拼接。消费方必须经 [`AppConfig::effective_terminal_log_dir`]
+    /// 取最终目录，禁止直接读取本字段绕开回退逻辑。
+    #[serde(
+        default = "AppConfig::default_terminal_log_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub terminal_log_dir: Option<PathBuf>,
+    /// 启用终端会话日志的 Shell 名单（模块 ID → 仅向本名单内的 Shell 注入钩子；
+    /// 实际注入目标与实现策略由终端日志模块后续阶段决定）。
+    ///
+    /// 默认启用传统三件套：`powershell` / `cmd` / `bash`。
+    #[serde(default = "AppConfig::default_enabled_shells")]
+    pub enabled_shells: Vec<String>,
     /// 各模块的自定义参数（模块 ID → 配置值），供模块级扩展配置使用。
     #[serde(default)]
     pub module_custom_params: HashMap<String, String>,
@@ -112,6 +133,28 @@ impl AppConfig {
     fn default_minimize_to_tray() -> bool {
         true
     }
+
+    fn default_terminal_log_dir() -> Option<PathBuf> {
+        None
+    }
+
+    fn default_enabled_shells() -> Vec<String> {
+        vec!["powershell".into(), "cmd".into(), "bash".into()]
+    }
+
+    /// 终端日志目录的**有效路径**（消费方唯一入口）。
+    ///
+    /// `terminal_log_dir` 为 `None`（缺省 / 旧配置）时回退到可执行文件同级目录
+    /// 下的 `logs/terminals`（与配置 `config/`、应用日志 `logs/` 同锚定基准，
+    /// 见 [`resolve_app_path`] 与 [`DEFAULT_TERMINAL_LOG_DIR`]）；显式给出时按
+    /// [`resolve_app_path`] 语义处理绝对 / 相对路径（相对路径同样锚定 exe 目录，
+    /// 与 CWD 解耦，自启 / 双击拉起均指向同一目录）。
+    pub fn effective_terminal_log_dir(&self) -> PathBuf {
+        match &self.terminal_log_dir {
+            Some(dir) => resolve_app_path(dir),
+            None => resolve_app_path(Path::new(DEFAULT_TERMINAL_LOG_DIR)),
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -121,6 +164,8 @@ impl Default for AppConfig {
             popup_blacklist: Self::default_popup_blacklist(),
             auto_start_windows: Self::default_auto_start_windows(),
             minimize_to_tray: Self::default_minimize_to_tray(),
+            terminal_log_dir: Self::default_terminal_log_dir(),
+            enabled_shells: Self::default_enabled_shells(),
             module_custom_params: HashMap::new(),
         }
     }
@@ -396,21 +441,87 @@ mod tests {
     fn default_config_has_expected_values() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.auto_start_modules, vec!["popup_blocker".to_string()]);
-        assert!(!cfg.auto_start_windows, "开机自启默认应为关闭（显式开启才写注册表）");
-        assert!(cfg.minimize_to_tray, "关闭按钮最小化到托盘默认应开启（桌面常驻定位）");
+        assert!(
+            !cfg.auto_start_windows,
+            "开机自启默认应为关闭（显式开启才写注册表）"
+        );
+        assert!(
+            cfg.minimize_to_tray,
+            "关闭按钮最小化到托盘默认应开启（桌面常驻定位）"
+        );
         assert!(cfg.module_custom_params.is_empty());
 
         // 弹窗黑名单默认值 = 传统内置的常见广告 / 流氓窗口关键词。
-        let expected: Vec<String> = [
-            "广告",
-            "Flash Helper Service",
-            "Update Notice",
-            "推广弹窗",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
-        assert_eq!(cfg.popup_blacklist, expected, "黑名单默认值应保留原有关键词");
+        let expected: Vec<String> = ["广告", "Flash Helper Service", "Update Notice", "推广弹窗"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            cfg.popup_blacklist, expected,
+            "黑名单默认值应保留原有关键词"
+        );
+
+        // 终端日志子系统（基础层）默认值：日志目录不显式指定（消费方回退
+        // exe 同级 logs/terminals），Shell 名单 = 传统三件套。
+        assert_eq!(
+            cfg.enabled_shells,
+            vec![
+                "powershell".to_string(),
+                "cmd".to_string(),
+                "bash".to_string()
+            ],
+            "默认启用 Shell 名单应为 powershell / cmd / bash"
+        );
+        assert_eq!(
+            cfg.terminal_log_dir, None,
+            "终端日志目录默认不应显式指定（None → exe 同级 logs/terminals）"
+        );
+    }
+
+    #[test]
+    fn terminal_log_dir_default_falls_back_to_exe_adjacent_logs() {
+        // None 时 effective_terminal_log_dir 必须落在 exe 同级 logs/terminals，
+        // 与配置文件（exe 同级 config/）保持同一锚定基准。
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.terminal_log_dir, None, "前置条件：默认无显式目录");
+        let effective = cfg.effective_terminal_log_dir();
+        assert!(
+            effective.is_absolute(),
+            "回退目录应为绝对路径（exe 锚定），实际: {}",
+            effective.display()
+        );
+        assert!(
+            effective.ends_with(Path::new(DEFAULT_TERMINAL_LOG_DIR)),
+            "回退目录应以 logs/terminals 收尾，实际: {}",
+            effective.display()
+        );
+    }
+
+    #[test]
+    fn explicit_terminal_log_dir_resolves_absolute_and_relative() {
+        // 显式绝对路径：原样使用（不改写调用方意图）。
+        let mut cfg = AppConfig::default();
+        let abs = std::env::temp_dir().join("tltoolbox-terminal-logs");
+        cfg.terminal_log_dir = Some(abs.clone());
+        assert_eq!(
+            cfg.effective_terminal_log_dir(),
+            abs,
+            "显式绝对路径应原样返回"
+        );
+
+        // 显式相对路径：按 resolve_app_path 语义锚定到 exe 目录（与 CWD 解耦）。
+        cfg.terminal_log_dir = Some(PathBuf::from("data/terminal-logs"));
+        let effective = cfg.effective_terminal_log_dir();
+        assert!(
+            effective.is_absolute(),
+            "相对路径应被锚定为绝对路径，实际: {}",
+            effective.display()
+        );
+        assert!(
+            effective.ends_with(Path::new("data").join("terminal-logs")),
+            "锚定结果应以 data/terminal-logs 收尾，实际: {}",
+            effective.display()
+        );
     }
 
     #[tokio::test]
@@ -424,6 +535,9 @@ mod tests {
         cfg.auto_start_windows = true;
         cfg.minimize_to_tray = false;
         cfg.popup_blacklist = vec!["弹窗测试关键词".into(), "Popup Test Ad".into()];
+        // 终端日志字段显式给出（含 Some 目录的序列化 / 反序列化路径）。
+        cfg.terminal_log_dir = Some(PathBuf::from("terminal-log-roundtrip"));
+        cfg.enabled_shells = vec!["powershell".into(), "wt".into()];
         cfg.module_custom_params
             .insert("popup_blocker".into(), "aggressive".into());
 
@@ -485,9 +599,55 @@ mod tests {
             AppConfig::default().popup_blacklist,
             "黑名单缺省时应回退默认关键词"
         );
-        assert_eq!(cfg.auto_start_windows, AppConfig::default().auto_start_windows);
+        assert_eq!(
+            cfg.auto_start_windows,
+            AppConfig::default().auto_start_windows
+        );
         assert_eq!(cfg.minimize_to_tray, AppConfig::default().minimize_to_tray);
         assert!(cfg.module_custom_params.is_empty());
+        assert_eq!(
+            cfg.enabled_shells,
+            AppConfig::default().enabled_shells,
+            "缺省时 Shell 名单应回退默认三件套"
+        );
+        assert_eq!(
+            cfg.terminal_log_dir, None,
+            "缺省时日志目录应为 None（消费方回退 exe 同级 logs/terminals）"
+        );
+
+        remove_if_exists(&path).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_log_fields_parse_when_present() {
+        let path = temp_cfg_path("terminal-log");
+        remove_if_exists(&path).await;
+        // 显式声明终端日志字段（相对目录 + 自定义 Shell 名单）：应原样解析。
+        fs::write(
+            &path,
+            "terminal_log_dir = \"data/terminal-logs\"\n\
+             enabled_shells = [\"powershell\", \"wsl\"]\n",
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("含终端日志字段的配置应正常解析");
+        assert_eq!(
+            cfg.terminal_log_dir,
+            Some(PathBuf::from("data/terminal-logs")),
+            "显式目录应原样读入（相对路径由 effective 访问器消费时再锚定）"
+        );
+        assert_eq!(
+            cfg.enabled_shells,
+            vec!["powershell".to_string(), "wsl".to_string()],
+            "自定义 Shell 名单应逐字读入"
+        );
+        // 其余键缺省仍回退默认值，互不影响。
+        assert_eq!(
+            cfg.auto_start_modules,
+            AppConfig::default().auto_start_modules
+        );
 
         remove_if_exists(&path).await;
     }
@@ -538,13 +698,29 @@ mod tests {
             AppConfig::default().popup_blacklist,
             "旧版配置缺黑名单键时应回退默认关键词"
         );
-        assert_eq!(cfg.auto_start_windows, AppConfig::default().auto_start_windows);
+        assert_eq!(
+            cfg.auto_start_windows,
+            AppConfig::default().auto_start_windows
+        );
         assert_eq!(cfg.minimize_to_tray, AppConfig::default().minimize_to_tray);
+        assert_eq!(
+            cfg.enabled_shells,
+            AppConfig::default().enabled_shells,
+            "旧版配置缺 Shell 名单键时应回退默认三件套"
+        );
+        assert_eq!(
+            cfg.terminal_log_dir, None,
+            "旧版配置缺日志目录键时应为 None（不阻断解析）"
+        );
 
         let serialized = toml::to_string_pretty(&cfg).expect("重新序列化应成功");
         assert!(
             !serialized.contains("llm_api_base") && !serialized.contains("llm_model"),
             "转型后配置不得再携带 llm 字段: {serialized}"
+        );
+        assert!(
+            !serialized.contains("terminal_log_dir"),
+            "None 的日志目录键不应序列化落盘: {serialized}"
         );
 
         remove_if_exists(&path).await;
@@ -555,9 +731,12 @@ mod tests {
         let path = temp_cfg_path("unknown");
         remove_if_exists(&path).await;
         // 结构未声明未来版本可能新增的键：应被忽略，不得整体报错。
-        fs::write(&path, "auto_start_windows = true\nfuture_section = { a = 1 }\n")
-            .await
-            .unwrap();
+        fs::write(
+            &path,
+            "auto_start_windows = true\nfuture_section = { a = 1 }\n",
+        )
+        .await
+        .unwrap();
 
         let mgr = ConfigManager::new(&path);
         let cfg = mgr.load().await.expect("未知键应被容忍");

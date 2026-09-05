@@ -54,8 +54,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(windows)]
 use windows::Win32::System::Power::{
-    SetThreadExecutionState, EXECUTION_STATE, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-    ES_SYSTEM_REQUIRED,
+    SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+    EXECUTION_STATE,
 };
 
 /// 激活时注入的执行状态：持续生效 + 阻止系统睡眠 + 阻止显示器熄灭。

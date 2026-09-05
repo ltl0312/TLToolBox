@@ -101,7 +101,8 @@ impl SingleInstanceGuard {
 
 impl fmt::Debug for SingleInstanceGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SingleInstanceGuard").finish_non_exhaustive()
+        f.debug_struct("SingleInstanceGuard")
+            .finish_non_exhaustive()
     }
 }
 
@@ -153,7 +154,9 @@ pub fn acquire() -> Result<SingleInstanceOutcome, SingleInstanceError> {
             target: "single_instance",
             "非 Windows 平台：单实例守护退化为空操作，本进程按主实例运行"
         );
-        Ok(SingleInstanceOutcome::Primary(SingleInstanceGuard::placeholder()))
+        Ok(SingleInstanceOutcome::Primary(
+            SingleInstanceGuard::placeholder(),
+        ))
     }
 }
 
@@ -182,7 +185,7 @@ mod imp {
     use super::*;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, BOOL, HANDLE, LPARAM, WPARAM,
+        CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, WPARAM,
     };
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -199,18 +202,18 @@ mod imp {
     /// `binitialowner = false`：只借互斥的**存在性**做唯一性判别，从不真正占用
     /// （不调用 `ReleaseMutex`），句柄语义退化为“该名称是否已被本进程 / 其他进程
     /// 持有”。
-    pub(super) fn acquire_named(
-        name: &str,
-    ) -> Result<SingleInstanceOutcome, SingleInstanceError> {
+    pub(super) fn acquire_named(name: &str) -> Result<SingleInstanceOutcome, SingleInstanceError> {
         let wide = to_wide_units(name);
         // SAFETY: wide 为 NUL 结尾的 UTF-16 缓冲，其指针在本调用期间存活；
         // SECURITY_ATTRIBUTES 传 None（默认安全描述符，会话级命名空间无需提权）；
         // binitialowner = BOOL(0)（windows-0.58 的 BOOL 参数需显式传 BOOL 包装值，
         // 原生 bool 不满足其 Param 约束）；lpname 传 PCWSTR 值（Option 包装不满足
         // windows-0.58 的 Param<PCWSTR> 约束；本路径恒提供非空名称）。
-        let handle = unsafe { CreateMutexW(None, BOOL(0), PCWSTR(wide.as_ptr())) }
-            .map_err(|err| SingleInstanceError::CreateMutex {
-                reason: err.to_string(),
+        let handle =
+            unsafe { CreateMutexW(None, BOOL(0), PCWSTR(wide.as_ptr())) }.map_err(|err| {
+                SingleInstanceError::CreateMutex {
+                    reason: err.to_string(),
+                }
             })?;
 
         // CreateMutexW 对“已存在的同名互斥”仍返回有效句柄，只是把上次错误码
@@ -232,9 +235,9 @@ mod imp {
             });
         }
 
-        Ok(SingleInstanceOutcome::Primary(SingleInstanceGuard::from_handle(
-            handle.0 as usize,
-        )))
+        Ok(SingleInstanceOutcome::Primary(
+            SingleInstanceGuard::from_handle(handle.0 as usize),
+        ))
     }
 
     /// 注册唤醒广播消息并返回其系统内唯一编号；`0` = 注册失败。
@@ -306,7 +309,12 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("系统时钟应晚于 UNIX 纪元")
             .as_nanos();
-        format!(r"Local\TLToolBox_Test_{}_{}_{}", std::process::id(), tag, nanos)
+        format!(
+            r"Local\TLToolBox_Test_{}_{}_{}",
+            std::process::id(),
+            tag,
+            nanos
+        )
     }
 
     /// Windows：同名二次获取应判别为 Secondary；主守卫释放后可再次成为 Primary。

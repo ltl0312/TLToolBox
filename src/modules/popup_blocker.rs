@@ -142,7 +142,10 @@ impl RuleSet {
 
     /// 回读当前关键词（归一化后的原始文本，顺序与去重后一致）。
     fn raw_keywords(&self) -> Vec<String> {
-        self.patterns.iter().map(|pattern| pattern.raw.clone()).collect()
+        self.patterns
+            .iter()
+            .map(|pattern| pattern.raw.clone())
+            .collect()
     }
 
     /// 判定窗口标题 / 类名是否命中任意黑名单关键词。
@@ -206,8 +209,7 @@ impl RuleStore {
 ///
 /// 生命周期与钩子安装 / 卸载严格对齐：泵线程在 `SetWinEventHook` 成功**之后**注册、
 /// 在 `UnhookWinEvent` **之前**注销；句柄被操作系统复用时不会命中残留映射。
-static HOOK_RULE_REGISTRY: OnceLock<StdRwLock<HashMap<usize, Arc<RuleStore>>>> =
-    OnceLock::new();
+static HOOK_RULE_REGISTRY: OnceLock<StdRwLock<HashMap<usize, Arc<RuleStore>>>> = OnceLock::new();
 
 #[cfg(windows)]
 fn hook_registry() -> &'static StdRwLock<HashMap<usize, Arc<RuleStore>>> {
@@ -771,10 +773,10 @@ mod tests {
     fn rule_set_compile_normalizes_trims_and_dedups() {
         let rules = RuleSet::compile(
             [
-                "  广告  ",           // 去空白后与下方 "广告" 重复
+                "  广告  ", // 去空白后与下方 "广告" 重复
                 "广告",
-                "",                   // 空串剔除
-                "   ",                // 纯空白剔除
+                "",    // 空串剔除
+                "   ", // 纯空白剔除
                 "Flash Helper Service",
                 "flash helper service", // 与上一条同义（忽略大小写）→ 剔除
             ]
@@ -851,7 +853,10 @@ mod tests {
         let snapshot = module.inner.rules.snapshot();
         assert!(snapshot.matches("FLASH HELPER SERVICE", ""));
         assert!(snapshot.matches("xx推广弹窗xx", ""));
-        assert!(!snapshot.matches("普通窗口内容", "Edit"), "无关窗口不得误伤");
+        assert!(
+            !snapshot.matches("普通窗口内容", "Edit"),
+            "无关窗口不得误伤"
+        );
         assert!(!snapshot.matches("", ""));
 
         module.stop().await.expect("停止应成功");

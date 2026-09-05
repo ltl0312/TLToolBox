@@ -123,9 +123,8 @@ use windows::Win32::{
     System::Memory::{GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE},
     System::Threading::GetCurrentThreadId,
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, GetMessageW, HWND_MESSAGE, MSG, PM_NOREMOVE,
-        PeekMessageW, PostThreadMessageW, WM_CLIPBOARDUPDATE, WM_QUIT, WINDOW_EX_STYLE,
-        WINDOW_STYLE,
+        CreateWindowExW, DestroyWindow, GetMessageW, PeekMessageW, PostThreadMessageW,
+        HWND_MESSAGE, MSG, PM_NOREMOVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE, WM_QUIT,
     },
 };
 
@@ -312,7 +311,9 @@ impl ClipboardPurifierModule {
         }
 
         // 4) 预分配新块并写入文本（在 EmptyClipboard 之前完成：分配失败不影响原数据）。
-        let byte_len = (text.len() + 1).checked_mul(2).expect("剪贴板文本长度溢出 usize");
+        let byte_len = (text.len() + 1)
+            .checked_mul(2)
+            .expect("剪贴板文本长度溢出 usize");
         let new_global = match GlobalAlloc(GMEM_MOVEABLE, byte_len) {
             Ok(block) => block,
             Err(err) => {
@@ -786,8 +787,14 @@ mod tests {
     #[test]
     fn should_purge_requires_text_plus_rich_format() {
         // 富文本来源：HTML / RTF / 两者齐备，均应净化。
-        assert!(should_purge(true, true, false), "CF_UNICODETEXT + CF_HTML 应净化");
-        assert!(should_purge(true, false, true), "CF_UNICODETEXT + RTF 应净化");
+        assert!(
+            should_purge(true, true, false),
+            "CF_UNICODETEXT + CF_HTML 应净化"
+        );
+        assert!(
+            should_purge(true, false, true),
+            "CF_UNICODETEXT + RTF 应净化"
+        );
         assert!(should_purge(true, true, true), "全部格式齐备应净化");
         // 纯文本复制：无富文本格式 → 放行。
         assert!(!should_purge(true, false, false), "仅纯文本不得净化");
@@ -812,7 +819,10 @@ mod tests {
         assert!(guard.armed);
 
         // 紧随其后的一条更新是自我回声 → 跳过并解除布防。
-        assert!(guard.on_clipboard_update(), "布防后的下一条更新应被当作回声跳过");
+        assert!(
+            guard.on_clipboard_update(),
+            "布防后的下一条更新应被当作回声跳过"
+        );
         assert!(!guard.armed, "回声被消费后标记应解除");
 
         // 解除后再布防 → 重新生效（模块可反复启停净化）。

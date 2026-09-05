@@ -61,3 +61,7 @@ pub mod popup_blocker;
 
 /// 剪贴板纯文本净化模块（阶段三原生落地：第三个常驻守护模块）。
 pub mod clipboard_purifier;
+
+/// 终端交互日志子系统（基础层：通用无损文本锚点插拔引擎，见
+/// [`terminal_logger::anchor`]；ToolModule 化装配在后续阶段落地）。
+pub mod terminal_logger;

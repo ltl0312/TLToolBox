@@ -68,9 +68,9 @@
 
 use crate::bus::{AppEvent, EventBus, TrayAction};
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::JoinHandle;
 
 // ---------------------------------------------------------------------------
@@ -303,8 +303,8 @@ mod platform {
     };
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, PostThreadMessageW,
-        TranslateMessage, WM_APP, WM_QUIT,
+        DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW, TranslateMessage, MSG,
+        PM_REMOVE, WM_APP, WM_QUIT,
     };
 
     /// 托盘线程唤醒消息（主线程投递，非 `WM_QUIT` 时仅唤醒不携带载荷）。
@@ -370,33 +370,26 @@ mod platform {
                 &toggle_item,
                 &separator_b,
             ] {
-                menu.append(item)
-                    .map_err(|err| TrayError::Init {
-                        reason: format!("右键菜单装配失败: {err}"),
-                    })?;
+                menu.append(item).map_err(|err| TrayError::Init {
+                    reason: format!("右键菜单装配失败: {err}"),
+                })?;
             }
 
             // 2) 提权入口：仅在未提权（受 UIPI 限制、拦截高权限窗口可能失败）时
             //    渲染；已提权实例隐藏该项——菜单在启动装配时按 `elevated` 快照
             //    一次性定型，进程生命周期内提权状态不会漂移，无需运行期增删。
             if !elevated {
-                let restart_item = MenuItem::with_id(
-                    MENU_ID_RESTART_ADMIN,
-                    MENU_LABEL_RESTART_ADMIN,
-                    true,
-                    None,
-                );
-                menu.append(&restart_item)
-                    .map_err(|err| TrayError::Init {
-                        reason: format!("右键菜单装配失败: {err}"),
-                    })?;
+                let restart_item =
+                    MenuItem::with_id(MENU_ID_RESTART_ADMIN, MENU_LABEL_RESTART_ADMIN, true, None);
+                menu.append(&restart_item).map_err(|err| TrayError::Init {
+                    reason: format!("右键菜单装配失败: {err}"),
+                })?;
             }
 
             let exit_item = MenuItem::with_id(MENU_ID_EXIT, "退出程序", true, None);
-            menu.append(&exit_item)
-                .map_err(|err| TrayError::Init {
-                    reason: format!("右键菜单装配失败: {err}"),
-                })?;
+            menu.append(&exit_item).map_err(|err| TrayError::Init {
+                reason: format!("右键菜单装配失败: {err}"),
+            })?;
 
             // 3) 图标：优先从 exe 内嵌图标资源（build.rs 嵌入的 res/app.ico）
             //    解码 32×32 帧；资源缺失 / 非 32bpp DIB / 解析失败时降级为
@@ -476,7 +469,8 @@ mod platform {
                 ..
             } = event
             {
-                self.bus.publish(AppEvent::TrayAction(TrayAction::ShowWindow));
+                self.bus
+                    .publish(AppEvent::TrayAction(TrayAction::ShowWindow));
             }
             // 其余事件（单击、移动、进出等）暂不消费。
         }
@@ -541,7 +535,8 @@ mod platform {
                     // 第二实例的唤醒广播（单实例守护）：把静默常驻的主窗口还原
                     // 前置。发布 AppEvent::TrayAction(ShowWindow)，由生命周期
                     // 控制器经 invoke_from_event_loop 在 UI 线程执行。
-                    self.bus.publish(AppEvent::TrayAction(TrayAction::ShowWindow));
+                    self.bus
+                        .publish(AppEvent::TrayAction(TrayAction::ShowWindow));
                 } else {
                     unsafe {
                         let _ = TranslateMessage(&msg);
@@ -585,10 +580,7 @@ mod platform {
             tracing::warn!(target: "tray", "托盘初始化失败: {err}");
         }
         // 先行回报：父线程据此判断 spawn 成败（管理器失败时不进入消息泵）。
-        let outcome = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|err| err.to_string());
+        let outcome = result.as_ref().map(|_| ()).map_err(|err| err.to_string());
         let _ = init_tx.send(outcome);
 
         if let Ok(manager) = result {
@@ -677,13 +669,20 @@ mod platform {
     /// 读取当前进程模块内一个数字 ID 资源的原始字节。
     ///
     /// `name` / `r#type` 均为资源数字 ID（`MAKEINTRESOURCE` 语义）。
-    unsafe fn load_resource_bytes(module: HMODULE, name: u16, r#type: u16) -> Result<Vec<u8>, String> {
+    unsafe fn load_resource_bytes(
+        module: HMODULE,
+        name: u16,
+        r#type: u16,
+    ) -> Result<Vec<u8>, String> {
         // 数字 ID → 伪指针（低 16 位即 ID，等同 MAKEINTRESOURCEW）。
         let name_ptr = PCWSTR(name as usize as *const u16);
         let type_ptr = PCWSTR(r#type as usize as *const u16);
         let hres: HRSRC = FindResourceW(module, name_ptr, type_ptr);
         if hres.is_invalid() {
-            return Err(format!("FindResourceW 未找到资源 #{}（类型 #{})", name, r#type));
+            return Err(format!(
+                "FindResourceW 未找到资源 #{}（类型 #{})",
+                name, r#type
+            ));
         }
         let hglobal: HGLOBAL = LoadResource(module, hres).map_err(|err| err.to_string())?;
         if hglobal.is_invalid() {
@@ -714,9 +713,7 @@ mod platform {
                 let group = load_resource_bytes(module, APP_ICON_GROUP_ID, RT_GROUP_ICON)
                     .map_err(|reason| fail("RT_GROUP_ICON(#1)", reason))?;
                 let frame_ids = super::preferred_icon_frame_ids(&group, TRAY_ICON_PX)
-                    .ok_or_else(|| {
-                        fail("帧目录解析", "组图标不含任何合法帧条目".into())
-                    })?;
+                    .ok_or_else(|| fail("帧目录解析", "组图标不含任何合法帧条目".into()))?;
 
                 // 3) 依序尝试各候选帧：DIB 解码成功即用（256px PNG 帧天然解码
                 //    失败、自动跳过，不影响 32px DIB 帧命中）。
@@ -758,10 +755,8 @@ mod platform {
                 }
             }
         }
-        Icon::from_rgba(rgba, ICON_SIZE as u32, ICON_SIZE as u32).map_err(|err| {
-            TrayError::Init {
-                reason: format!("备用托盘图标生成失败: {err}"),
-            }
+        Icon::from_rgba(rgba, ICON_SIZE as u32, ICON_SIZE as u32).map_err(|err| TrayError::Init {
+            reason: format!("备用托盘图标生成失败: {err}"),
         })
     }
 }
@@ -865,7 +860,11 @@ fn parse_group_entries(group: &[u8]) -> Option<Vec<IconFrameEntry>> {
         let e = 6 + i * GRP_ENTRY_LEN;
         entries.push(IconFrameEntry {
             width: if group[e] == 0 { 256 } else { group[e] as u32 },
-            height: if group[e + 1] == 0 { 256 } else { group[e + 1] as u32 },
+            height: if group[e + 1] == 0 {
+                256
+            } else {
+                group[e + 1] as u32
+            },
             bit_count: u16::from_le_bytes(group[e + 6..e + 8].try_into().ok()?),
             id: u16::from_le_bytes(group[e + 12..e + 14].try_into().ok()?),
         });
@@ -1005,7 +1004,10 @@ mod tests {
         for y in 0..32 {
             for x in 0..32 {
                 if inside_glyph_t(x, y) {
-                    assert!(inside_rounded_square(x, y), "字形像素必须位于方块内: ({x},{y})");
+                    assert!(
+                        inside_rounded_square(x, y),
+                        "字形像素必须位于方块内: ({x},{y})"
+                    );
                 }
             }
         }
