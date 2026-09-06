@@ -1,215 +1,202 @@
 # TLToolBox
 
-> 原生 Windows 桌面实用工具箱 —— **轻量 · 纯粹 · 常驻**：单文件、免安装、无网络依赖、随开机静默自启。
+原生 Windows 桌面实用工具箱 —— 轻量 · 纯粹 · 常驻：单文件、免安装、无网络依赖、随开机静默自启。
 
-[![Release v0.2.0](https://img.shields.io/badge/Release-v0.2.0-2d74e8?style=flat-square)](https://github.com/ltl0312/TLToolBox/releases)
-[![Rust](https://img.shields.io/badge/Rust-2021%20%7C%20MSVC-f75208?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078d6?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
-[![License](https://img.shields.io/badge/License-MIT-10b981?style=flat-square)](https://github.com/ltl0312/TLToolBox)
+[![Release](https://img.shields.io/github/v/release/ltl0312/TLToolBox?style=flat-square&color=2563eb&label=Release)](https://github.com/ltl0312/TLToolBox/releases)
+[![Rust](https://img.shields.io/badge/Rust-2021%20%7C%20MSVC-ea580c?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0284c7?style=flat-square&logo=windows)](https://www.microsoft.com/windows)
+[![License](https://img.shields.io/badge/License-MIT-16a34a?style=flat-square)](LICENSE)
 
-**TLToolBox** 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：把「桌面弹窗拦截、系统防休眠、剪贴板纯文本净化」这几件高频琐事收进一个**常驻系统托盘、约 11 MB 的单文件程序**里，开关即用、低打扰、零后台负担。它不含 Electron 外壳、不含解释器运行时、不发起任何网络请求——全部能力都通过 Win32 系统 API 在本地完成。
+TLToolBox 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：把「桌面弹窗拦截、系统防休眠、剪贴板纯文本净化、终端交互与状态日志」收进一个常驻系统托盘、约 11 MB 的单文件程序里。后台常驻物理内存低至约 **1.8 MB**，开关即用、低打扰、零后台负担。它不含 Electron 外壳、不含解释器运行时、不发起任何网络请求——全部能力均通过 Win32 系统原生 API 本地完成。
 
-| 维度 | 说明 |
-| --- | --- |
-| **定位** | 轻量、纯粹的桌面常驻工具；Release 单文件原生可执行程序（实测约 11 MB） |
-| **技术栈** | Rust 2021 · Slint 声明式 UI（1.9 语言规范，当前锁定 1.17.1）· Tokio 异步事件驱动 · windows-rs 0.58 原生绑定 |
-| **形态** | 绿色便携：解压即用、无需安装、无管理员权限要求；Release 为 Windows GUI 子系统，无控制台黑框 |
-| **系统** | Windows 10 / 11（x64）。应用清单声明兼容 Win7–Win11；完整 Per-Monitor V2 逐显示器高分屏体验需 Windows 10 1703+ |
-| **隐私** | 纯本地运行：无遥测、无账号、无后台服务；唯一系统写入为「开机自启」的用户级注册表 Run 键（HKCU，免提权） |
+| 维度       | 说明                                                         |
+| :--------- | :----------------------------------------------------------- |
+| **定位**   | 轻量、纯粹的桌面常驻守护工具；Release 单文件原生可执行程序（实测磁盘体积约 11 MB，后台常驻内存约 1.8 MB） |
+| **技术栈** | Rust 2021 · Slint 声明式 UI（当前锁定 1.17.1）· Tokio 异步事件驱动 · windows-rs 0.58 原生绑定 |
+| **形态**   | 绿色便携：解压即用、无需安装、默认普通权限运行（支持一键 UAC 提权）；Release 为 Windows GUI 子系统，无控制台黑框 |
+| **系统**   | Windows 10 / 11（x64）。应用清单声明兼容 Win7–Win11；完整 Per-Monitor V2 逐显示器高分屏体验需 Windows 10 1703+ |
+| **隐私**   | 纯本地运行：无遥测、无账号、无后台服务；默认仅在开启开机自启时写入用户级注册表 Run 键（HKCU，免提权） |
 
 ---
 
 ## ✨ 功能特性
 
-三个常驻守护模块共享同一套「卡片开关」交互：打开主窗口，拨动开关即启用，点卡片上的 ⚙ 可进入模块级设置（当前弹窗拦截支持黑名单规则管理）。
+四个常驻守护模块共享同一套「卡片开关」交互：打开主窗口，拨动开关即启用，点击卡片上的 ⚙ 齿轮图标可进入对应模块的设置弹窗（弹窗拦截规则管理、终端日志存储管理等）。
 
-| 模块 | 它做什么 | 底层原理 | 推荐开启场景 |
-| --- | --- | --- | --- |
-| **桌面弹窗拦截**<br>`popup_blocker` | 系统级监听新窗口创建，命中黑名单关键词的广告 / 流氓弹窗在出现瞬间被毫秒级 `WM_CLOSE` 关闭 | 基于 `SetWinEventHook` 监听 `EVENT_OBJECT_CREATE`，钩子与 Win32 消息泵运行在**专用原生线程**（`win32-popup-hook-pump`）上；黑名单为 **COW 快照 + 热重载**，增删关键词即时生效、无需重启钩子；匹配语义 = 窗口标题 / 类名**子串匹配、忽略大小写** | 默认随应用启动。对弹窗零容忍的常驻用户、广告软件频发的公共 / 家用机器；规则可在 ⚙ 弹窗中自由增删 |
-| **系统防休眠**<br>`keep_awake` | 阻止系统自动睡眠与屏幕空闲熄灭，让下载 / 渲染 / 值守任务彻夜运行 | 调用 `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED \| ES_DISPLAY_REQUIRED)` 注入**粘性执行状态**；这是一次微秒级内核调用，**无任何常驻线程，运行时开销为零**；关闭时以 `ES_CONTINUOUS` 还原系统默认电源策略，进程退出由内核自动回收 | 默认关闭（显式开启才合理）。长时间下载 / 视频渲染 / 外接演示 / 隔夜任务时开启；日常保持关闭以尊重系统电源策略 |
-| **剪贴板纯文本净化**<br>`clipboard_purifier` | 剪贴板内容同时携带纯文本与富文本（网页 HTML、Office RTF、聊天工具内嵌样式）时，自动清空并**仅写回纯文本**，粘贴不再带格式残留 | 基于 `AddClipboardFormatListener` 注册监听，`WM_CLIPBOARDUPDATE` 由**专用原生线程**的纯消息窗口（`STATIC` + `HWND_MESSAGE`）消息泵接收；净化在**单次持有剪贴板锁**内完成（先分配后清空，失败绝不损伤原数据），并内置**自循环回声防护**（`EchoGuard`），写回不会自我触发 | 默认关闭。常把网页 / Office 内容复制进 Markdown、代码、邮件等纯文本场景的用户；需要保留格式粘贴时请保持关闭 |
+| 模块                                         | 它做什么                                                     | 底层原理                                                     | 推荐开启场景                                                 |
+| :------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- |
+| **桌面弹窗拦截**<br>`popup_blocker`          | 系统级监听新窗口创建，命中黑名单关键词的广告 / 流氓弹窗在出现瞬间被毫秒级 `WM_CLOSE` 关闭 | 基于 `SetWinEventHook` 监听 `EVENT_OBJECT_CREATE`，Win32 消息泵运行在专用原生线程（`win32-popup-hook-pump`）；黑名单采用 COW 快照 + 热重载，增删关键词即时生效、无需重启钩子；支持一键提权重启突破 UIPI 限制 | **默认随应用启动**。对弹窗零容忍的常驻用户、流氓广告频发的机器；规则可在 ⚙ 弹窗中自由增删 |
+| **系统防休眠**<br>`keep_awake`               | 阻止系统自动睡眠与屏幕空闲熄灭，让下载 / 渲染 / 编译 / 值守任务彻夜稳定运行 | 调用 `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED \| ES_DISPLAY_REQUIRED)` 注入粘性执行状态；纯内核状态标记，无常驻循环，CPU 开销绝对为零；关闭时以 `ES_CONTINUOUS` 还原默认策略 | **默认关闭**。长时间下载 / 视频渲染 / 外接投影演示 / 隔夜挂机任务时开启；日常保持关闭以尊重系统节能策略 |
+| **剪贴板纯文本净化**<br>`clipboard_purifier` | 剪贴板内容同时携带纯文本与富文本（网页 HTML、Office RTF、聊天工具内嵌样式）时，自动剔除格式残留，粘贴始终为纯文本 | 基于 `AddClipboardFormatListener` 注册监听，专用原生纯消息窗口（STATIC + `HWND_MESSAGE`）处理 `WM_CLIPBOARDUPDATE`；原子清空并重写，内置自循环回声防护（EchoGuard）彻底避免自我触发 | **默认关闭**。常将网页 / 文档内容复制进 Markdown、代码编辑器、终端等纯文本环境的用户；需要富文本粘贴时关闭 |
+| **终端交互日志**<br>`terminal_logger`        | 自动记录 CMD、PowerShell (5.1/7+)、Bash 终端的全部输入指令、交互会话与命令退出状态码（Exit Code） | **PowerShell**：挂载静默转录流并代理 `prompt` 捕获 `$LASTEXITCODE`；<br>**Bash**：基于 `PROMPT_COMMAND` 与历史行解析记录用户指令与 `$?`；<br>**CMD**：注册表 AutoRun 挂载原生非侵入式脚本，doskey 捕获用户键入与退出码，内置 `/c` 护栏严禁挂起构建子进程 | **默认关闭**。开发调试、命令行操作审计、运维排错及终端历史持久化留痕场景 |
 
-> **默认值说明**：弹窗拦截是「装上就想用」的能力，默认随应用启动；防休眠与剪贴板净化分别改变电源策略与剪贴板行为，属于用户预期敏感的操作，故默认关闭，由你在 UI 中显式开启。
+> **默认值说明**：弹窗拦截属于“装上即用”的核心能力，默认随应用启动；防休眠、剪贴板净化与终端日志涉及系统电源策略、剪贴板行为与外部 Shell 挂接，属于操作敏感型功能，默认保持关闭，由用户显式开启。
 
-### 桌面常驻与生命周期
+---
 
-TLToolBox 定位是**常驻**而非「用完即走」：
+## 🖥 桌面常驻与生命周期
 
-- **关闭即收进托盘**：点击窗口右上角 × 默认隐藏到系统托盘（`minimize_to_tray = true`），进程继续在后台守护，需要时双击托盘图标呼出；
-- **托盘右键菜单**：`显示主窗口` / `全部模块：开启·关闭`（文案随实际聚合状态自动切换）/ `退出程序`——只有从菜单退出才是真正结束进程；
-- **单实例防多开**：基于会话级具名互斥（`CreateMutexW`），再次双击 exe 或系统重复自启时，第二实例会自动把已常驻实例的主窗口唤到前台后自行退出，绝不产生双托盘图标、双钩子；
-- **开机静默自启**：打开主窗口顶部「开机自启」开关即可。自启项写入
-  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（值名 `TLToolBox`，值形如 `"D:\Tools\TLToolBox\tltoolbox.exe" --silent`）；登录时以 `--silent` 参数拉起，**主窗口保持隐藏、仅托盘常驻**，双击托盘图标即可唤出。
+TLToolBox 专注于低打扰、低开销的常驻守护：
+
+* **关闭即收进托盘**：点击窗口右上角 × 默认隐藏至系统托盘（`minimize_to_tray = true`），主事件循环由 `slint::run_event_loop_until_quit` 驱动，后台平稳守护；双击托盘图标随时呼回主窗口。
+* **物理内存极致压制**：主窗口隐藏进托盘或空闲时，自动调用 Win32 `EmptyWorkingSet`，将闲置的 GPU/DirectX 驱动缓存与字体内存页移出工作集，**物理内存占用自 ~80 MB 骤降至 1.8 MB**。
+* **管理员提权感知与突破 (UIPI)**：普通权限进程受 Windows UIPI 限制无法关闭高特权流氓弹窗。工具箱启动时自动探测权限状态：未提权时标题栏显示琥珀色提权按钮、托盘提供「以管理员身份重启」；点击后通过 `runas` 提权拉起自身并协同 `--restart-as-admin` 标记跳过单实例互斥，已提权时显示翡翠色「管理员 (Admin)」徽标。
+* **操作气泡即时反馈 (Toast)**：规则增删、自启切换、提权变迁均具备 150ms 平滑淡入淡出悬浮气泡，操作结果一目了然。
+* **单实例防多开**：基于会话级具名互斥（`CreateMutexW`），重复双击 exe 或自启拉起时，第二实例自动向系统广播自定义唤醒消息（`RegisterWindowMessageW`）将既有窗口前置，自身立即退出，绝不产生双托盘图标。
+* **开机静默自启**：开启主窗口顶部开关，自动写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（免提权）。系统登录时自动附加 `--silent` 参数启动：窗口静默隐藏、托盘常驻。
 
 ---
 
 ## 🏗 架构设计亮点
 
 ### 1. Win32 原生线程与消息泵隔离（模块第一性原则）
+Windows 的系统级事件通知——`SetWinEventHook`（`WINEVENT_OUTOFCONTEXT`）回调与 `WM_CLIPBOARDUPDATE`——强制要求安装方线程自身的消息队列运行标准 Win32 消息泵（`GetMessageW` / `DispatchMessageW`）。Tokio 异步工作线程是无栈协程调度载体、不运行此类消息循环。TLToolBox 将系统钩子与消息泵整体隔离在专用操作系统原生线程中：
+* **启动握手竞态防护**：泵线程先以 `PeekMessageW(PM_NOREMOVE)` 强制建立系统消息队列，再回报线程 ID，从根上消除停机信号早于队列建立而投递失败的竞态；
+* **平滑卸载协议**：`stop()` 依次执行 `CancellationToken` 广播停机意图 -> `PostThreadMessageW(WM_QUIT)` 唤醒阻塞的泵 -> 5 秒超时保护平滑收尾，`UnhookWinEvent` / `RemoveClipboardFormatListener` 保证在安装线程安全释放；
+* **静态回调路由**：WinEvent 回调是 `unsafe extern "system"` 静态函数，模块通过进程级无锁/分段锁注册表将回调无损路由至所属实例；
+* **COW 规则快照**：黑名单存为 `RwLock<Arc<RuleSet>>`，写操作整包原子替换，钩子回调仅克隆引用在锁外执行子串比对，热重载无需重启线程。
 
-Windows 的系统级事件通知——`SetWinEventHook`（`WINEVENT_OUTOFCONTEXT`）回调与 `WM_CLIPBOARDUPDATE`——都会被系统投递到**安装方线程自己的消息队列**，必须由该线程运行标准 Win32 消息泵（`GetMessageW` / `DispatchMessageW`）才能派发。Tokio 工作线程是无栈协程调度载体、并不运行 Win32 消息循环，因此在 `tokio::spawn` 中挂接这些钩子**永远收不到回调**。
+### 2. 终端无损插拔与死锁防护
+* **通用文本锚点引擎**：对 Shell 配置文件采用 `# >>> TLToolBox TAG >>>` 注释块封装，修改具备幂等性与原位更新能力，卸载时逐字节还原，绝不破坏用户原生配置与行尾格式（CRLF / LF）；
+* **CMD 动态命令行护栏**：注册表 AutoRun 挂载的捕获脚本利用 `findstr /I /C:"/c"` 严格探测 `%CMDCMDLINE%`，遇到构建工具链（`cargo`、`git`、`npm`）派生的后台子进程瞬时跳过，彻底杜绝管道中继导致的终端假死与编译挂起。
 
-TLToolBox 因此将「钩子安装 / 监听窗口创建 + 消息泵」整体隔离到 `std::thread` 派生的**专用操作系统原生线程**（`win32-popup-hook-pump`、`win32-clipboard-purifier-pump`），Tokio 侧只做生命周期编排：
+### 3. Slint 单向响应式数据流（界面即事实）
+* 跨线程改写严格包裹于 `slint::invoke_from_event_loop` 闭包内（即 UI 线程消息循环中）；
+* 状态调度基于 `tokio::sync::broadcast` 无锁总线，发布为非阻塞同步调用，慢消费者不会阻塞发布方，UI 与托盘均只消费调度层确认的最终事实，界面永不展示虚假状态。
 
-- **启动握手**：泵线程先以 `PeekMessageW(PM_NOREMOVE)` 强制建立消息队列，再回报线程 ID——从根上消除「`WM_QUIT` 早于队列建立而投递失败」的竞态；
-- **平滑卸载协议**：`stop()` 依次执行 ① `CancellationToken` 广播停机意图 → ② `PostThreadMessageW(WM_QUIT)` 定向唤醒阻塞中的泵 → ③ Join 线程并施加 5 秒超时；`UnhookWinEvent` / `RemoveClipboardFormatListener` + `DestroyWindow` 保证在**安装线程上**执行完毕，杜绝系统级钩子与监听窗口泄漏；实例消亡还有 `Drop` 兜底唤醒；
-- **静态回调路由**：WinEvent 回调是 `unsafe extern "system"` 静态函数、拿不到 `&self`，模块通过一张进程级「钩子句柄 → 规则存储」注册表（`OnceLock<RwLock<HashMap>>`）把回调路由回所属实例；
-- **COW 规则热重载**：黑名单存为 `RwLock<Arc<RuleSet>>`，`update_rules` 以写锁整体替换不可变快照（写入时一次性完成归一化 + 去重）；回调只在读锁内做一次 `Arc` 克隆，全部字符串匹配在**锁外**完成——规则热更新无需重启消息泵线程，回调内也绝不持有重锁。
-
-### 2. Slint 单向响应式数据流（界面即事实）
-
-Slint 的 `VecModel` / `ModelRc` **非 `Send`**，自创建后终生驻留 UI 主线程。TLToolBox 的跨线程桥接严格遵循这一约束：
-
-- 跨线程载荷只有 `Weak<MainWindow>`（Slint 官方保证 `Send`）与模块调度器 `Arc` 等 `Send` 数据；**模型改写一律发生在 `slint::invoke_from_event_loop` 闭包内**（即 UI 线程消息循环中）；
-- 自动启动模块在 UI 装配**之前**执行，初始模块列表是调度层的**真实状态快照**而非请求意图；每次开关落定后，调度器广播真实状态，UI 重拉调度层事实并整体重建列表（模型 reset 语义）——**启动失败、权限不足等异常会自动把开关回滚**，界面永不显示虚假的「运行中」。
-
-### 3. 无锁广播总线与并发安全
-
-- 模块调度器持有 `tokio::sync::broadcast`（容量 256）事件总线：`publish` 为**同步、非阻塞**调用，慢消费者只会收到 `Lagged` 淘汰提示、绝不会拖慢发布方；
-- 总线事件**只在状态落定之后**广播（成败皆广播），UI 与托盘菜单看到的永远是模块的最终事实；
-- 调度器自身**零全局锁**、无锁跨 `await`；同一模块的并发启停由模块内部的生命周期锁串行收敛（`AtomicBool` + 异步锁 + `CancellationToken`），不同模块的启停天然并行；`ToolModule` 契约收敛为共享借用（`&self`）+ `Send + Sync` + 幂等 `start` / `stop`；
-- 托盘线程是托盘资源的唯一拥有者（`tray-icon` 0.19 + `muda` 0.15 为 Rc 句柄、且回调有线程亲和约束），与主线程之间只有**单向、无应答、无锁**的指令 / 事件投递，不存在任何死锁环。
-
-### 4. 配置与状态收敛
-
-- 配置为 TOML，路径**锚定到可执行文件同级目录**的 `config/tltoolbox.toml`（与 CWD 解耦——注册表自启时 CWD 是 `System32`，相对路径会写错位置甚至无权限）；
-- 持久化 = 同目录临时文件 + `rename` 原子替换 + 写锁串行化，崩溃不产生半截文件；字段级向前兼容，旧配置缺新字段自动补默认值；解析失败**绝不静默覆盖**用户文件；
-- 自启状态以配置为唯一事实源：每次启动都会把注册表 Run 键收敛到配置意图（路径漂移自动重写、残留自动清理、失败仅告警不阻断启动）；UI 开关则「先写注册表 → 再持久化配置 → 回读注册表真实状态驱动开关」。
-
-### 5. Windows 原生适配细节
-
-- **应用清单**：Per-Monitor V2 逐显示器 DPI 感知（自动回退 PerMonitor v1 / 旧式 `dpiAware`），高分屏文本不模糊；`asInvoker` 执行级别——不弹 UAC，与「托盘静默常驻 + 开机自启」定位一致；Common-Controls v6 视觉样式；`supportedOS` 显式声明 Win7–Win11；
-- **内嵌多尺寸图标**：`res/app.ico`（16 / 32 / 48 / 256 四帧，由 `scripts/generate-app-icon.ps1` 生成）经 `build.rs` 以 `winresource` 编译进 exe；托盘运行期从 exe 资源段读取并解码 32×32 帧，资源异常时降级为纯代码绘制的备用图标——任何构建形态下托盘都有图标；
-- **体积压制**：Release 配置 `opt-level = "z"` + `lto = true` + `codegen-units = 1` + `strip = true`，产出约 11 MB 的 GUI 子系统单文件；刻意保留默认 unwind（不设 `panic = "abort"`），保证 `tokio::spawn` 能把后台任务异常隔离在 `JoinHandle` 内，符合「错误隔离、优雅降级」的常驻定位。
-
----
+### 4. 生产级日志与配置路径绝对锚定
+* **路径绝对锚定**：配置文件 `config/tltoolbox.toml` 与日志目录 `logs/` 均以 `current_exe()` 父目录为基准绝对解析，彻底根治注册表开机自启时（CWD 为 `C:\Windows\System32`）找不到文件或无权写入的隐患；
+* **原子写盘机制**：配置持久化采用同目录临时文件 + rename 原子替换，系统崩溃不产生半截损坏文件；
+* **滚动日志落盘**：引入 `tracing-appender` 按天切分本地日志（保留 15 份），Release 模式下无控制台黑框仍可稳定记录排错日志。
 
 ## 🚀 快速上手
 
 ### 绿色便携版（解压即用）
+1. 从 Releases 下载 `tltoolbox-windows-x86_64.zip`，并核对随附的 `.sha256` 校验和；
+2. 解压到任意目录（例如 `D:\Tools\TLToolBox`），包内包含 `tltoolbox.exe` 与 `config\tltoolbox.toml`；
+3. 双击 `tltoolbox.exe` 启动；
+4. 在主窗口拨动各模块卡片开关，或点击卡片上的 ⚙ 图标进入高级配置。
 
-1. 从 [Releases](https://github.com/ltl0312/TLToolBox/releases) 下载 `tltoolbox-windows-x86_64.zip`，并核对随附的 `.sha256` 校验和；
-2. 解压到**任意目录**（例如 `D:\Tools\TLToolBox`），包内结构为 `tltoolbox.exe` 与 `config\tltoolbox.toml`；
-3. 双击 `tltoolbox.exe` 启动——首次运行会在 exe 旁自动生成 `config` 目录并落盘默认配置；
-4. 在主窗口拨动各模块卡片开关，或点击弹窗拦截卡片上的 ⚙ 管理黑名单规则。
-
-> **绿色便携的边界**：配置始终写在 exe 同级目录，整个目录拷走即完成迁移；程序被移动 / 升级后，已开启的开机自启会在下次启动时自动校正到新路径。程序未做数字签名，SmartScreen / 杀软首次运行可能弹出未知发布者提示，请自行决定是否信任（本项目开源，可自行编译核对）。
+> **绿色便携边界**：所有配置与日志均保存在 exe 同级目录，拷贝整个文件夹即可完成数据迁移。程序未作付费商业数字签名，SmartScreen / 杀软首次运行可能弹出未知发布者提示，可自行编译源码核对。
 
 ### 开机自启
-
-打开主窗口 → 勾选顶部右侧「开机自启」开关。
-
-- 开启后写入 `HKCU\...\CurrentVersion\Run`（免管理员权限），下次登录时程序将以 `--silent` 静默启动：**不弹主窗口，仅托盘常驻**；
-- 关闭该开关即删除注册表项；绿色版卸载 = 关闭自启 + 删除整个目录，系统内不残留其他写入。
+打开主窗口顶部「开机自启」开关即可。程序自动写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（免管理员权限），登录时以 `--silent` 参数启动并静默常驻托盘；关闭开关即可完全清理该注册表键值。
 
 ### 快捷键与常用操作
-
-| 操作 | 效果 |
-| --- | --- |
-| **双击托盘图标** | 呼出 / 前置主窗口（静默常驻时的唯一唤醒入口） |
-| **右键托盘图标** | 弹出原生菜单：`显示主窗口` → `全部模块：开启 / 关闭` → `退出程序` |
-| 左键单击托盘图标 | 无动作（双击语义保留给显示窗口，避免误触） |
-| 主窗口右上角 × | 最小化到托盘（默认），进程继续常驻；在配置中把 `minimize_to_tray` 改为 `false` 则直接退出 |
-| 再次运行 `tltoolbox.exe` | 不产生第二实例：既有实例的主窗口被唤到前台，本次进程立即退出 |
-| 开机自启登录后 | 无窗口静默常驻，需要时双击托盘图标唤出 |
+| 操作                 | 效果                                                         |
+| :------------------- | :----------------------------------------------------------- |
+| **双击托盘图标**     | 呼出 / 前置主窗口（静默常驻时的唤醒入口）                    |
+| **右键托盘图标**     | 弹出原生菜单：显示主窗口 / 以管理员身份重启 / 全部模块启停 / 退出程序 |
+| **主窗口右上角 ×**   | 隐藏到托盘继续常驻，触发内存工作集回收（工作集降至 ~1.8 MB） |
+| **再次运行 exe**     | 单实例守卫生效：既有实例窗口唤出至前台，当前新进程立即退出   |
+| **点击顶部盾牌按钮** | 发起 UAC 提权重启，用于突破 Windows UIPI 拦截高特权安装包广告 |
 
 ### 弹窗拦截 · 黑名单规则管理
-
 点击「桌面弹窗拦截」卡片右侧的 ⚙ 齿轮，可查看 / 新增 / 删除拦截关键词：
+* **匹配语义**：窗口标题或类名包含该关键词即拦截（子串匹配、忽略大小写），中文关键词逐字生效；
+* **即时生效**：规则增删即时热重载生效，并自动持久化到 `config/tltoolbox.toml` 的 `popup_blacklist`；
+* **默认规则**：内置 `广告`、`Flash Helper Service`、`Update Notice`、`推广弹窗` 等默认项，重复输入自动去重。
 
-- 匹配语义：**窗口标题或类名包含该关键词即拦截**（子串匹配、忽略大小写），中文关键词逐字生效；
-- 规则增删**即时生效**（COW 快照热重载，无需重启应用），并自动持久化到 `config/tltoolbox.toml` 的 `popup_blacklist`；
-- 内置默认关键词：`广告`、`Flash Helper Service`、`Update Notice`、`推广弹窗`；重复 / 纯空白输入会被自动归一化合并，可放心操作。
+### 终端日志 · 存储管理
+点击「终端交互日志」卡片右侧的 ⚙ 齿轮：
+* 查看当前日志绝对路径（默认 `exe 同级/logs/terminals/`）；
+* 点击「在文件资源管理器中打开日志目录」快速调取各终端生成的会话 log 文件。
 
 ---
 
 ## ⚙️ 命令行参数
 
-| 参数 | 说明 |
-| --- | --- |
-| `--silent` | 静默启动：主窗口保持隐藏、仅托盘常驻。开机自启项会自动附带本参数；手动运行同样适用（适用于「登录即常驻、不打扰」的用法） |
+| 参数                 | 说明                                                         |
+| :------------------- | :----------------------------------------------------------- |
+| `--silent`           | 静默启动：主窗口保持隐藏、仅托盘常驻。开机自启项会自动附带本参数 |
+| `--restart-as-admin` | 提权重启握手标记：由普通权限实例拉起提权新实例时内部传递，用于跳过单实例互斥阻断 |
 
 ---
 
 ## 🔧 从源码构建
 
 ### 环境准备
-
-| 依赖 | 说明 |
-| --- | --- |
-| Windows 10 / 11 x64 | 开发与运行目标平台 |
-| [Rust stable（MSVC 工具链）](https://www.rust-lang.org/tools/install) | 安装 rustup 后确认默认宿主为 `x86_64-pc-windows-msvc`：`rustup default stable-x86_64-pc-windows-msvc` |
-| [Visual Studio Build Tools](https://aka.ms/vs) | 勾选「使用 C++ 的桌面开发」工作负载（含 Windows SDK）——链接阶段的 `link.exe` 与 `build.rs` 内嵌清单 / 图标所需的 `rc.exe` 依赖它 |
+* **目标系统**：Windows 10 / 11 x64
+* **Rust 工具链**：Rust stable MSVC（`rustup default stable-x86_64-pc-windows-msvc`）
+* **编译组件**：Visual Studio Build Tools（勾选“使用 C++ 的桌面开发”，包含 MSVC 编译器、`link.exe` 以及内嵌资源编译所需的 `rc.exe`）
 
 ### 构建与测试
-
 ```powershell
-# 1. 构建 Release 单文件（体积优化：LTO + strip，耗时较长属正常）
+# 1. 构建 Release 单文件（体积极致压制：LTO + Strip）
 cargo build --release
+# 产物：target\release\tltoolbox.exe（约 11 MB，Windows GUI 子系统，无控制台黑框）
 
-# 产物：target\release\tltoolbox.exe（约 11 MB，GUI 子系统、无控制台黑框）
-
-# 2. 运行全部测试（单元 + 集成，全程不触达图形会话，可离线执行）
+# 2. 运行全量脱机测试（140+ 单元测试与集成测试，不依赖图形环境）
 cargo test --all-targets
 
-# 3. 调试运行（debug 保留控制台子系统，便于观察 tracing 日志）
+# 3. 运行含真实注册表往返与控制台自清理的实机测试
+cargo test --all-targets -- --ignored
+
+# 4. 调试模式运行（保留控制台黑框，实时输出 tracing debug 日志）
 cargo run
 ```
-
-补充说明：
-
-- **Windows 资源嵌入在构建期自动完成**：`build.rs` 经 `winresource` 把 `app.manifest`（DPI / UAC / Common-Controls）与 `res/app.ico` 编译进 exe，无需手工步骤；
-- `scripts/` 提供图标生成与产物验证脚本：`generate-app-icon.ps1`（重新生成多尺寸 ICO）、`verify-manifest.ps1` / `verify-icon.ps1` / `verify-release-workflow.py`（发布前校验）；
-- **发布流水线**：推送 `v0.2.0` 形式的 Tag 即触发 `.github/workflows/release.yml`（Windows 最新镜像 + MSVC），依次执行测试 → Release 编译 → 打包 `tltoolbox-windows-x86_64.zip`（exe + 默认配置）→ 生成 SHA256 → 创建 GitHub Release；
-- 涉及真实注册表读写的往返测试默认 `#[ignore]`，需显式执行（会短暂读写当前用户 Run 键，测试自清理）：`cargo test -- --ignored`。
 
 ### 项目结构
 
 ```text
 TLToolBox/
-├── Cargo.toml              # 依赖声明 + Release 体积优化配置
-├── build.rs                # Slint UI 编译 + Win32 资源嵌入（manifest / ico）
-├── app.manifest            # Per-Monitor V2 DPI / asInvoker / Common-Controls v6
-├── res/app.ico             # 多尺寸应用图标（16 / 32 / 48 / 256）
+├── Cargo.toml               # 依赖声明 + Release 优化配置 (opt-level="z", lto, strip)
+├── build.rs                 # Slint UI 编译 + Win32 资源嵌入 (manifest / ico)
+├── app.manifest             # Per-Monitor V2 DPI 感知 / asInvoker 清单声明
+├── res/app.ico              # 多尺寸内嵌应用图标 (16 / 32 / 48 / 256)
 ├── ui/
-│   ├── app.slint           # Slint 声明式界面（单栏工具箱 · 深色主题）
-│   └── icons/              # 界面内联 SVG 图标
+│   ├── app.slint            # Slint 声明式主界面 (深色主题 / Toast / 设置弹窗)
+│   └── icons/               # 界面内嵌 SVG 矢量图标 (盾牌、齿轮、关闭等)
 ├── src/
-│   ├── main.rs             # 装配点：单实例 / 总线 / 托盘生命周期 / UI 桥
-│   ├── lib.rs              # 库入口（可脱离 GUI 测试）
-│   ├── bus.rs              # 广播事件总线（tokio::sync::broadcast）
-│   ├── manager.rs          # 模块调度管理器
-│   ├── config.rs           # TOML 配置引擎（原子写盘）
-│   ├── autostart.rs        # 注册表开机自启（HKCU Run 键）
-│   ├── single_instance.rs  # 具名互斥 + 唤醒广播
-│   ├── tray.rs             # 系统托盘线程与右键菜单
+│   ├── main.rs              # 程序入口：单实例守卫 / 托盘 / 内存优化 / UI 调度
+│   ├── lib.rs               # 核心库入口 (供单元与集成测试引用)
+│   ├── logging.rs           # 本地滚动日志系统 (tracing-appender 每日切分)
+│   ├── platform.rs          # 平台级调用 (EmptyWorkingSet 内存压制 / UAC runas 提权重启)
+│   ├── bus.rs               # 广播事件总线 (tokio::sync::broadcast)
+│   ├── manager.rs           # 模块调度生命周期控制器
+│   ├── config.rs            # TOML 配置引擎 (路径绝对锚定 + 原子覆写)
+│   ├── autostart.rs         # 注册表开机自启管理 (HKCU Run 键)
+│   ├── single_instance.rs   # 具名互斥锁 + 跨进程唤醒广播
+│   ├── tray.rs              # 原生托盘线程、图标多级降级与 Win32 菜单
 │   └── modules/
-│       ├── popup_blocker.rs      # 桌面弹窗拦截
-│       ├── keep_awake.rs         # 系统防休眠
-│       └── clipboard_purifier.rs # 剪贴板纯文本净化
-├── tests/                  # 无图形会话的集成测试
-├── scripts/                # 图标生成 / 产物验证脚本
-└── .github/workflows/      # Windows 自动发布流水线（release.yml）
+│       ├── mod.rs           # 模块统一契约 (ToolModule)
+│       ├── popup_blocker.rs # 桌面弹窗拦截模块
+│       ├── keep_awake.rs    # 系统防休眠模块
+│       ├── clipboard_purifier.rs # 剪贴板格式净化模块
+│       └── terminal_logger/ # 终端交互日志记录子系统
+│           ├── mod.rs       # 终端调度器与 HookManager
+│           ├── anchor.rs    # Shell 配置文件文本锚点注入引擎
+│           ├── ps_bash.rs   # PowerShell 与 Bash 挂载实现
+│           └── cmd.rs       # CMD AutoRun 批处理与 doskey 状态捕获
+├── tests/                   # 模块生命周期无头集成测试
+└── .github/workflows/       # GitHub Actions Windows 自动化发版流水线 (release.yml)
 ```
 
 ---
 
 ## 📖 常见问题
 
-**需要管理员权限吗？**
-不需要。程序以 `asInvoker` 执行级别与启动方同权限运行，自启写入用户级注册表，全程不触发 UAC。对应的已知边界：对**以管理员权限运行**的进程窗口，普通权限进程受 UIPI 保护无法向其投递关闭消息，此类高权限弹窗不会被拦截——这是 Windows 安全模型的刻意设计，暂不以整体提权换取拦截能力。
+**Q: 需要管理员权限吗？**
 
-**程序会联网吗？**
-不会。项目已移除全部 HTTP / LLM 依赖，无任何网络请求与遥测上报，可在完全离线的机器上运行。
+A: 默认不需要。程序默认以普通用户权限（`asInvoker`）运行，自启仅写入当前用户注册表，启动全程不弹出 UAC。但针对以管理员身份运行的流氓安装包或更新器弹窗，受 Windows UIPI 安全隔离限制，普通权限程序无法向其投递关闭消息。遇到此类弹窗时，只需点击窗口顶部盾牌按钮或托盘菜单中的「以管理员身份重启」，即可无缝提权以获得 100% 拦截能力。
 
-**配置存在哪里？**
-exe 同级目录 `config\tltoolbox.toml`（首次运行自动生成），字段可直接手改，改后重启应用生效。
+**Q: 软件会发起网络请求吗？**
 
-**点 × 之后程序去哪了？**
-默认收进系统托盘继续常驻（托盘图标在通知区，可能需要点 ↑ 展开）。双击托盘图标唤回窗口，右键托盘图标选择「退出程序」才真正结束。
+A: 绝对不会。本项目不包含任何网络请求或遥测上报代码，无外部域名解析，可在完全离线的保密开发机安心常驻。
 
-**如何卸载？**
-先在主窗口关闭「开机自启」，再删除整个程序目录即可——系统内无其他残留。
+**Q: 配置文件与日志存放在哪里？**
+
+- 配置文件：`exe 同级目录\config\tltoolbox.toml`（首次启动自动创建）；
+- 系统运行日志：`exe 同级目录\logs\tltoolbox.YYYY-MM-DD.log`（保留最近 15 天）；
+- 终端交互日志：`exe 同级目录\logs\terminals\<终端类型>\`（可在设置弹窗中一键在资源管理器中打开）。
+
+**Q: 点击窗口右上角的 × 为什么不退出？**
+
+A: TLToolBox 采用常驻守护设计。点击 × 会将窗口隐藏进托盘，并自动调用 `EmptyWorkingSet` 释放物理内存至 1.8 MB。若需彻底退出，请右键托盘图标点击「退出程序」。
+
+**Q: 如何彻底卸载？**
+
+A: 先在主界面关闭「开机自启」以及各功能开关，然后直接删除整个程序目录即可——系统内无任何其他常驻服务或残留文件。
 
 ---
 
