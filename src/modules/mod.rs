@@ -62,6 +62,14 @@ pub mod popup_blocker;
 /// 剪贴板纯文本净化模块（阶段三原生落地：第三个常驻守护模块）。
 pub mod clipboard_purifier;
 
-/// 终端交互日志子系统（基础层：通用无损文本锚点插拔引擎，见
-/// [`terminal_logger::anchor`]；ToolModule 化装配在后续阶段落地）。
+/// 终端交互日志模块（阶段收官 · 第四个常驻守护模块）。
+///
+/// 底层为无损锚点引擎（[`terminal_logger::anchor`]）+ PowerShell 5.1/7.x
+/// 多宿主挂载器与 bash 双入口记录器（[`terminal_logger::ps_bash`]）+ CMD
+/// AutoRun 会话回显捕获壳（[`terminal_logger::cmd`]）；装配层
+/// （[`terminal_logger::HookManager`] 与
+/// [`terminal_logger::TerminalLoggerModule`]）把三者统一调度并按
+/// [`ToolModule`] 契约接入模块生命周期：`start` 解析最终日志目录后按
+/// `enabled_shells` 名单安装钩子，`stop` 统一卸载，`is_running` 由内存标志
+/// 与 cmd AutoRun 注册表状态联合判定。
 pub mod terminal_logger;

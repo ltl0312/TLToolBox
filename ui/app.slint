@@ -14,13 +14,15 @@
 // │  └───────────────────────────────────────────────────┘ │    显示齿轮入口（轻量按钮）
 // │  （……更多模块卡片，超出自动滚动……）                       │
 // ├────────────────────────────────────────────────────────┤
-// │  （规则管理遮罩层：点击齿轮淡入；半透明遮罩 + 居中弹窗）   │ ← 根层级 Overlay（弹窗拦截专用）
+// │  （规则 / 存储管理遮罩层：点击齿轮淡入；半透明遮罩 + 居中弹窗）│ ← 根层级 Overlay（模块设置弹窗）
 // └────────────────────────────────────────────────────────┘
 //
 // 数据契约（供 Rust 侧 include_modules! 后经 VecModel 填充）：
 //   - modules:            ModuleItem 列表（id/name/desc/enabled/has_settings）
 //   - popup_rules:        弹窗拦截黑名单关键词（规则弹窗的列表数据源）
 //   - show_rules_modal:   「规则管理」弹窗展示开关（由 Rust 装配层驱动）
+//   - terminal_log_dir_display: 终端交互日志当前生效的存储目录绝对路径（展示文本）
+//   - show_terminal_modal:「终端日志记录 - 存储管理」弹窗展示开关（由 Rust 驱动）
 //   - autostart_enabled:  全局开机自启当前生效状态（注册表为准）
 //   - elevated:           提权（管理员）状态（启动装配层注入）：true = 标题旁渲染
 //                         「管理员 (Admin)」翡翠徽标并隐藏提权入口；false = 渲染醒目
@@ -34,7 +36,15 @@
 //   - toggle_all_modules(enabled)     ← 「全部启用 / 全部停用」按钮点击
 //   - request_elevate()               ← 盾牌提权按钮点击（Rust 侧经 UAC 确认后以管理员
 //                                       身份重启，见 crate::platform::restart_as_admin）
-//   - open_rules_modal()              ← 模块卡片齿轮点击（Rust 灌入最新规则后置 show=true）
+//   - open_module_settings(module_id) ← 模块卡片齿轮点击（Rust 按模块 ID 分派：弹窗
+//                                       拦截=「规则管理」弹窗；终端交互日志=「存储管理」
+//                                       弹窗，见 TerminalSettingsModal）
+//   - open_terminal_modal()           ← 打开「终端日志记录 - 存储管理」弹窗（预留入口，
+//                                       与 open_module_settings 的 terminal_logger 分派
+//                                       共用 Rust 侧 open_terminal_settings 动作）
+//   - close_terminal_modal()          ← 「存储管理」弹窗「×」/ 遮罩空白点击
+//   - open_log_dir_in_explorer()      ← 「存储管理」弹窗主按钮：在文件资源管理器中
+//                                       打开日志目录（目录不存在时 Rust 侧自动创建）
 //   - close_rules_modal()             ← 弹窗「×」/ 遮罩空白点击
 //   - add_rule(keyword)               ← 弹窗底部「添加」（含输入框回车）
 //   - remove_rule(index)              ← 规则行右侧红色删除按钮
@@ -50,7 +60,8 @@ export struct ModuleItem {
     name: string,
     desc: string,
     enabled: bool,
-    // 是否有「设置面板」：为真时卡片在 Switch 左侧渲染齿轮按钮（当前仅弹窗拦截）。
+    // 是否有「设置面板」：为真时卡片在 Switch 左侧渲染齿轮按钮
+    // （当前为弹窗拦截：规则管理弹窗；终端交互日志：存储管理弹窗，见 Rust 侧分派）。
     has_settings: bool,
 }
 
@@ -383,8 +394,8 @@ component ModuleCard inherits Rectangle {
                 }
             }
 
-            // 设置齿轮：仅在模块声明 has_settings 时渲染；点击上抛，由 Rust 装配层
-            // 拉取最新规则并打开「规则管理」弹窗。
+            // 设置齿轮：仅在模块声明 has_settings 时渲染；点击上抛模块 ID，由 Rust
+            // 装配层按模块分派各自的设置面板入口。
             if root.module.has_settings : GhostIconButton {
                 icon: @image-url("icons/settings.svg");
                 icon-size: 14px;
@@ -646,6 +657,165 @@ component RulesModal inherits Rectangle {
     }
 }
 
+// —— 终端交互日志 · 存储管理（根层级 Overlay 2：与 RulesModal 同构的遮罩 + 居中
+//    弹窗卡片。展示当前生效的日志存储目录绝对路径，并提供「资源管理器打开」入口） ——
+//
+// 输入 / 动画架构与 RulesModal 完全一致（避免隐藏弹层拦截主界面交互）：
+//   - 遮罩层常驻挂载、仅以 opacity 渐变进出：隐藏态其全部 TouchArea 经 enabled
+//     关闭（Slint 语义：disabled 的 TouchArea 把事件原样穿透给下层元素），纯视觉层
+//     不会形成点击 / 滚轮黑洞；
+//   - 弹窗卡片**只在展示期挂载**（`if root.show`）：隐藏即从树中移除，离场视觉由
+//     遮罩的淡出动画承接（与 RulesModal 同一取舍——本弹窗无滚动内容，无滚轮陷阱）。
+component TerminalSettingsModal inherits Rectangle {
+    in property <bool> show;
+    in property <string> log-dir: "";
+    callback close-requested;
+    callback open-log-dir-requested;
+
+    // 半透明遮罩底：透明度随 show 渐变（入场淡入 / 关闭淡出）。根元素宽高在装配点
+    // （MainWindow）以窗口尺寸显式给出，组件自身不绑定 `parent`。
+    background: Theme.overlay-scrim;
+    opacity: root.show ? 1.0 : 0.0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    // 遮罩点击层：点击弹窗之外空白 → 请求关闭；同时吞没滚轮防止穿透主界面。
+    backdrop := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.show;
+        clicked => { root.close-requested(); }
+        scroll-event(event) => { return accept; }
+    }
+
+    // 居中弹窗卡片（仅展示期挂载，见组件文档的输入架构说明）。
+    if root.show : dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(440px, parent.width - 32px);
+        height: min(252px, parent.height - 48px);
+        border-radius: 14px;
+        background: Theme.dialog-bg;
+        border-width: 1px;
+        border-color: Theme.dialog-border;
+        clip: true;
+
+        // 卡片空白区吞没层：点击 / 滚动不穿透到遮罩层造成误关闭。
+        body-catcher := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+            scroll-event(event) => { return accept; }
+        }
+
+        VerticalBox {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 10px;
+
+            // —— 标题行：弹窗标题 + 关闭按钮 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                Text {
+                    text: "终端日志记录 - 存储管理";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                GhostIconButton {
+                    icon: @image-url("icons/close.svg");
+                    icon-size: 13px;
+                    icon-color: Theme.text-muted;
+                    clicked => { root.close-requested(); }
+                }
+            }
+
+            // —— 语义提示 ——
+            Text {
+                text: "会话日志按 Shell 类型（powershell / bash / cmd）写入该目录下的子文件夹。";
+                font-size: 11px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            // —— 存储目录标签 ——
+            Text {
+                text: "当前存储目录：";
+                font-size: 12px;
+                color: Theme.text-secondary;
+            }
+
+            // —— 绝对路径展示框：单行展示，过长以省略号收尾 ——
+            dir-box := Rectangle {
+                height: 40px;
+                border-radius: 8px;
+                background: Theme.card-bg;
+                border-width: 1px;
+                border-color: Theme.card-border;
+
+                Text {
+                    text: root.log-dir;
+                    font-size: 11.5px;
+                    color: Theme.text-primary;
+                    overflow: elide;
+                    x: 12px;
+                    y: 0;
+                    width: parent.width - 24px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                }
+            }
+
+            // 弹性占位：把主操作按钮沉底（内容不足时吸收剩余纵向空间）。
+            Rectangle { vertical-stretch: 1; }
+
+            // —— 主操作：在文件资源管理器中打开日志目录（实底强调，整行宽度） ——
+            open-button := Rectangle {
+                height: 34px;
+                border-radius: 8px;
+                background: Theme.accent-bg;
+
+                states [
+                    hover when open-touch.has-hover && !open-touch.pressed : {
+                        background: Theme.accent-bg-hover;
+                    }
+                    pressed when open-touch.pressed : {
+                        background: Theme.accent-bg-pressed;
+                    }
+                ]
+                animate background { duration: 100ms; }
+
+                Text {
+                    text: "在文件资源管理器中打开日志目录";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: Theme.accent-fg;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                open-touch := TouchArea {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => { root.open-log-dir-requested(); }
+                }
+            }
+        }
+    }
+}
+
 // —— Toast 轻量操作反馈：窗口底部居中的半透明悬浮胶囊 ——
 //
 // 输入架构（沿用 RulesModal 的「常驻挂载 + 状态驱动」思路，规避隐藏层拦截交互）：
@@ -712,6 +882,9 @@ export component MainWindow inherits Window {
     in property <[ModuleItem]> modules;
     in property <[string]> popup_rules;
     in property <bool> show_rules_modal: false;
+    // 终端交互日志 · 存储管理弹窗：当前生效的日志根目录绝对路径（展示文本）与显隐开关。
+    in property <string> terminal_log_dir_display: "";
+    in property <bool> show_terminal_modal: false;
     in property <bool> autostart_enabled;
     // 提权（管理员）状态：true → 标题旁「管理员 (Admin)」翡翠徽标；false → 盾牌提权按钮。
     in property <bool> elevated: false;
@@ -727,7 +900,10 @@ export component MainWindow inherits Window {
     callback toggle_autostart(bool);
     callback toggle_all_modules(bool);
     callback request_elevate();
-    callback open_rules_modal();
+    callback open_module_settings(string);
+    callback open_terminal_modal();
+    callback close_terminal_modal();
+    callback open_log_dir_in_explorer();
     callback close_rules_modal();
     callback add_rule(string);
     callback remove_rule(int);
@@ -851,7 +1027,7 @@ export component MainWindow inherits Window {
                         root.toggle_module(item.id, checked);
                     }
                     settings-clicked => {
-                        root.open_rules_modal();
+                        root.open_module_settings(item.id);
                     }
                 }
             }
@@ -870,6 +1046,20 @@ export component MainWindow inherits Window {
         close-requested => { root.close_rules_modal(); }
         add-requested(keyword) => { root.add_rule(keyword); }
         remove-requested(index) => { root.remove_rule(index); }
+    }
+
+    // ============================================================
+    //  根层级「终端日志记录 - 存储管理」遮罩层（模块设置弹窗之二；声明于规则遮罩
+    //  之后、Toast 之前——两弹窗互斥展示，Toast 仍保持全局最高层级）
+    // ============================================================
+    terminal-modal := TerminalSettingsModal {
+        width: root.width;
+        height: root.height;
+        show: root.show_terminal_modal;
+        log-dir: root.terminal_log_dir_display;
+
+        close-requested => { root.close_terminal_modal(); }
+        open-log-dir-requested => { root.open_log_dir_in_explorer(); }
     }
 
     // ============================================================

@@ -63,6 +63,11 @@ tray-icon = "0.19"
 #                                  （剪贴板纯文本净化模块的监听与净化 API）
 #   - Win32_System_Memory         ：GlobalAlloc / GlobalLock / GlobalUnlock / GlobalSize /
 #                                  GMEM_MOVEABLE（净化时分配 / 锁定跨进程 HGLOBAL 文本块）
+#   - Win32_System_ProcessStatus  ：EmptyWorkingSet（窗口隐藏进托盘时压制本进程物理内存
+#                                  工作集，常驻内存从 ~54MB 骤降至 ~10MB 以内，见 platform）
+#   - Win32_Graphics_Gdi          ：GetDIBits / GetObjectW / CreateCompatibleDC 等（托盘图标
+#                                  从 Win32 原生 LoadIconW(None, IDI_APPLICATION) 兜底取帧时
+#                                  把 HICON 位图解码为 RGBA，见 tray.rs 的图标降级链）
 #   - Win32_UI_Shell              ：ShellExecuteW（提权重启：以 "runas" 动词经 UAC 拉起
 #                                  高权限副本，见 src/platform.rs）。注意 windows 0.58 的
 #                                  ShellExecuteW 本体按 Win32_UI_WindowsAndMessaging 门控，
@@ -81,7 +86,13 @@ features = [
     "Win32_System_Power",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_Graphics_Gdi",
     "Win32_UI_Shell",
+    # Win32_Globalization：WideCharToMultiByte / MultiByteToWideChar（cmd 捕获
+    # 脚本把非 ASCII 日志根路径按机器 OEM 代码页内嵌，运行时与控制台默认
+    # 代码页一致，见 terminal_logger::cmd 模块文档）
+    "Win32_Globalization",
 ]
 
 [build-dependencies]

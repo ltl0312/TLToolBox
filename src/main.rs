@@ -11,9 +11,12 @@
 //! `slint::include_modules!()` 引入）串成完整的常驻桌面应用。UI 为 480 × 560
 //! 的**单栏「桌面实用工具箱」**：顶部全局控制栏（标题/小版本号/开机自启/
 //! 一键全开全关）+ ScrollView 流式模块卡片列表（名称 / 描述 / 运行状态徽标 /
-//! 物理开关）；带设置项的模块（当前为弹窗拦截）卡片上另有齿轮按钮，点击弹出
-//! **「黑名单规则管理」弹窗**（根层级 Overlay：查看 / 新增 / 删除拦截关键词，
-//! 经 `update_rules` 热更新并持久化到配置，全程无需手写 TOML）；
+//! 物理开关）；带设置项的模块（弹窗拦截、终端交互日志）卡片上另有齿轮按钮：
+//! 弹窗拦截点击弹出**「黑名单规则管理」弹窗**（根层级 Overlay：查看 / 新增 /
+//! 删除拦截关键词，经 `update_rules` 热更新并持久化到配置，全程无需手写 TOML）；
+//! 终端交互日志点击弹出**「终端日志记录 - 存储管理」弹窗**（根层级 Overlay 之二：
+//! 展示当前生效的日志存储目录绝对路径，可一键在文件资源管理器中打开——目录不存在
+//! 时自动创建，齿轮分派见 8.4.1、弹窗回调接线见 8.4.5）；
 //! 双栏时代的内嵌运行日志控制台已退役，日志改由 `tracing` 承载，并在本函数第一句
 //! 装配（见 [`tltoolbox::logging`]）：debug 构建双写 控制台 + 按天滚动文件；
 //! release 构建（无控制台黑框）仅写文件。日志目录锚定 **exe 同级 `logs/`**
@@ -43,7 +46,8 @@
 //! 4. **总线装配**：`EventBus`（`tokio::sync::broadcast`，容量 256）注入模块管理器
 //!    作为广播出口；
 //! 5. **模块注册**：注册内置常驻守护模块（[`PopupBlockerModule`] 弹窗拦截、
-//!    [`KeepAwakeModule`] 系统防休眠、[`ClipboardPurifierModule`] 剪贴板纯文本净化）；
+//!    [`KeepAwakeModule`] 系统防休眠、[`ClipboardPurifierModule`] 剪贴板纯文本净化、
+//!    [`TerminalLoggerModule`] 终端交互日志）；
 //! 6. **自动启动模块**：按配置对 `auto_start_modules` 执行 `toggle(id, true)`——
 //!    **先于 UI 装配**，启动期广播事件因尚无订阅者而被总线按设计丢弃，随后以调度
 //!    层**真实状态快照**填充 UI 初始模型，保证“界面即事实”；
@@ -63,9 +67,20 @@
 //!    拉取 `current_rules` 灌入弹窗；新增 / 删除同步热更新模块内 RuleStore、
 //!    经单写者通道异步落盘 `popup_blacklist`、再回读归一化结果刷新弹窗列表——
 //!    规则事实源始终是模块内存态，配置与 UI 均自其收敛（详见函数体 8.4）；
+//!    终端交互日志额外注册**存储管理弹窗**：齿轮读取当前生效的日志根目录绝对路径
+//!    写入 UI 展示，可一键在文件资源管理器中打开（目录不存在自动创建；齿轮分派见
+//!    8.4.1、弹窗回调接线见 8.4.5）；
 //! 10. **托盘装配与生命周期控制**（桌面常驻核心）：`tray::spawn` 派生**独立托盘
 //!     线程**（Win32 消息泵），把菜单 / 双击指令发布为 [`AppEvent::TrayAction`]；
-//!     关闭按钮按 `minimize_to_tray` 配置**隐藏到托盘**（`CloseRequestResponse`）；
+//!     `minimize_to_tray && 托盘就绪` 时构成**常驻闭环**：关闭按钮回调返回
+//!     `CloseRequestResponse::KeepWindowShown` 拒绝关闭，并经
+//!     `invoke_from_event_loop` 延后执行 `hide()` + [`platform::empty_working_set`]
+//!     （物理内存工作集压制——常驻期从 ~54MB 骤降至 ~10MB 以内）；事件循环改
+//!     用 `slint::run_event_loop_until_quit`——slint 的 keepalive 语义是「最后
+//!     一个可见窗口 / 托盘图标消失即退出」，普通 `run_event_loop` 会在窗口隐藏
+//!     的瞬间终止进程，`until_quit` 形态让窗口隐藏 / 显示切换都不收尾，只有
+//!     托盘「退出程序」的 `quit_event_loop` 才进入平滑收尾（该形态同时使
+//!     `--silent` 静默常驻成立）；
 //!     `--silent` 静默自启且托盘就绪时主窗口保持隐藏（不调用 `show()`）；独立“生命周期控制器”订阅总线——双击 /
 //!     “显示主窗口”经 `invoke_from_event_loop` 在 UI 线程还原窗口，“全部模块：开启/
 //!     关闭”逐模块 toggle，“退出程序”调度 `slint::quit_event_loop` 进入收尾；模块
@@ -91,6 +106,7 @@ use tltoolbox::manager::{ModuleManager, SharedManager};
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::PopupBlockerModule;
+use tltoolbox::modules::terminal_logger::TerminalLoggerModule;
 use tltoolbox::modules::ToolModule;
 use tltoolbox::platform;
 use tltoolbox::single_instance;
@@ -102,13 +118,17 @@ use tokio::sync::Mutex;
 // UI 模型辅助（仅允许在 UI 主线程执行）
 // ---------------------------------------------------------------------------
 
-/// 模块是否在卡片上提供「设置齿轮」（点击弹出模块级配置面板）。
+/// 模块是否在卡片上提供「设置齿轮」（点击弹出模块级配置面板入口）。
 ///
-/// 仅当模块装配层为其实现了设置面板入口回调时才返回 `true`；当前只有弹窗拦截
-/// 模块具备「黑名单规则管理」弹窗，其余模块（如 keep_awake）不渲染齿轮。
+/// 仅当模块装配层为其实现了设置面板入口回调时才返回 `true`。当前：
+/// - `popup_blocker`（弹窗拦截）：齿轮点击打开「黑名单规则管理」弹窗；
+/// - `terminal_logger`（终端交互日志）：齿轮点击打开「终端日志记录 - 存储管理」
+///   弹窗（展示当前生效的日志存储目录，可一键在文件资源管理器中打开，见函数体
+///   8.4.1 / 8.4.5 的按模块 ID 分派与回调接线）。
+/// 其余模块（如 keep_awake）不渲染齿轮。
 /// 未来新增带设置面板的模块时在此扩展。
 fn module_has_settings(id: &str) -> bool {
-    matches!(id, "popup_blocker")
+    matches!(id, "popup_blocker" | "terminal_logger")
 }
 
 /// 把调度层元数据快照转换为 UI 模块列表条目。
@@ -170,6 +190,94 @@ fn deliver_popup_rules_refresh(ui_weak: &slint::Weak<MainWindow>, rules: Vec<Str
     if queued.is_err() {
         tracing::warn!(target: "main", "无法投递规则列表刷新：UI 事件循环已不可用");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 终端交互日志 · 存储管理设置弹窗（UI 回调 → 异步读取配置 → 回 UI 线程展示）
+// ---------------------------------------------------------------------------
+
+/// 打开「终端日志记录 - 存储管理」设置弹窗（卡片齿轮 `terminal_logger` 分派与
+/// `open_terminal_modal` 预留回调的共用入口）。
+///
+/// 线程模型：回调运行于 UI 线程，而读取配置需跨 `tokio::sync::Mutex`（异步锁），
+/// 同步阻塞加锁会卡住事件循环，故整体经 [`tokio::spawn`] 移出 UI 线程；解析出
+/// **当前生效**的日志根目录绝对路径（[`AppConfig::effective_terminal_log_dir`]：
+/// 显式目录按绝对 / exe 锚定语义解析，缺省回退 exe 同级 `logs/terminals`）后，
+/// 再经 [`slint::invoke_from_event_loop`] 排队回 UI 线程：写入
+/// `terminal_log_dir_display` 文本并亮起 `show_terminal_modal`。本函数只读解析
+/// 路径，不创建目录——目录的按需创建发生在「资源管理器打开」动作里。
+fn open_terminal_settings(
+    ui_weak: &slint::Weak<MainWindow>,
+    runtime_config: Arc<Mutex<AppConfig>>,
+) {
+    let weak = ui_weak.clone();
+    tokio::spawn(async move {
+        // 锁内仅解析路径快照（不跨 await 持锁）；effective_* 恒产出绝对路径。
+        let log_dir = {
+            let cfg = runtime_config.lock().await;
+            cfg.effective_terminal_log_dir()
+        };
+        let display = log_dir.to_string_lossy().into_owned();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_terminal_log_dir_display(SharedString::from(display));
+                ui.set_show_terminal_modal(true);
+            }
+        });
+    });
+}
+
+/// 「在文件资源管理器中打开日志目录」请求的单飞守卫。
+///
+/// explorer 进程 spawn 本身瞬时返回，但连点会在极短窗口内堆叠多个资源管理器
+/// 窗口；请求置位后闭锁，直到本次打开落定（成功或失败）再复位。
+static EXPLORER_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// 【UI 回调入口】确保日志根目录存在（不存在自动 `create_dir_all`）后，调用
+/// `std::process::Command::new("explorer").arg(&dir).spawn()` 打开该目录；成功
+/// 经 `show_toast` 反馈「已在资源管理器中打开目录」。
+///
+/// 线程模型（杜绝界面卡死）：回调运行于 UI 线程，目录创建与进程 spawn 均为同步
+/// IO / 进程操作，全部经 [`tokio::task::spawn_blocking`] 移出 UI 线程与 Tokio
+/// 工作线程；spawn 返回的 `Child` 随即丢弃且**从不 wait**——explorer 是 GUI
+/// 进程，创建成功即独立存活、立即返回，绝不在任何线程上阻塞等待其退出。
+fn open_terminal_log_dir_in_explorer(
+    ui_weak: &slint::Weak<MainWindow>,
+    runtime_config: Arc<Mutex<AppConfig>>,
+) {
+    if EXPLORER_OPEN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return; // 已有打开请求在途：静默忽略重复触发，避免堆叠资源管理器窗口。
+    }
+    let weak = ui_weak.clone();
+    tokio::spawn(async move {
+        let log_dir = {
+            let cfg = runtime_config.lock().await;
+            cfg.effective_terminal_log_dir()
+        };
+        let dir_text = log_dir.to_string_lossy().into_owned();
+        let outcome = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            std::fs::create_dir_all(&log_dir)?; // 目录不存在则自动创建
+            std::process::Command::new("explorer").arg(&log_dir).spawn()?;
+            Ok(())
+        })
+        .await;
+        // 落定后复位单飞守卫：成功 / 失败都允许用户再次发起新一轮打开。
+        EXPLORER_OPEN_IN_FLIGHT.store(false, Ordering::SeqCst);
+        match outcome {
+            Ok(Ok(())) => show_toast(&weak, "已在资源管理器中打开目录"),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "main",
+                    "资源管理器打开日志目录失败（目录 '{dir_text}'）: {err}"
+                );
+                show_toast(&weak, "打开日志目录失败，请稍后重试");
+            }
+            Err(err) => {
+                tracing::error!(target: "main", "资源管理器打开日志目录任务异常: {err}");
+                show_toast(&weak, "打开日志目录失败，请稍后重试");
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +754,15 @@ async fn main() -> Result<(), AppError> {
     //      剪贴板纯文本净化模块：无参构造即可注册。同样**不**进入默认自动启动列表——
     //      剪贴板行为改写（自动剥离富文本格式）属用户预期敏感的操作，显式开启才合理。
     module_mgr.register(Arc::new(ClipboardPurifierModule::new()));
+    //      终端交互日志模块：以运行期配置句柄装配（与上面 `runtime_config` 同源）——
+    //      `start` 时经 `effective_terminal_log_dir` 解析最终日志目录，并按
+    //      `enabled_shells` 名单向 PowerShell / bash / CMD 注入会话钩子。钩子全部在
+    //      start 期惰性装配，模块注册本身零系统探测 / 改写。同样**不**进入默认自动
+    //      启动列表——向用户 Shell 配置文件与注册表 AutoRun 注入钩子属「显式开启才
+    //      合理」的系统改写（默认名单仅弹窗拦截，见 AppConfig::default_auto_start_modules）。
+    module_mgr.register(Arc::new(TerminalLoggerModule::new(Arc::clone(
+        &runtime_config,
+    ))));
     let shared_mgr: SharedManager = Arc::new(module_mgr);
     let registered_modules: Vec<&str> = shared_mgr
         .get_metadata_list()
@@ -809,13 +926,31 @@ async fn main() -> Result<(), AppError> {
     let blacklist_persister =
         spawn_blacklist_persister(Arc::clone(&config_mgr), Arc::clone(&runtime_config));
 
-    // 8.4.1 齿轮点击 → 从模块读取最新规则灌入 UI 模型并展示弹窗。
+    // 8.4.1 模块卡片齿轮点击 → 按模块 ID 分派设置面板入口（卡片渲染条件见
+    //      module_has_settings）。当前：
+    //      - popup_blocker：从模块读取最新规则灌入 UI 模型并展示「规则管理」弹窗；
+    //      - terminal_logger：读取当前生效的日志根目录绝对路径写入
+    //        terminal_log_dir_display，并展示「终端日志记录 - 存储管理」弹窗
+    //        （与 on_open_terminal_modal 共用 open_terminal_settings 入口，见 8.4.5）。
     let open_blocker = Arc::clone(&popup_blocker);
+    let open_cfg = Arc::clone(&runtime_config);
     let open_ui = ui.as_weak();
-    ui.on_open_rules_modal(move || {
-        let Some(ui) = open_ui.upgrade() else { return };
-        set_popup_rules_model(&ui, open_blocker.current_rules());
-        ui.set_show_rules_modal(true);
+    ui.on_open_module_settings(move |module_id| {
+        let weak = open_ui.clone();
+        match module_id.as_str() {
+            "popup_blocker" => {
+                if let Some(ui) = weak.upgrade() {
+                    set_popup_rules_model(&ui, open_blocker.current_rules());
+                    ui.set_show_rules_modal(true);
+                }
+            }
+            "terminal_logger" => {
+                open_terminal_settings(&weak, Arc::clone(&open_cfg));
+            }
+            other => {
+                tracing::warn!(target: "main", "模块 {other} 尚无设置面板实现（齿轮点击忽略）");
+            }
+        }
     });
 
     // 8.4.2 弹窗关闭（右上角 × / 点击遮罩空白）。
@@ -882,6 +1017,32 @@ async fn main() -> Result<(), AppError> {
         show_toast(&remove_ui, "拦截规则已删除");
     });
 
+    // 8.4.5 终端交互日志 · 存储管理弹窗回调接线：
+    //      a) open_terminal_modal：Slint 声明面的预留打开入口（与 8.4.1 的
+    //         terminal_logger 齿轮分派共用 open_terminal_settings，供未来 UI 内
+    //         任意元素直接请求打开该弹窗）；
+    //      b) close_terminal_modal：弹窗右上角「×」/ 点击遮罩空白 → 复位显隐；
+    //      c) open_log_dir_in_explorer：「在文件资源管理器中打开日志目录」主按钮
+    //         → 保证目录存在后以 explorer 打开并 Toast 反馈（见 helper 文档）。
+    let open_term_cfg = Arc::clone(&runtime_config);
+    let open_term_ui = ui.as_weak();
+    ui.on_open_terminal_modal(move || {
+        open_terminal_settings(&open_term_ui, Arc::clone(&open_term_cfg));
+    });
+
+    let close_term_ui = ui.as_weak();
+    ui.on_close_terminal_modal(move || {
+        if let Some(ui) = close_term_ui.upgrade() {
+            ui.set_show_terminal_modal(false);
+        }
+    });
+
+    let explorer_cfg = Arc::clone(&runtime_config);
+    let explorer_ui = ui.as_weak();
+    ui.on_open_log_dir_in_explorer(move || {
+        open_terminal_log_dir_in_explorer(&explorer_ui, Arc::clone(&explorer_cfg));
+    });
+
     // ---- 9. 托盘装配与生命周期控制（桌面常驻核心机制）。 ----
     //      第三个参数 elevated 决定托盘菜单是否渲染「以管理员身份重启」：
     //      未提权渲染（UIPI 突围入口），已提权隐藏。
@@ -904,11 +1065,38 @@ async fn main() -> Result<(), AppError> {
         }
     };
 
-    // 关闭按钮按配置“隐藏到托盘”而非退出进程（窗口对象保留，可再次显示）。
-    if app_config.minimize_to_tray {
-        ui.window().on_close_requested(|| {
-            tracing::debug!(target: "main", "窗口关闭请求 → 隐藏到系统托盘（进程常驻）");
-            CloseRequestResponse::HideWindow
+    // 托盘常驻闭环是否成立：配置开启**且**托盘图标就绪。成立时关闭按钮
+    // “隐藏到托盘”且事件循环用 run_event_loop_until_quit（窗口隐藏 / 关闭都
+    // 不终止进程——slint 的 keepalive 语义是「最后一个可见窗口 / 托盘图标消失
+    // 即退出」；只有托盘「退出程序」/ 提权重启的 quit_event_loop 才收尾）。
+    // 不成立时（配置关闭 / 托盘初始化失败）不挂常驻钩子：关闭窗口 = 退出进程。
+    let tray_resident = app_config.minimize_to_tray && tray_handle.is_some();
+    if tray_resident {
+        // 关闭按钮“隐藏到托盘”（窗口对象保留，可经托盘再次显示）：
+        // 回调返回 KeepWindowShown 拒绝系统关闭，随后经 invoke_from_event_loop
+        // 把 hide() + 内存压制（EmptyWorkingSet）排到**下一轮**事件循环执行。
+        // 经验约束（slint 1.17 + winit 实测）：普通 run_event_loop 在关闭回调
+        // 内同步 hide() 会释放窗口 keepalive、让循环立即退出；把隐藏延后到
+        // 关闭处理完全落定（且循环为 run_event_loop_until_quit 形态）后才执行，
+        // 进程才能保持常驻。
+        let ui_weak = ui.as_weak();
+        ui.window().on_close_requested(move || {
+            let hide_ui = ui_weak.clone();
+            let queued = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = hide_ui.upgrade() {
+                    let _ = ui.hide();
+                }
+                // 窗口已隐藏：常驻期的窗口对象无需热页面，压制物理内存工作集
+                //（尽力而为；失败仅告警，绝不阻断常驻）。
+                if let Err(err) = platform::empty_working_set() {
+                    tracing::warn!(target: "main", "隐藏进托盘后内存工作集压制失败: {err}");
+                }
+            });
+            if queued.is_err() {
+                tracing::warn!(target: "main", "关闭请求后无法排队隐藏动作：事件循环已不可用");
+            }
+            tracing::debug!(target: "main", "窗口关闭请求 → 已排队隐藏到系统托盘（进程常驻）");
+            CloseRequestResponse::KeepWindowShown
         });
     }
 
@@ -938,8 +1126,18 @@ async fn main() -> Result<(), AppError> {
     }
 
     tracing::info!(target: "main", "TLToolBox 启动完毕，进入事件循环");
-    slint::run_event_loop()
-        .map_err(|err| -> AppError { format!("Slint 事件循环运行失败: {err}").into() })?;
+    if tray_resident {
+        // 常驻闭环：窗口隐藏 / 显示切换都不终止循环，仅 quit_event_loop 收尾
+        // （托盘「退出程序」/ 提权重启）。这一形态同时修正了 slint 默认循环
+        // 「最后一个可见窗口消失即退出」对托盘应用的误伤（含 --silent 静默
+        // 常驻：窗口从未显示也可长期驻留）。
+        slint::run_event_loop_until_quit()
+            .map_err(|err| -> AppError { format!("Slint 事件循环运行失败: {err}").into() })?;
+    } else {
+        // 常规形态（minimize_to_tray 关闭 / 托盘不可用）：关闭最后窗口即退出。
+        slint::run_event_loop()
+            .map_err(|err| -> AppError { format!("Slint 事件循环运行失败: {err}").into() })?;
+    }
     tracing::info!(target: "main", "UI 事件循环已退出，开始平滑收尾");
 
     // ---- 11. 收尾：先逆序停止全部仍在运行的模块（平滑卸载 Win32 钩子等

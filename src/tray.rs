@@ -4,10 +4,13 @@
 //! （System Tray），由托盘图标承载右键菜单与双击唤醒。本模块是常驻层的
 //! 底层机制，负责：
 //!
-//! - 创建托盘图标（优先从**可执行文件内嵌图标资源**解码 32×32 应用图标——
-//!   `build.rs` 已把 `res/app.ico` 经 winresource 编译为 RT_GROUP_ICON/RT_ICON，
-//!   此处读取帧目录并解码 DIB 帧；资源缺失或格式异常时降级为**程序化生成的
-//!   备用嵌入图标**——纯代码像素绘制，零额外资源文件）；
+//! - 创建托盘图标（**三级降级链**，保证任何构建形态下图标 100% 加载）：
+//!   ① 从**可执行文件内嵌图标资源**解码 32×32 应用图标（`build.rs` 已把
+//!   `res/app.ico` 经 winresource 编译为 RT_GROUP_ICON/RT_ICON，此处读取帧目录
+//!   并解码 DIB 帧）；② 资源缺失 / 格式异常时降级为 Win32 原生
+//!   `LoadIconW(None, IDI_APPLICATION)` 系统「应用程序」图标（系统共享句柄，
+//!   永不失败、折叠区可用）；③ 仅当系统图标也无法解码（理论不可达）才降级为
+//!   **程序化生成的备用嵌入图标**（纯代码像素绘制，零额外资源文件）；
 //! - 构建原生右键菜单（`muda` crate）：`显示主窗口` / `全部模块：开启/关闭` /
 //!   （未提权时额外渲染）`以管理员身份重启` / `退出程序`；
 //! - 监听托盘事件（菜单点击、双击图标），把用户意图以
@@ -391,20 +394,38 @@ mod platform {
                 reason: format!("右键菜单装配失败: {err}"),
             })?;
 
-            // 3) 图标：优先从 exe 内嵌图标资源（build.rs 嵌入的 res/app.ico）
-            //    解码 32×32 帧；资源缺失 / 非 32bpp DIB / 解析失败时降级为
-            //    纯代码像素绘制的备用图标，保证托盘任何构建形态下都有图标。
+            // 3) 图标三级降级链（保证任何构建形态下托盘都有图标，且 100% 成功）：
+            //    ① exe 内嵌图标资源（build.rs 嵌入的 res/app.ico）→ 32×32 帧；
+            //    ② 资源提取失败 → Win32 原生 LoadIconW(None, IDI_APPLICATION)
+            //       系统「应用程序」图标（系统共享句柄，永不失败；可在通知区
+            //       折叠区正常渲染）；
+            //    ③ 仅当 ② 也解码失败（理论不可达）→ 纯代码像素绘制备用图标。
             let icon = match load_embedded_app_icon() {
                 Ok(icon) => {
                     tracing::debug!(target: "tray", "托盘图标：已从 exe 内嵌图标资源加载 32×32 帧");
                     icon
                 }
-                Err(err) => {
+                Err(embedded_err) => {
                     tracing::warn!(
                         target: "tray",
-                        "托盘图标资源加载失败，降级为程序化备用图标: {err}"
+                        "exe 内嵌图标资源加载失败，尝试 Win32 原生系统图标兜底: {embedded_err}"
                     );
-                    build_fallback_icon()?
+                    match load_system_app_icon() {
+                        Some(icon) => {
+                            tracing::info!(
+                                target: "tray",
+                                "托盘图标：LoadIconW(None, IDI_APPLICATION) 系统图标兜底生效"
+                            );
+                            icon
+                        }
+                        None => {
+                            tracing::warn!(
+                                target: "tray",
+                                "系统图标兜底不可用，降级为程序化备用图标"
+                            );
+                            build_fallback_icon()?
+                        }
+                    }
                 }
             };
 
@@ -664,7 +685,8 @@ mod platform {
     //     256px 一般为 PNG 压缩帧）。
     // 托盘只需 32×32 帧：读组目录 → 就近选 32bpp 帧 → 读 RT_ICON 字节 →
     // 自行解码 DIB 为 RGBA（纯函数见模块尾部，带单元测试）。任何一步失败
-    // 都返回 Err，由调用方降级到 build_fallback_icon，绝不因图标问题阻断托盘。
+    // 都返回 Err，由调用方降级到 LoadIconW(None, IDI_APPLICATION) 系统图标兜底
+    //（再不行才是程序化备用图标），绝不因图标问题阻断托盘。
 
     /// 读取当前进程模块内一个数字 ID 资源的原始字节。
     ///
@@ -734,9 +756,157 @@ mod platform {
     }
 
     // ------------------------------------------------------------------
+    // Win32 原生系统图标兜底（LoadIconW(None, IDI_APPLICATION)）
+    // ------------------------------------------------------------------
+    //
+    // exe 内嵌图标资源不可用时（如无资源构建 / 帧目录损坏 / 单文件体积优化
+    // 裁掉资源段），进入本兜底：调用 Win32 原生 `LoadIconW(None,
+    // IDI_APPLICATION)` 取出系统标准「应用程序」图标句柄（该图标由系统共享，
+    // **永不失败**、且已在通知区折叠 / 展开两种形态下验证可渲染），再经
+    // GDI 把 HICON 位图解码为 RGBA 供 tray-icon 消费。只有连这一步都失败
+    // （理论不可达）才降级到纯代码程序化绘制 —— 保证托盘图标 100% 加载。
+
+    /// 生成「Win32 系统应用图标」兜底图标（`LoadIconW(None, IDI_APPLICATION)`）。
+    ///
+    /// 返回 `None` 仅表示系统图标句柄获取或位图解码失败（此时调用方降级到
+    /// 程序化备用图标）。
+    fn load_system_app_icon() -> Option<Icon> {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, SelectObject,
+            BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, LoadIconW, ICONINFO, IDI_APPLICATION};
+
+        unsafe {
+            // 1) 系统共享「应用程序」图标句柄（hInstance=None + IDI_APPLICATION）。
+            let hicon = LoadIconW(None, IDI_APPLICATION).ok()?;
+
+            // 2) 取位图句柄（hbmColor 缺失 → 单色图标，无法可靠转 RGBA，放弃）。
+            let mut info = ICONINFO::default();
+            GetIconInfo(hicon, &mut info).ok()?;
+            if info.hbmColor.is_invalid() {
+                let _ = DeleteObject(info.hbmMask);
+                return None;
+            }
+
+            // 3) 位图尺寸（GetObjectW → BITMAP）。
+            let mut bm = BITMAP::default();
+            if GetObjectW(info.hbmColor, std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut core::ffi::c_void)) == 0 {
+                let _ = DeleteObject(info.hbmMask);
+                let _ = DeleteObject(info.hbmColor);
+                return None;
+            }
+            let (w, h) = (bm.bmWidth, bm.bmHeight);
+            if w <= 0 || h <= 0 {
+                let _ = DeleteObject(info.hbmMask);
+                let _ = DeleteObject(info.hbmColor);
+                return None;
+            }
+            let (w, h) = (w as u32, h as u32);
+
+            // 4) 32bpp 颜色位图（GetDIBits，bottom-up 原始行序）。
+            let dc = CreateCompatibleDC(None);
+            SelectObject(dc, info.hbmColor);
+            let mut color = vec![0u8; (w * h * 4) as usize];
+            let mut bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w as i32,
+                    biHeight: h as i32, // 正数 = bottom-up
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                bmiColors: [Default::default()],
+            };
+            if GetDIBits(
+                dc,
+                info.hbmColor,
+                0,
+                h,
+                Some(color.as_mut_ptr().cast()),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            ) == 0
+            {
+                let _ = DeleteDC(dc);
+                let _ = DeleteObject(info.hbmMask);
+                let _ = DeleteObject(info.hbmColor);
+                return None;
+            }
+
+            // 5) 透明度来源：32bpp 颜色位图自带 alpha（现代图标）→ 直接使用；
+            //    否则读 AND 掩码（1bpp，1 = 透明）合成。
+            let mut alpha_mask: Option<Vec<bool>> = None;
+            if color.iter().step_by(4).all(|&a| a == 0) {
+                // 颜色位图不含 alpha：读 1bpp AND 掩码。
+                if !info.hbmMask.is_invalid() {
+                    let mut mono = vec![0u8; (((w as usize + 31) / 32) * 4) * h as usize];
+                    let mut mask_bmi = BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: w as i32,
+                            biHeight: h as i32,
+                            biPlanes: 1,
+                            biBitCount: 1,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        bmiColors: [Default::default()],
+                    };
+                    if GetDIBits(
+                        dc,
+                        info.hbmMask,
+                        0,
+                        h,
+                        Some(mono.as_mut_ptr().cast()),
+                        &mut mask_bmi,
+                        DIB_RGB_COLORS,
+                    ) != 0
+                    {
+                        let row_bytes = (((w as usize + 31) / 32) * 4) as usize;
+                        let mut mask = vec![false; (w * h) as usize];
+                        for y in 0..h as usize {
+                            let row = row_bytes * (h as usize - 1 - y); // bottom-up → top-down
+                            for x in 0..w as usize {
+                                let byte = mono[row + x / 8];
+                                let bit = byte & (0x80 >> (x % 8));
+                                mask[y * w as usize + x] = bit != 0; // 1 = 透明（AND 掩码）
+                            }
+                        }
+                        alpha_mask = Some(mask);
+                    }
+                }
+            }
+
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(info.hbmMask);
+            let _ = DeleteObject(info.hbmColor);
+
+            // 6) BGRA(bottom-up) → RGBA(top-down) + alpha 合成。
+            let mut rgba = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h as usize {
+                let src_row = (h as usize - 1 - y) * 4 * w as usize;
+                for x in 0..w as usize {
+                    let si = src_row + x * 4;
+                    let di = (y * w as usize + x) * 4;
+                    rgba[di] = color[si + 2]; // B → R
+                    rgba[di + 1] = color[si + 1];
+                    rgba[di + 2] = color[si]; // R → B
+                    let has_alpha = color[si + 3] != 0;
+                    let masked = alpha_mask.as_ref().is_some_and(|m| m[y * w as usize + x]);
+                    rgba[di + 3] = if has_alpha && !masked { color[si + 3] } else if masked { 0 } else { 255 };
+                }
+            }
+
+            Icon::from_rgba(rgba, w, h).ok()
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 备用嵌入图标（程序化像素绘制）
     // ------------------------------------------------------------------
-
     /// 生成备用托盘图标：品牌蓝圆角方块 + 白色 “T” 字形。
     ///
     /// 纯代码逐像素绘制（零资源文件、零解码依赖），仅当 exe 内嵌图标资源
