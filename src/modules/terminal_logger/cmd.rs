@@ -1122,25 +1122,129 @@ mod tests {
         &bytes[start..end]
     }
 
-    /// 按机器 OEM 代码页解码字节（仅测试侧：Windows 用
-    /// `MultiByteToWideChar(CP_OEMCP)` 还原非 ASCII 日志根路径）。
+    /// 检查捕获 .bat 的「批处理格式合法性」并返回问题清单（空 = 合法）。
+    /// 无损 / 有损两个编码分支共用：无论内嵌路径段是 OEM 双字节还是 '?' 替换
+    /// 字节，生成的脚本都必须保持 cmd 可正常解析的结构（行结构 / 引号配对 /
+    /// CRLF 行尾 / 段外恒为纯 ASCII / 占位符不泄漏）。
+    fn find_batch_format_problems(bytes: &[u8], segment: &[u8]) -> Vec<String> {
+        let mut problems = Vec::new();
+        let marker = b"set \"TLTB_CMD_LOG_DIR=";
+        let Some(marker_at) = bytes.windows(marker.len()).position(|w| w == marker) else {
+            problems.push("缺少日志根路径行标记 `set \"TLTB_CMD_LOG_DIR=`".into());
+            return problems;
+        };
+        let seg_start = marker_at + marker.len();
+        if bytes.get(seg_start..seg_start + segment.len()) != Some(segment) {
+            problems.push("内嵌路径段与断言段不一致".into());
+        }
+        let after = seg_start + segment.len();
+        if bytes.get(after) != Some(&b'"') {
+            problems.push("路径段之后缺失收尾双引号（引号结构被破坏）".into());
+        }
+        if segment.contains(&b'"') {
+            problems.push("路径段内含双引号（引号结构被破坏）".into());
+        }
+        if segment.contains(&b'\r') || segment.contains(&b'\n') || segment.contains(&0) {
+            problems.push("路径段内含 CR / LF / NUL（行结构被破坏）".into());
+        }
+        // 段之外必须恒为纯 ASCII（模板无 BOM、无其它非 ASCII 字节）。
+        let head_ascii = bytes[..seg_start].iter().all(u8::is_ascii);
+        let tail_ascii = bytes
+            .get(after + 1..)
+            .map_or(true, |tail| tail.iter().all(u8::is_ascii));
+        if !head_ascii || !tail_ascii {
+            problems.push("路径段之外存在非 ASCII 字节".into());
+        }
+        // 行尾统一 CRLF：无裸 LF、无孤立 CR。
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' => {
+                    if bytes.get(i + 1) != Some(&b'\n') {
+                        problems.push("存在孤立 CR（行尾应统一 CRLF）".into());
+                        break;
+                    }
+                    i += 2;
+                }
+                b'\n' => {
+                    problems.push("存在裸 LF（行尾应统一 CRLF）".into());
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+        // 占位符不得泄漏。
+        if bytes
+            .windows(LOG_ROOT_PLACEHOLDER.len())
+            .any(|w| w == LOG_ROOT_PLACEHOLDER.as_bytes())
+        {
+            problems.push("日志根路径占位符泄漏".into());
+        }
+        problems
+    }
+
+    /// 机器 OEM 代码页编号（仅测试侧）：`GetOEMCP()`——en-US CI 虚拟机为 437
+    /// （US-ASCII），本地中文系统为 936（GBK）。测试据此对非 ASCII 日志根路径
+    /// 的编码结果分支断言（见 [`capture_script_oem_embeds_non_ascii_log_root`]）。
     #[cfg(windows)]
-    fn oem_decode_for_test(bytes: &[u8]) -> String {
+    fn oem_codepage_for_test() -> u32 {
+        use windows::Win32::Globalization::GetOEMCP;
+        // SAFETY: GetOEMCP 无参数、无前置条件，恒可调用；返回系统 OEM 代码页编号。
+        unsafe { GetOEMCP() }
+    }
+
+    /// 以**显式代码页**编码（仅测试侧模拟，不依赖系统当前代码页）：与生产
+    /// [`oem_encode`] 同一 Win32 调用形态，仅代码页由参数指定——用于在任意
+    /// 机器上确定性地模拟 en-US CI（OEMCP=437）等异代码页环境的编码结果。
+    #[cfg(windows)]
+    fn oem_encode_with_cp_for_test(text: &str, codepage: u32) -> Vec<u8> {
+        use windows::Win32::Globalization::WideCharToMultiByte;
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        // SAFETY: 探测调用（lpMultiByteStr=None → 返回所需字节数）与写入调用
+        // （缓冲长度即探测值）均在调用期间持有所有权。
+        unsafe {
+            let needed = WideCharToMultiByte(
+                codepage,
+                0,
+                &wide,
+                None,
+                windows::core::PCSTR::null(),
+                None,
+            );
+            if needed <= 0 {
+                return text.as_bytes().to_vec(); // 与生产一致：失败按 UTF-8 兜底
+            }
+            let mut out = vec![0u8; needed as usize];
+            let written = WideCharToMultiByte(
+                codepage,
+                0,
+                &wide,
+                Some(&mut out),
+                windows::core::PCSTR::null(),
+                None,
+            );
+            out.truncate(written.max(0) as usize);
+            out
+        }
+    }
+
+    /// 以**显式代码页**解码（仅测试侧模拟，不依赖系统当前代码页）。
+    #[cfg(windows)]
+    fn oem_decode_with_cp_for_test(bytes: &[u8], codepage: u32) -> String {
         use windows::Win32::Globalization::{
             MultiByteToWideChar, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
         };
-        const CP_OEMCP: u32 = 1;
         // SAFETY: 探测调用（lpWideCharStr=None → 返回所需宽字符数）与写入调用
         // （缓冲长度即探测值）均在调用期间持有所有权。
         unsafe {
             let needed =
-                MultiByteToWideChar(CP_OEMCP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None);
+                MultiByteToWideChar(codepage, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None);
             if needed <= 0 {
                 return String::new();
             }
             let mut out = vec![0u16; needed as usize];
             let written = MultiByteToWideChar(
-                CP_OEMCP,
+                codepage,
                 MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
                 bytes,
                 Some(&mut out),
@@ -1148,6 +1252,13 @@ mod tests {
             out.truncate(written.max(0) as usize);
             String::from_utf16_lossy(&out)
         }
+    }
+
+    /// 按机器 OEM 代码页解码字节（仅测试侧：Windows 用
+    /// `MultiByteToWideChar(CP_OEMCP)` 还原非 ASCII 日志根路径）。
+    #[cfg(windows)]
+    fn oem_decode_for_test(bytes: &[u8]) -> String {
+        oem_decode_with_cp_for_test(bytes, 1 /* CP_OEMCP */)
     }
 
     // ---- 捕获脚本内容生成（原生非侵入方案）----
@@ -1248,25 +1359,66 @@ mod tests {
 
     #[test]
     fn capture_script_oem_embeds_non_ascii_log_root() {
-        // 中文路径：Windows 上按机器 OEM 代码页（cp936 等）内嵌字节，cmd 在
-        // 默认控制台解析正确；非 Windows 平台以 UTF-8 兜底。
-        let bytes =
-            capture_script_bytes(Path::new(r"C:\Users\张三\O'Brien\logs")).unwrap();
+        // 中文路径：Windows 上按机器 OEM 代码页内嵌字节，cmd 在默认控制台解析
+        // 正确；非 Windows 平台以 UTF-8 兜底。
+        //
+        // 跨区域兼容（GitHub Actions windows-latest 为 en-US，OEMCP=437，中文
+        // 无法映射为 OEM 字节）：不硬编码「当前环境一定能转出 GBK 字节」，而按
+        // 机器实际 OEMCP 分支——
+        //   * 无损（cp936 等可表示中文的代码页）：断言 OEM 解码逐字还原，cp936
+        //     下再断言具体 GBK 双字节（张 = D5 C5，三 = C8 FD）；
+        //   * 有损（cp437 等西文代码页，不可表示字符被替换为 '?'）：断言降级 /
+        //     替换逻辑，且脚本格式仍合法。
+        let path_text = r"C:\Users\张三\O'Brien\logs";
+        let expected = r"C:\Users\张三\O'Brien\logs\cmd";
+        let bytes = capture_script_bytes(Path::new(path_text)).unwrap();
         let segment = embedded_log_root_bytes(&bytes);
+        // 格式合法性两个分支都必须满足（行结构 / 引号 / CRLF / 段外纯 ASCII）。
+        let problems = find_batch_format_problems(&bytes, segment);
+        assert!(problems.is_empty(), ".bat 脚本格式不合法: {problems:?}");
+
         #[cfg(windows)]
         {
-            assert_eq!(
-                oem_decode_for_test(segment),
-                r"C:\Users\张三\O'Brien\logs\cmd",
-                "OEM 解码应还原原始日志根路径"
-            );
-            // 模板其余部分恒为纯 ASCII：只有路径段携带非 ASCII 字节。
-            let offset = segment.as_ptr() as usize - bytes.as_ptr() as usize;
-            assert!(
-                bytes[..offset].iter().all(u8::is_ascii)
-                    && bytes[offset + segment.len()..].iter().all(u8::is_ascii),
-                "路径段之外必须保持纯 ASCII（无 BOM、无其它非 ASCII 字节）"
-            );
+            // 机器 OEM 代码页：本地中文系统 936（GBK），en-US CI 虚拟机 437。
+            let oemcp = oem_codepage_for_test();
+            let decoded = oem_decode_for_test(segment);
+            if decoded == expected {
+                // ---- 无损分支：代码页可表示中文，OEM 解码逐字还原 ----
+                assert_eq!(decoded, expected, "OEM 解码应还原原始日志根路径");
+                if oemcp == 936 {
+                    // cp936 (GBK) 的具体双字节断言：张 = D5 C5、三 = C8 FD，
+                    // 而非仅泛泛断言「能转出字节」。
+                    let mut want = Vec::new();
+                    want.extend_from_slice(br"C:\Users\");
+                    want.extend_from_slice(&[0xD5, 0xC5]); // 张（GBK 双字节）
+                    want.extend_from_slice(&[0xC8, 0xFD]); // 三（GBK 双字节）
+                    want.extend_from_slice(br"\O'Brien\logs\cmd");
+                    assert_eq!(segment, &want[..], "cp936 下中文路径段应按 GBK 双字节内嵌");
+                } else {
+                    // 其它支持多字节 CJK 的代码页（cp932 / 950 / 949 / 65001 等）：
+                    // 双字节证据——两个中文字符各编码为 >1 字节（含 ≥0x80 的高位
+                    // 字节特征）。
+                    let non_ascii = segment.iter().filter(|&&b| !b.is_ascii()).count();
+                    assert!(
+                        non_ascii >= 4 && segment.iter().any(|&b| b >= 0x80),
+                        "多字节代码页下中文应编码为双字节（至少 4 个非 ASCII 字节）: \
+                         {segment:02X?}"
+                    );
+                }
+            } else {
+                // ---- 有损分支（cp437 等西文代码页，或 CJK 字符不可表示）----
+                // 降级 / 替换逻辑：不可表示字符按系统默认策略替换为 '?'，ASCII
+                // 部分原样保留；脚本格式合法性已由上面的统一断言覆盖。
+                assert_ne!(decoded, expected, "有损分支不应还原原始路径");
+                assert!(
+                    decoded.contains('?'),
+                    "不可表示字符应替换为 '?'（系统默认策略）: {decoded:?}"
+                );
+                assert!(
+                    decoded.starts_with(r"C:\Users\") && decoded.ends_with(r"\O'Brien\logs\cmd"),
+                    "ASCII 部分应原样保留: {decoded:?}"
+                );
+            }
         }
         #[cfg(not(windows))]
         {
@@ -1275,11 +1427,47 @@ mod tests {
                 r"C:\Users\张三\O'Brien\logs\cmd"
             );
         }
+    }
+
+    /// 模拟 en-US CI（OEMCP=437）的降级输出：**不依赖系统当前代码页**，用显式
+    /// CP437 对同一路径编码（中文 → '?'），把结果原位替换进真实脚本后验证——
+    /// 降级 / 替换逻辑成立，且生成的 .bat 仍是格式合法的批处理。本测试在任意
+    /// 机器（含本地 cp936）上都确定性地覆盖「非 936 代码页」路径。
+    #[cfg(windows)]
+    #[test]
+    fn capture_script_oem_lossy_cp437_replacement_keeps_batch_legal() {
+        let path_text = r"C:\Users\张三\O'Brien\logs";
+        let expected = r"C:\Users\张三\O'Brien\logs\cmd";
+        let bytes = capture_script_bytes(Path::new(path_text)).unwrap();
+        let segment = embedded_log_root_bytes(&bytes);
+
+        // 显式 CP437 编码（等价于 en-US 机器上 oem_encode 的输出）：不可表示的
+        // 中文字符按默认策略替换为 '?'，ASCII 部分原样。
+        let cp437_segment = oem_encode_with_cp_for_test(expected, 437);
         assert!(
-            !bytes
-                .windows(LOG_ROOT_PLACEHOLDER.len())
-                .any(|w| w == LOG_ROOT_PLACEHOLDER.as_bytes()),
-            "占位符不得泄漏"
+            cp437_segment.iter().all(u8::is_ascii),
+            "cp437 下非 ASCII 输入应全部替换为 ASCII 占位: {cp437_segment:02X?}"
+        );
+        assert_eq!(
+            oem_decode_with_cp_for_test(&cp437_segment, 437),
+            r"C:\Users\??\O'Brien\logs\cmd",
+            "cp437 下每个不可表示字符应替换为单个 '?'"
+        );
+
+        // 用 437 形态段原位替换真实段：段之外均为模板 ASCII 字节，替换结果与
+        // 「在 437 机器上由 capture_script_bytes 生成的脚本」逐字节一致。
+        let seg_start = segment.as_ptr() as usize - bytes.as_ptr() as usize;
+        let mut simulated = Vec::with_capacity(bytes.len() - segment.len() + cp437_segment.len());
+        simulated.extend_from_slice(&bytes[..seg_start]);
+        simulated.extend_from_slice(&cp437_segment);
+        simulated.extend_from_slice(&bytes[seg_start + segment.len()..]);
+
+        // 降级输出后脚本格式必须仍然合法（cmd 可正常解析）。
+        let problems = find_batch_format_problems(&simulated, &cp437_segment);
+        assert!(problems.is_empty(), "437 降级输出的 .bat 格式不合法: {problems:?}");
+        assert!(
+            simulated.iter().all(u8::is_ascii),
+            "437 下整份脚本应保持纯 ASCII（无 BOM、无其它非 ASCII 字节）"
         );
     }
 
