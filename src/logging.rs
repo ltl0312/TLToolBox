@@ -8,6 +8,11 @@
 //! 路径写日志将落错位置甚至因无写权限而失败；锚定 exe 目录后从任意工作目录拉起
 //! 都稳定写到程序安装目录旁）。
 //!
+//! v0.3.2 起日志目录可经配置自定义（[`crate::config::AppConfig::app_log_dir`]）：
+//! [`init_in_dir`] 接受调用方解析出的**有效日志目录**（缺省回退 exe 同级
+//! `logs/`），[`init`] 保持指向默认目录的便捷入口。同目录下还落盘用户操作审计
+//! 日志 `logs/app_audit.log`（见下方「审计日志」小节）。
+//!
 //! # 装配拓扑（多目标分发，`tracing_subscriber::layer`）
 //!
 //! 以 `tracing_subscriber::registry()` 挂载两层 `fmt::Layer`，编译期按构建模式分支：
@@ -30,11 +35,23 @@
 //!
 //! # 刷盘保证（WorkerGuard 生命周期）
 //!
-//! [`init`] 返回的 [`LoggingGuard`] 持有非阻塞写线程的 [`WorkerGuard`]：其 `Drop`
-//! 会向写线程发送关闭信号并等待其把**尚未落盘的事件全部写完后**才返回（内部最多
-//! 等待约 1 秒）。因此调用方（`main`）必须把守卫绑定到与进程同寿的变量上
-//! （`let _log_guard = logging::init();`），使**任何退出路径**（正常收尾、单实例
-//! 二次启动提前 `return`、panic 展开）都会在进程结束前触发完整刷盘。
+//! [`init`] / [`init_in_dir`] 返回的 [`LoggingGuard`] 持有非阻塞写线程的
+//! [`WorkerGuard`]：其 `Drop` 会向写线程发送关闭信号并等待其把**尚未落盘的事件
+//! 全部写完后**才返回（内部最多等待约 1 秒）。因此调用方（`main`）必须把守卫
+//! 绑定到与进程同寿的变量上（`let _log_guard = logging::init();`），使**任何退出
+//! 路径**（正常收尾、单实例二次启动提前 `return`、panic 展开）都会在进程结束前
+//! 触发完整刷盘。
+//!
+//! # 审计日志（用户操作留痕，v0.3.2）
+//!
+//! [`AuditSink`] 把用户在 GUI 中的全部关键操作（模块开关、黑名单增删、开机自启
+//! 切换、UAC 提权、检查更新、路径更改等）以**高精度时间戳**（微秒，UTC ISO8601）
+//! 逐行追加写入 `<应用日志目录>/app_audit.log`（[`AUDIT_LOG_FILE`]）。写入经
+//! 无界异步通道交给常驻任务串行落盘（调用方绝不阻塞），格式：
+//!
+//! ```text
+//! [2026-09-04T12:34:56.123456Z] [模块开关] popup_blocker -> 开启 -> 成功
+//! ```
 //!
 //! # 优雅降级
 //!
@@ -61,6 +78,9 @@ pub const DEFAULT_LOG_PREFIX: &str = "tltoolbox";
 
 /// 日志文件名的后缀（产出 `tltoolbox.2026-09-04.log` 形态）。
 pub const DEFAULT_LOG_SUFFIX: &str = "log";
+
+/// 用户操作审计日志的文件名（位于应用日志目录下，见 [`AuditSink`]）。
+pub const AUDIT_LOG_FILE: &str = "app_audit.log";
 
 /// 磁盘上最多保留的日志文件份数（含当日文件）。
 ///
@@ -118,7 +138,19 @@ pub fn log_directory() -> PathBuf {
 /// 日志目录不可用时绝不 panic：debug 构建退化为仅控制台输出；release 构建退化为
 /// 不落盘（[`LoggingGuard::is_file_logging_active`] 返回 `false` 可自检）。
 pub fn init() -> LoggingGuard {
-    init_to(&log_directory())
+    init_in_dir(&log_directory())
+}
+
+/// 在**指定目录**装配全局日志订阅者（进程内**仅可调用一次**，见 [`init_to`]
+/// 的说明）。
+///
+/// v0.3.2 起全局日志目录可经配置自定义：`main` 先加载配置，再把
+/// [`AppConfig::effective_app_log_dir`](crate::config::AppConfig::effective_app_log_dir)
+/// 解析出的**有效目录**传入本函数（缺省回退 exe 同级 `logs/`），使 tracing
+/// 按天滚动文件与用户操作审计日志（[`AuditSink`]）落在同一自定义目录下。
+/// 返回的 [`LoggingGuard`] 必须由调用方持有到进程退出（语义与 [`init`] 一致）。
+pub fn init_in_dir(directory: &Path) -> LoggingGuard {
+    init_to(directory)
 }
 
 /// 在指定目录装配日志订阅者（内部实现；`init()` 指向默认 exe 锚定目录）。
@@ -217,10 +249,108 @@ fn build_file_writer(directory: &Path) -> io::Result<(NonBlocking, WorkerGuard)>
     Ok(tracing_appender::non_blocking(appender))
 }
 
+// ---------------------------------------------------------------------------
+// 用户操作审计日志（v0.3.2：GUI 全部关键操作的高精度留痕）
+// ---------------------------------------------------------------------------
+
+/// 审计日志单条记录的常规格式（见 [`AuditSink::record`]）。
+///
+/// `[<UTC 微秒时间戳>] [<操作类别>] <操作详情> -> <操作结果>`
+const AUDIT_LINE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
+
+/// 用户操作审计日志发送端句柄（轻量克隆，跨线程可共享）。
+///
+/// 经无界异步通道把格式化好的记录行交给常驻落盘任务串行追加写入
+/// `<应用日志目录>/app_audit.log`——调用方（UI 回调 / Tokio 任务）发送即返回、
+/// 绝不阻塞；写入顺序与发送顺序严格一致（单消费者 FIFO）。
+///
+/// 生命周期：发送端被 UI 回调句柄持有到进程收尾；通道随最后一份发送端析构
+/// 而关闭，落盘任务自然退出（最后一次 `record` 发送后至多残留一条在途记录，
+/// 对低频审计语义可接受）。
+#[derive(Clone)]
+pub struct AuditSink {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl AuditSink {
+    /// 在指定目录装配审计落盘任务。
+    ///
+    /// 目录不存在时自动创建（与 tracing 文件日志同目录，即
+    /// [`AppConfig::effective_app_log_dir`](crate::config::AppConfig::effective_app_log_dir)
+    /// 的取值；创建失败不 panic——审计降级为静默空操作，应用本体不受影响）。
+    pub fn new(directory: PathBuf) -> Self {
+        let file_path = directory.join(AUDIT_LOG_FILE);
+        if std::fs::create_dir_all(&directory).is_err() {
+            tracing::warn!(
+                target: "logging",
+                "审计日志目录创建失败（本次运行审计不落盘）: '{}'",
+                directory.display()
+            );
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut reported = false;
+            while let Some(line) = rx.recv().await {
+                let text = line + "\n";
+                let write_result = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&file_path)
+                    .and_then(|mut file| {
+                        use std::io::Write;
+                        file.write_all(text.as_bytes())
+                    });
+                if let Err(err) = write_result {
+                    // 首次失败告警一次即可（后续持续失败不刷屏）。
+                    if !reported {
+                        reported = true;
+                        tracing::warn!(
+                            target: "logging",
+                            "审计日志写入失败: {} -> {err}",
+                            file_path.display()
+                        );
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    /// 追加一条审计记录（**高精度时间戳**由本方法在调用时刻生成，微秒级 UTC）。
+    ///
+    /// - `action`：操作类别（如 `模块开关`、`黑名单`、`开机自启`、`UAC 提权`、
+    ///   `检查更新`、`路径更改`）；
+    /// - `detail`：操作详情（对象与目标状态，如 `popup_blocker -> 开启`）；
+    /// - `result`：操作结果（如 `成功` / `失败: <原因>`，由调用方如实上报）。
+    ///
+    /// 三段文本均接受任何 `AsRef<str>` 载荷（`&str` / `String` / `&String`，
+    /// 供调用方可选移动或借用）。任意线程可调用；发送失败（通道已关闭，进程
+    /// 收尾中）时静默忽略。
+    pub fn record<A, D, R>(&self, action: A, detail: D, result: R)
+    where
+        A: AsRef<str>,
+        D: AsRef<str>,
+        R: AsRef<str>,
+    {
+        let timestamp = chrono::Utc::now().format(AUDIT_LINE_FORMAT);
+        let action = action.as_ref();
+        let detail = detail.as_ref();
+        let result = result.as_ref();
+        let line = format!("[{timestamp}] [{action}] {detail} -> {result}");
+        let _ = self.tx.send(line);
+    }
+}
+
+/// 审计日志文件的绝对路径（供 UI 展示与测试直接定位）。
+pub fn audit_log_path(directory: &Path) -> PathBuf {
+    directory.join(AUDIT_LOG_FILE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
 
     /// 生成本次测试独有的临时子目录（确保并发测试互不干扰）。
     fn temp_subdir(tag: &str) -> PathBuf {
@@ -353,5 +483,112 @@ mod tests {
         );
 
         cleanup(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 用户操作审计日志（AuditSink，v0.3.2）
+    // -----------------------------------------------------------------------
+
+    /// 轮询等待审计文件出现目标子串（落盘任务异步写入，需有限等待窗口）。
+    fn wait_for_audit_line(dir: &Path, needle: &str, timeout: std::time::Duration) -> String {
+        let file = audit_log_path(dir);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            if let Ok(content) = std::fs::read_to_string(&file) {
+                if content.contains(needle) {
+                    return content;
+                }
+                last = content;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "审计文件应在 {timeout:?} 内出现 {needle:?}，实际内容: {last:?}（文件: {}）",
+            file.display()
+        );
+    }
+
+    /// 审计记录携带高精度时间戳（微秒），按 动作/详情/结果 三段落盘。
+    ///
+    /// 多线程运行时：`AuditSink` 的落盘任务独立运行于工作线程，测试线程轮询
+    /// 等待（current-thread 运行时会因测试线程 sleep 阻塞而永远等不到落盘）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_sink_writes_timestamped_records() {
+        let dir = temp_subdir("audit");
+        let sink = AuditSink::new(dir.clone());
+
+        sink.record("模块开关", "popup_blocker -> 开启", "成功");
+        sink.record("检查更新", "found v9.9.9", "发现新版本");
+        drop(sink); // 关闭发送端，落盘任务在排空后退出
+
+        let content = wait_for_audit_line(&dir, "popup_blocker -> 开启 -> 成功", Duration::from_secs(3));
+        assert!(
+            content.contains("[模块开关] popup_blocker -> 开启 -> 成功"),
+            "审计行应含动作/详情/结果三段，实际: {content:?}"
+        );
+        assert!(
+            content.contains("[检查更新] found v9.9.9 -> 发现新版本"),
+            "第二条记录应完整落盘，实际: {content:?}"
+        );
+
+        // 时间戳形态：[YYYY-MM-DDTHH:MM:SS.ffffffZ]，微秒级高精度（RFC3339 子集）。
+        let first_line = content.lines().next().expect("至少一行");
+        let timestamp_part = first_line
+            .split(']')
+            .next()
+            .expect("行首应为时间戳")
+            .trim_start_matches('[');
+        assert!(
+            timestamp_part.len() >= 24,
+            "时间戳应为微秒级 ISO8601 形态，实际: {timestamp_part:?}"
+        );
+        // RFC3339 解析（'Z' 结尾 + 小数秒）：chrono 的 parse_from_str 对 'Z' 与
+        // %.6f 各有坑（%z 不接受 'Z'、%.Nf 的消费规则），统一走 RFC3339 校验。
+        let parsed = chrono::DateTime::parse_from_rfc3339(timestamp_part);
+        assert!(
+            parsed.is_ok(),
+            "时间戳应可被 RFC3339 解析，实际: {timestamp_part:?}（{parsed:?}）"
+        );
+        // 精度断言：小数秒至少 3 位（毫秒级即达标的高精度下限，µs 形态恒满足）。
+        let frac_digits = timestamp_part
+            .split('.')
+            .nth(1)
+            .map(|frac| frac.trim_end_matches('Z').len())
+            .unwrap_or(0);
+        assert!(
+            frac_digits >= 3,
+            "时间戳应含毫秒以上精度，实际小数秒位数: {frac_digits}（{timestamp_part:?}）"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// 审计目录不存在时自动创建（AuditSink::new 的目录引导语义）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_sink_creates_missing_directory() {
+        let base = temp_subdir("audit-dir");
+        let dir = base.join("nested").join("audit");
+        assert!(!dir.exists(), "前置条件：目录尚不存在");
+
+        let sink = AuditSink::new(dir.clone());
+        sink.record("路径更改", "app_log_dir", "成功");
+        drop(sink);
+
+        let content = wait_for_audit_line(&dir, "路径更改", Duration::from_secs(3));
+        assert!(content.contains("[路径更改] app_log_dir -> 成功"));
+        assert!(audit_log_path(&dir).is_file(), "审计文件应已创建");
+
+        cleanup(&base);
+    }
+
+    /// 审计文件名常量契约：`app_audit.log`（供 UI 展示 / 文档引用）。
+    #[test]
+    fn audit_file_name_contract() {
+        assert_eq!(AUDIT_LOG_FILE, "app_audit.log");
+        assert_eq!(
+            audit_log_path(Path::new("C:/dir")),
+            PathBuf::from("C:/dir/app_audit.log")
+        );
     }
 }

@@ -6,28 +6,36 @@
 //
 // 布局总览（480 × 560 适中单栏小窗体 · 深色专业风）
 // ┌────────────────────────────────────────────────────────┐
-// │ TLToolBox  [ v0.2.0 ]         全部停用   全部启用        │ ← 顶部系统与全局控制栏
-// │ 原生 Windows 轻量工具箱 · 桌面常驻     开机自启  [开关]   │    标题/小版本号/自启/一键全开全关
+// │ TLToolBox  [ v0.3.x ]         全部停用   全部启用        │ ← 顶部系统与全局控制栏
+// │ 原生 Windows 轻量工具箱 · 桌面常驻 [关于][设置] 开机自启 [开关]│    标题/小版本号/自启/一键全开全关
 // ├────────────────────────────────────────────────────────┤
 // │  ┌ 模块名（加粗白字）        ●运行中/○已停止 [⚙][开关] ┐ │ ← ScrollView 流式卡片列表
 // │  │ 详细用途描述（淡灰细字）                          │ │    有设置项的卡片在开关左侧
 // │  └───────────────────────────────────────────────────┘ │    显示齿轮入口（轻量按钮）
 // │  （……更多模块卡片，超出自动滚动……）                       │
 // ├────────────────────────────────────────────────────────┤
-// │  （规则 / 存储管理遮罩层：点击齿轮淡入；半透明遮罩 + 居中弹窗）│ ← 根层级 Overlay（模块设置弹窗）
+// │  （规则 / 存储管理 / 主设置 / 关于 遮罩层：点击齿轮淡入；半透明遮罩 + 居中弹窗）│ ← 根层级 Overlay
 // └────────────────────────────────────────────────────────┘
 //
 // 数据契约（供 Rust 侧 include_modules! 后经 VecModel 填充）：
 //   - modules:            ModuleItem 列表（id/name/desc/enabled/has_settings）
 //   - popup_rules:        弹窗拦截黑名单关键词（规则弹窗的列表数据源）
+//   - captures:           弹窗拦截留痕记录（CaptureItem：文件名/标题/时间/路径）
+//   - capture_preview:    留痕预览图（Rust 侧经 slint::Image::load_from_path 注入）
+//   - capture_preview_caption: 预览图下方信息（文件名 + 标题）
 //   - show_rules_modal:   「规则管理」弹窗展示开关（由 Rust 装配层驱动）
-//   - terminal_log_dir_display: 终端交互日志当前生效的存储目录绝对路径（展示文本）
+//   - terminal_log_dir_display / app_log_dir_display / screenshot_dir_display:
+//                         三类路径的当前生效绝对路径（主设置 / 模块设置弹窗展示）
 //   - show_terminal_modal:「终端日志记录 - 存储管理」弹窗展示开关（由 Rust 驱动）
+//   - show_settings_modal:「全局设置（日志 / 截图目录自定义）」弹窗展示开关
+//   - show_about_modal:   「关于 TLToolBox」弹窗展示开关
+//   - update_status / update_available / latest_version: 检查更新状态文本与升级入口
 //   - autostart_enabled:  全局开机自启当前生效状态（注册表为准）
 //   - elevated:           提权（管理员）状态（启动装配层注入）：true = 标题旁渲染
 //                         「管理员 (Admin)」翡翠徽标并隐藏提权入口；false = 渲染醒目
 //                         盾牌提权按钮（突破 UIPI 拦截限制的入口）
-//   - app-version:        界面小版本号（默认与 Cargo.toml 对齐，可由装配层覆盖）
+//   - app-version:        界面小版本号（由 Rust 装配层经 env!("CARGO_PKG_VERSION")
+//                         动态注入，UI 侧不写死任何版本号）
 //   - toast_message:      Toast 提示文案（Rust 侧统一 show_toast 写入）
 //   - show_toast:         Toast 显示开关（置 true 弹入，2.5s 后自动收回 / 点击胶囊即提前关闭）
 // 回调契约：
@@ -37,14 +45,20 @@
 //   - request_elevate()               ← 盾牌提权按钮点击（Rust 侧经 UAC 确认后以管理员
 //                                       身份重启，见 crate::platform::restart_as_admin）
 //   - open_module_settings(module_id) ← 模块卡片齿轮点击（Rust 按模块 ID 分派：弹窗
-//                                       拦截=「规则管理」弹窗；终端交互日志=「存储管理」
-//                                       弹窗，见 TerminalSettingsModal）
-//   - open_terminal_modal()           ← 打开「终端日志记录 - 存储管理」弹窗（预留入口，
-//                                       与 open_module_settings 的 terminal_logger 分派
-//                                       共用 Rust 侧 open_terminal_settings 动作）
-//   - close_terminal_modal()          ← 「存储管理」弹窗「×」/ 遮罩空白点击
-//   - open_log_dir_in_explorer()      ← 「存储管理」弹窗主按钮：在文件资源管理器中
-//                                       打开日志目录（目录不存在时 Rust 侧自动创建）
+//                                       拦截=「规则管理 + 留痕」弹窗；终端交互日志=
+//                                       「存储管理」弹窗，见 TerminalSettingsModal）
+//   - open_terminal_modal() / close_terminal_modal() ← 「存储管理」弹窗开关
+//   - open_log_dir_in_explorer()      ← 「存储管理」弹窗：资源管理器打开日志目录
+//   - browse_setting_dir(key)         ← 主设置 / 模块设置：Win32 原生文件夹选择切换路径
+//                                       （key: "app_log" | "terminal_log" | "popup_screenshot"）
+//   - open_setting_dir(key)           ← 主设置：资源管理器打开指定目录
+//   - reset_setting_dir(key)          ← 主设置 / 模块设置：恢复默认目录（None）
+//   - open_about_modal() / close_about_modal()  ← 「关于」弹窗开关
+//   - open_repo_url()                 ← 「关于」：系统浏览器打开开源地址
+//   - check_for_updates()             ← 「关于」：WinHttp 原生检查 GitHub 最新发行版
+//   - open_download_url()             ← 「关于」：发现新版本后打开下载页
+//   - capture_selected(index)         ← 留痕列表选中：Rust 加载预览图
+//   - open_capture_dir()              ← 留痕区：资源管理器打开截图目录
 //   - close_rules_modal()             ← 弹窗「×」/ 遮罩空白点击
 //   - add_rule(keyword)               ← 弹窗底部「添加」（含输入框回车）
 //   - remove_rule(index)              ← 规则行右侧红色删除按钮
@@ -61,8 +75,27 @@ export struct ModuleItem {
     desc: string,
     enabled: bool,
     // 是否有「设置面板」：为真时卡片在 Switch 左侧渲染齿轮按钮
-    // （当前为弹窗拦截：规则管理弹窗；终端交互日志：存储管理弹窗，见 Rust 侧分派）。
+    // （当前为弹窗拦截：规则管理 + 留痕弹窗；终端交互日志：存储管理弹窗，见 Rust 侧分派）。
     has_settings: bool,
+}
+
+// —— 弹窗拦截留痕列表条目（与 popup_blocker::CaptureRecord 对应） ——
+export struct CaptureItem {
+    // 截图文件名（popup_<时间>_<序号>.png）
+    file_name: string,
+    // 被拦截窗口标题
+    title: string,
+    // 拦截时刻（本地时间文本）
+    captured_at: string,
+    // 截图文件绝对路径（Rust 侧选中时按此加载预览）
+    path: string,
+}
+
+// —— 全局设置目录行的键（与 Rust 侧 browse/reset/open 分派一致） ——
+export enum PathKind {
+    app-log,
+    terminal-log,
+    popup-screenshot,
 }
 
 // —— 全局暗色主题令牌（zinc 底 + 翡翠强调；统一取色，避免魔法数字散落） ——
@@ -119,14 +152,22 @@ export global Theme {
     in-out property <color> toast-bg: #27272ae6;    // 胶囊底：zinc-800(#27272a) 派生，~90% 不透明（浮于内容上轻微透底）
     in-out property <color> toast-border: #3f3f46;  // 胶囊细描边
     in-out property <color> toast-text: #ffffff;    // 胶囊正文（纯白）
+
+    // —— 关于 / 设置 / 留痕区专用令牌 ——
+    in-out property <color> link-text: #6ee7b7;          // 可点击链接文字（翡翠）
+    in-out property <color> link-bg-hover: #10b98126;    // 链接悬停底
+    in-out property <color> update-badge-bg: #fbbf2426;  // “发现新版本”徽标底（琥珀淡底）
+    in-out property <color> update-badge-border: #fbbf2480;
+    in-out property <color> update-badge-text: #fcd34d;  // 琥珀强调文字
 }
 
-// —— 轻量操作按钮：全部启用 / 全部停用（幽灵样式，低打扰） ——
+// —— 轻量操作按钮：全部启用 / 全部停用 / 关于 / 设置（幽灵样式，低打扰） ——
 component GhostButton inherits Rectangle {
     in property <string> text: "";
+    in property <length> button-width: 76px;
     callback clicked;
 
-    width: 76px;
+    width: root.button-width;
     height: 26px;
     border-radius: 7px;
     border-width: 1px;
@@ -492,7 +533,188 @@ component RuleRow inherits Rectangle {
     }
 }
 
-// —— 弹窗拦截 · 黑名单规则管理（根层级 Overlay：遮罩 + 居中弹窗卡片） ——
+// —— 通用文本按钮：幽灵底 / 实底强调两态（存储管理、全局设置、关于弹窗复用） ——
+component TextButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> primary: false;
+    in property <length> button-width: 84px;
+    in property <length> button-height: 30px;
+    callback clicked;
+
+    width: root.button-width;
+    height: root.button-height;
+    border-radius: 7px;
+    background: root.primary ? Theme.accent-bg : Theme.btn-bg;
+    border-width: 1px;
+    border-color: root.primary ? Theme.accent-bg : Theme.btn-border;
+
+    states [
+        hover when btn-touch.has-hover && !btn-touch.pressed : {
+            background: root.primary ? Theme.accent-bg-hover : Theme.btn-bg-hover;
+            border-color: root.primary ? Theme.accent-bg-hover : Theme.btn-border-hover;
+        }
+        pressed when btn-touch.pressed : {
+            background: root.primary ? Theme.accent-bg-pressed : Theme.btn-bg-pressed;
+            border-color: root.primary ? Theme.accent-bg-pressed : Theme.btn-border-hover;
+        }
+    ]
+    animate background, border-color { duration: 100ms; }
+
+    Text {
+        text: root.text;
+        font-size: 11.5px;
+        font-weight: 600;
+        color: root.primary ? Theme.accent-fg : Theme.text-primary;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    btn-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 弹窗拦截留痕行：文件名 / 标题 / 时间（点击选中预览） ——
+component CaptureRow inherits Rectangle {
+    in property <CaptureItem> capture;
+    callback clicked;
+
+    height: 46px;
+    border-radius: 8px;
+    background: transparent;
+
+    states [
+        hover when cap-hover.has-hover : {
+            background: Theme.row-bg-hover;
+        }
+    ]
+    animate background { duration: 90ms; }
+
+    cap-hover := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+
+    VerticalBox {
+        padding-left: 10px;
+        padding-right: 8px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 2px;
+        alignment: center;
+
+        Text {
+            text: root.capture.file_name;
+            font-size: 10.5px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            overflow: elide;
+        }
+        Text {
+            text: root.capture.title;
+            font-size: 10px;
+            color: Theme.text-muted;
+            overflow: elide;
+        }
+        Text {
+            text: root.capture.captured_at;
+            font-size: 9px;
+            color: Theme.text-muted;
+        }
+    }
+}
+
+// —— 全局设置目录行：标题 + 当前路径 + 更改 / 打开 / 恢复默认 ——
+component PathSettingRow inherits Rectangle {
+    in property <string> title: "";
+    in property <string> tip: "";
+    in property <string> path: "";
+    in property <string> key: "";
+    callback browse-key(string);
+    callback open-key(string);
+    callback reset-key(string);
+
+    // 高度由内容自然撑开：不设固定 height——标题行 / 路径行 / 按钮行 + 内边距
+    // 共同决定卡片高度，杜绝「更改 / 打开 / 恢复默认」按钮溢出卡片底边（v0.3.2 布局修复）。
+    border-radius: 10px;
+    background: Theme.card-bg;
+    border-width: 1px;
+    border-color: Theme.card-border;
+
+    VerticalBox {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 7px;
+
+        // 标题行：名称 + 用途提示
+        HorizontalBox {
+            spacing: 8px;
+
+            Text {
+                text: root.title;
+                font-size: 12px;
+                font-weight: 600;
+                color: Theme.text-strong;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.tip;
+                font-size: 9.5px;
+                color: Theme.text-muted;
+                overflow: elide;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+        }
+
+        // 当前路径（单行省略展示）
+        Text {
+            text: root.path;
+            font-size: 10px;
+            color: Theme.text-secondary;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        // 操作行：更改（原生文件夹选择）/ 打开（资源管理器）/ 恢复默认（None）
+        HorizontalBox {
+            spacing: 8px;
+            alignment: start;
+
+            TextButton {
+                text: "更改…";
+                button-width: 72px;
+                button-height: 24px;
+                clicked => { root.browse-key(root.key); }
+            }
+            TextButton {
+                text: "打开";
+                button-width: 60px;
+                button-height: 24px;
+                clicked => { root.open-key(root.key); }
+            }
+            TextButton {
+                text: "恢复默认";
+                button-width: 76px;
+                button-height: 24px;
+                clicked => { root.reset-key(root.key); }
+            }
+        }
+    }
+}
+
+// —— 弹窗拦截 · 黑名单规则管理 + 拦截留痕（根层级 Overlay：遮罩 + 居中弹窗卡片） ——
 //
 // 输入 / 动画架构（避免“隐藏弹层拦截主界面交互”）：
 //   - 遮罩层常驻挂载、仅以 opacity 渐变进出：隐藏态其全部 TouchArea 经 enabled
@@ -505,9 +727,16 @@ component RuleRow inherits Rectangle {
 component RulesModal inherits Rectangle {
     in property <bool> show;
     in property <[string]> rules;
+    // —— v0.3.2 拦截留痕（截图列表 + 预览） ——
+    in property <[CaptureItem]> captures;
+    in property <image> capture-preview;
+    in property <string> capture-preview-caption: "";
     callback close-requested;
     callback add-requested(string);
     callback remove-requested(int);
+    callback capture-selected(int);
+    callback open-capture-dir();
+    callback browse-capture-dir();
 
     // 半透明遮罩底：透明度随 show 渐变（入场淡入 / 关闭淡出）。
     // 注意：本组件根元素的宽高在装配点（MainWindow）以窗口尺寸显式给出，
@@ -532,8 +761,8 @@ component RulesModal inherits Rectangle {
     if root.show : dialog := Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        width: min(440px, parent.width - 32px);
-        height: min(462px, parent.height - 48px);
+        width: min(460px, parent.width - 32px);
+        height: min(560px, parent.height - 24px);
         border-radius: 14px;
         background: Theme.dialog-bg;
         border-width: 1px;
@@ -626,6 +855,118 @@ component RulesModal inherits Rectangle {
                 }
             }
 
+            // 分隔线：规则区与拦截留痕区
+            Rectangle {
+                height: 1px;
+                background: Theme.divider;
+            }
+
+            // —— 拦截留痕区：最近拦截的截图列表（左）+ 预览（右） ——
+            // 每次拦截成功截图后，Rust 侧经版本号订阅刷新本列表；选中条目加载预览图。
+            HorizontalBox {
+                spacing: 8px;
+                alignment: center;
+
+                Text {
+                    text: "最近拦截留痕";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.captures.length == 0 ? "暂无记录" : (root.captures.length + " 条");
+                    font-size: 10px;
+                    color: Theme.text-muted;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+
+                GhostButton {
+                    text: "更改目录";
+                    button-width: 72px;
+                    height: 22px;
+                    clicked => { root.browse-capture-dir(); }
+                }
+                GhostButton {
+                    text: "打开目录";
+                    button-width: 72px;
+                    height: 22px;
+                    clicked => { root.open-capture-dir(); }
+                }
+            }
+
+            // 留痕区主体：左列表 + 右预览（高度固定 ~150px，列表内部滚动）
+            Rectangle {
+                height: 150px;
+
+                HorizontalBox {
+                    spacing: 10px;
+
+                    // 左：留痕列表（纵向滚动）
+                    captures-scroll := ScrollView {
+                        width: 186px;
+
+                        VerticalBox {
+                            padding-right: 6px; // 预留滚动条悬浮带
+                            spacing: 4px;
+                            width: captures-scroll.visible-width;
+
+                            if root.captures.length == 0 : Rectangle {
+                                height: 90px;
+
+                                Text {
+                                    text: "暂无拦截留痕\n命中黑名单的弹窗被关闭后自动截图留存";
+                                    font-size: 10px;
+                                    color: Theme.text-muted;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
+
+                            for capture[index] in root.captures : CaptureRow {
+                                capture: capture;
+                                clicked => { root.capture-selected(index); }
+                            }
+                        }
+                    }
+
+                    // 右：预览区（图片 contain 适配 + 底部信息条）
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        border-radius: 8px;
+                        background: Theme.card-bg;
+                        border-width: 1px;
+                        border-color: Theme.card-border;
+                        clip: true;
+
+                        Image {
+                            source: root.capture-preview;
+                            image-fit: contain;
+                            width: parent.width - 16px;
+                            height: parent.height - 28px;
+                            x: 8px;
+                            y: 6px;
+                        }
+                        Text {
+                            text: root.capture-preview-caption;
+                            font-size: 9.5px;
+                            color: Theme.text-muted;
+                            overflow: elide;
+                            width: parent.width - 10px;
+                            x: 5px;
+                            y: parent.height - 20px;
+                            height: 16px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
             // —— 底部：单行输入 + 添加按钮 ——
             HorizontalBox {
                 spacing: 10px;
@@ -671,6 +1012,8 @@ component TerminalSettingsModal inherits Rectangle {
     in property <string> log-dir: "";
     callback close-requested;
     callback open-log-dir-requested;
+    callback browse-dir-requested;
+    callback reset-dir-requested;
 
     // 半透明遮罩底：透明度随 show 渐变（入场淡入 / 关闭淡出）。根元素宽高在装配点
     // （MainWindow）以窗口尺寸显式给出，组件自身不绑定 `parent`。
@@ -693,8 +1036,8 @@ component TerminalSettingsModal inherits Rectangle {
     if root.show : dialog := Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        width: min(440px, parent.width - 32px);
-        height: min(252px, parent.height - 48px);
+        width: min(460px, parent.width - 32px);
+        height: min(292px, parent.height - 48px);
         border-radius: 14px;
         background: Theme.dialog-bg;
         border-width: 1px;
@@ -756,7 +1099,7 @@ component TerminalSettingsModal inherits Rectangle {
 
             // —— 绝对路径展示框：单行展示，过长以省略号收尾 ——
             dir-box := Rectangle {
-                height: 40px;
+                height: 36px;
                 border-radius: 8px;
                 background: Theme.card-bg;
                 border-width: 1px;
@@ -764,7 +1107,7 @@ component TerminalSettingsModal inherits Rectangle {
 
                 Text {
                     text: root.log-dir;
-                    font-size: 11.5px;
+                    font-size: 11px;
                     color: Theme.text-primary;
                     overflow: elide;
                     x: 12px;
@@ -778,38 +1121,369 @@ component TerminalSettingsModal inherits Rectangle {
             // 弹性占位：把主操作按钮沉底（内容不足时吸收剩余纵向空间）。
             Rectangle { vertical-stretch: 1; }
 
-            // —— 主操作：在文件资源管理器中打开日志目录（实底强调，整行宽度） ——
-            open-button := Rectangle {
-                height: 34px;
-                border-radius: 8px;
-                background: Theme.accent-bg;
+            // —— 操作行：更改目录（原生文件夹选择）/ 恢复默认 / 资源管理器打开 ——
+            HorizontalBox {
+                spacing: 10px;
+                alignment: center;
+
+                TextButton {
+                    text: "更改目录…";
+                    button-width: 96px;
+                    clicked => { root.browse-dir-requested(); }
+                }
+                TextButton {
+                    text: "恢复默认";
+                    button-width: 84px;
+                    clicked => { root.reset-dir-requested(); }
+                }
+                TextButton {
+                    text: "在资源管理器中打开";
+                    button-width: 160px;
+                    button-height: 34px;
+                    primary: true;
+                    clicked => { root.open-log-dir-requested(); }
+                }
+            }
+        }
+    }
+}
+
+// —— 全局设置：日志与截图目录自定义（根层级 Overlay 3，v0.3.2） ——
+//
+// 展示三类目录（应用日志 / 终端交互日志 / 弹窗截图）的当前生效绝对路径，
+// 每行提供「更改…」（Win32 原生文件夹选择，Rust 侧 SHBrowseForFolderW）、
+// 「打开」（资源管理器）、「恢复默认」（配置置 None → 回退 exe 同级默认布局）。
+// 输入 / 动画架构与其余弹窗一致（遮罩常驻渐变 + 卡片仅展示期挂载）。
+component SettingsModal inherits Rectangle {
+    in property <bool> show;
+    in property <string> app-log-dir: "";
+    in property <string> terminal-log-dir: "";
+    in property <string> screenshot-dir: "";
+    callback close-requested;
+    callback browse-key(string);
+    callback open-key(string);
+    callback reset-key(string);
+
+    background: Theme.overlay-scrim;
+    opacity: root.show ? 1.0 : 0.0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    backdrop := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.show;
+        clicked => { root.close-requested(); }
+        scroll-event(event) => { return accept; }
+    }
+
+    if root.show : dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(464px, parent.width - 32px);
+        height: min(464px, parent.height - 48px);
+        border-radius: 14px;
+        background: Theme.dialog-bg;
+        border-width: 1px;
+        border-color: Theme.dialog-border;
+        clip: true;
+
+        body-catcher := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+            scroll-event(event) => { return accept; }
+        }
+
+        VerticalBox {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 12px;
+            // 三张路径卡片按内容自然撑高后，剩余空间上下均分，保证弹窗内边距匀称。
+            alignment: center;
+
+            // —— 标题行 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                Text {
+                    text: "全局设置 - 日志与截图目录";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                GhostIconButton {
+                    icon: @image-url("icons/close.svg");
+                    icon-size: 13px;
+                    icon-color: Theme.text-muted;
+                    clicked => { root.close-requested(); }
+                }
+            }
+
+            // —— 语义提示 ——
+            Text {
+                text: "自定义各类日志 / 截图的落盘目录；相对路径锚定可执行文件所在目录，绝对路径原样生效。";
+                font-size: 11px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            // —— 三类目录行 ——
+            PathSettingRow {
+                title: "应用日志目录";
+                tip: "程序运行日志 + 用户操作审计";
+                path: root.app-log-dir;
+                key: "app_log";
+                browse-key(key) => { root.browse-key(key); }
+                open-key(key) => { root.open-key(key); }
+                reset-key(key) => { root.reset-key(key); }
+            }
+            PathSettingRow {
+                title: "终端交互日志目录";
+                tip: "PowerShell / bash / cmd 会话记录";
+                path: root.terminal-log-dir;
+                key: "terminal_log";
+                browse-key(key) => { root.browse-key(key); }
+                open-key(key) => { root.open-key(key); }
+                reset-key(key) => { root.reset-key(key); }
+            }
+            PathSettingRow {
+                title: "弹窗截图目录";
+                tip: "拦截留痕截图（PNG）";
+                path: root.screenshot-dir;
+                key: "popup_screenshot";
+                browse-key(key) => { root.browse-key(key); }
+                open-key(key) => { root.open-key(key); }
+                reset-key(key) => { root.reset-key(key); }
+            }
+        }
+    }
+}
+
+// —— 关于 TLToolBox：图标 / 版本 / 开源地址 / 检查更新（根层级 Overlay 4） ——
+//
+// 「检查更新」经 WinHttp 原生请求 GitHub Releases 接口（零网络库依赖）；
+// 发现新版本时展示琥珀色下载入口（点击经系统浏览器打开 Releases 页面）。
+component AboutModal inherits Rectangle {
+    in property <bool> show;
+    in property <string> version: "";
+    in property <string> update-status: "";
+    in property <bool> update-available: false;
+    in property <string> latest-version: "";
+    callback close-requested;
+    callback open-repo-requested;
+    callback check-update-requested;
+    callback open-download-requested;
+
+    background: Theme.overlay-scrim;
+    opacity: root.show ? 1.0 : 0.0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    backdrop := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.show;
+        clicked => { root.close-requested(); }
+        scroll-event(event) => { return accept; }
+    }
+
+    if root.show : dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(430px, parent.width - 32px);
+        height: min(388px, parent.height - 48px);
+        border-radius: 14px;
+        background: Theme.dialog-bg;
+        border-width: 1px;
+        border-color: Theme.dialog-border;
+        clip: true;
+
+        body-catcher := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+            scroll-event(event) => { return accept; }
+        }
+
+        VerticalBox {
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 12px;
+
+            // —— 标题行 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                Text {
+                    text: "关于 TLToolBox";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                GhostIconButton {
+                    icon: @image-url("icons/close.svg");
+                    icon-size: 13px;
+                    icon-color: Theme.text-muted;
+                    clicked => { root.close-requested(); }
+                }
+            }
+
+            // —— 品牌区：图标 + 名称 + 版本 ——
+            HorizontalBox {
+                spacing: 12px;
+
+                Rectangle {
+                    width: 46px;
+                    height: 46px;
+                    border-radius: 12px;
+                    background: Theme.pill-bg;
+                    border-width: 1px;
+                    border-color: Theme.pill-border;
+
+                    Image {
+                        source: @image-url("icons/shield.svg");
+                        colorize: Theme.pill-text;
+                        width: 26px;
+                        height: 26px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                    }
+                }
+                VerticalBox {
+                    spacing: 2px;
+                    alignment: center;
+
+                    Text {
+                        text: "TLToolBox";
+                        font-size: 17px;
+                        font-weight: 700;
+                        color: Theme.text-strong;
+                    }
+                    Text {
+                        text: "版本 " + root.version;
+                        font-size: 11px;
+                        color: Theme.text-secondary;
+                    }
+                }
+            }
+
+            Text {
+                text: "专注桌面常驻与开关控制的轻量级原生 Windows 工具箱：弹窗拦截 / 系统防休眠 / 剪贴板净化 / 终端交互日志。";
+                font-size: 11px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            // —— 开源地址（可点击，经 ShellExecuteW 打开浏览器） ——
+            Text {
+                text: "开源地址：";
+                font-size: 11px;
+                color: Theme.text-secondary;
+            }
+            link-row := Rectangle {
+                height: 28px;
+                border-radius: 7px;
+                background: transparent;
 
                 states [
-                    hover when open-touch.has-hover && !open-touch.pressed : {
-                        background: Theme.accent-bg-hover;
+                    hover when link-touch.has-hover : {
+                        background: Theme.link-bg-hover;
                     }
-                    pressed when open-touch.pressed : {
-                        background: Theme.accent-bg-pressed;
+                ]
+                animate background { duration: 90ms; }
+
+                Text {
+                    text: "https://github.com/ltl0312/TLToolBox.git";
+                    font-size: 10.5px;
+                    color: Theme.link-text;
+                    overflow: elide;
+                    x: 10px;
+                    y: 0;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                }
+                link-touch := TouchArea {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => { root.open-repo-requested(); }
+                }
+            }
+
+            // —— 检查更新：按钮 + 状态文本 ——
+            HorizontalBox {
+                spacing: 10px;
+                alignment: center;
+
+                GhostButton {
+                    text: "检查更新";
+                    button-width: 88px;
+                    clicked => { root.check-update-requested(); }
+                }
+                Text {
+                    text: root.update-status;
+                    font-size: 10.5px;
+                    color: Theme.text-muted;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+            }
+
+            // —— 下载入口（仅发现新版本时渲染，琥珀强调） ——
+            if root.update-available : download-row := Rectangle {
+                height: 32px;
+                border-radius: 8px;
+                background: Theme.update-badge-bg;
+                border-width: 1px;
+                border-color: Theme.update-badge-border;
+
+                states [
+                    hover when download-touch.has-hover && !download-touch.pressed : {
+                        background: #fbbf2438;
+                    }
+                    pressed when download-touch.pressed : {
+                        background: #fbbf2452;
                     }
                 ]
                 animate background { duration: 100ms; }
 
                 Text {
-                    text: "在文件资源管理器中打开日志目录";
-                    font-size: 12px;
+                    text: "发现新版本 " + root.latest-version + " —— 点击前往 GitHub 下载";
+                    font-size: 11.5px;
                     font-weight: 700;
-                    color: Theme.accent-fg;
+                    color: Theme.update-badge-text;
                     width: parent.width;
                     height: parent.height;
                     horizontal-alignment: center;
                     vertical-alignment: center;
+                    overflow: elide;
                 }
-                open-touch := TouchArea {
+                download-touch := TouchArea {
                     x: 0;
                     y: 0;
                     width: parent.width;
                     height: parent.height;
-                    clicked => { root.open-log-dir-requested(); }
+                    clicked => { root.open-download-requested(); }
                 }
             }
         }
@@ -882,13 +1556,28 @@ export component MainWindow inherits Window {
     in property <[ModuleItem]> modules;
     in property <[string]> popup_rules;
     in property <bool> show_rules_modal: false;
+    // 弹窗拦截留痕（截图列表 / 预览图 / 预览信息）。
+    in property <[CaptureItem]> captures;
+    in property <image> capture_preview;
+    in property <string> capture_preview_caption: "";
     // 终端交互日志 · 存储管理弹窗：当前生效的日志根目录绝对路径（展示文本）与显隐开关。
     in property <string> terminal_log_dir_display: "";
     in property <bool> show_terminal_modal: false;
+    // 全局设置（日志 / 截图目录自定义，v0.3.2）：显隐开关 + 三类目录当前生效路径。
+    in property <bool> show_settings_modal: false;
+    in property <string> app_log_dir_display: "";
+    in property <string> screenshot_dir_display: "";
+    // 关于弹窗（v0.3.2）：显隐开关、更新状态文本 / 下载入口。
+    in property <bool> show_about_modal: false;
+    in property <string> update_status: "";
+    in property <bool> update_available: false;
+    in property <string> latest_version: "";
     in property <bool> autostart_enabled;
     // 提权（管理员）状态：true → 标题旁「管理员 (Admin)」翡翠徽标；false → 盾牌提权按钮。
     in property <bool> elevated: false;
-    in property <string> app-version: "0.2.0";
+    // 界面小版本号：**不写死任何版本字面量**，由 Rust 装配层在初始化时经
+    // env!("CARGO_PKG_VERSION") 动态注入（见 crate::main 的 set_app_version）。
+    in property <string> app-version: "";
 
     // ===== Toast 轻量操作反馈（Rust 侧经统一 show_toast 驱动；UI 点击胶囊可提前关闭） =====
     in-out property <string> toast_message: "";
@@ -907,6 +1596,20 @@ export component MainWindow inherits Window {
     callback close_rules_modal();
     callback add_rule(string);
     callback remove_rule(int);
+    callback capture_selected(int);
+    callback open_capture_dir();
+    // 关于弹窗 / 检查更新（v0.3.2）。
+    callback open_about_modal();
+    callback close_about_modal();
+    callback open_repo_url();
+    callback check_for_updates();
+    callback open_download_url();
+    // 全局设置（目录自定义，v0.3.2）。
+    callback open_settings_modal();
+    callback close_settings_modal();
+    callback browse_setting_dir(string);
+    callback open_setting_dir(string);
+    callback reset_setting_dir(string);
 
     // ============================================================
     //  顶部系统与全局控制栏 + 单栏模块卡片流
@@ -978,18 +1681,31 @@ export component MainWindow inherits Window {
             }
         }
 
-        // ─── 行 2：副标题 + 全局开机自启开关 ───
+        // ─── 行 2：副标题 + 关于 / 设置 + 全局开机自启开关 ───
         HorizontalBox {
-            spacing: 10px;
+            spacing: 8px;
 
             Text {
                 text: "原生 Windows 轻量工具箱 · 桌面常驻";
                 font-size: 11px;
                 color: Theme.text-muted;
+                overflow: elide;
+                horizontal-stretch: 1;
                 vertical-alignment: center;
             }
 
-            Rectangle { horizontal-stretch: 1; }
+            // 「关于」：版本 / 开源地址 / 检查更新弹窗入口（v0.3.2）。
+            GhostButton {
+                text: "关于";
+                button-width: 56px;
+                clicked => { root.open_about_modal(); }
+            }
+            // 「设置」：日志与截图目录自定义弹窗入口（v0.3.2）。
+            GhostButton {
+                text: "设置";
+                button-width: 56px;
+                clicked => { root.open_settings_modal(); }
+            }
 
             Text {
                 text: "开机自启";
@@ -1042,15 +1758,21 @@ export component MainWindow inherits Window {
         height: root.height;
         show: root.show_rules_modal;
         rules: root.popup_rules;
+        captures: root.captures;
+        capture-preview: root.capture_preview;
+        capture-preview-caption: root.capture_preview_caption;
 
         close-requested => { root.close_rules_modal(); }
         add-requested(keyword) => { root.add_rule(keyword); }
         remove-requested(index) => { root.remove_rule(index); }
+        capture-selected(index) => { root.capture_selected(index); }
+        open-capture-dir => { root.open_capture_dir(); }
+        browse-capture-dir => { root.browse_setting_dir("popup_screenshot"); }
     }
 
     // ============================================================
     //  根层级「终端日志记录 - 存储管理」遮罩层（模块设置弹窗之二；声明于规则遮罩
-    //  之后、Toast 之前——两弹窗互斥展示，Toast 仍保持全局最高层级）
+    //  之后、Tool 之前——各弹窗互斥展示，Toast 仍保持全局最高层级）
     // ============================================================
     terminal-modal := TerminalSettingsModal {
         width: root.width;
@@ -1060,6 +1782,43 @@ export component MainWindow inherits Window {
 
         close-requested => { root.close_terminal_modal(); }
         open-log-dir-requested => { root.open_log_dir_in_explorer(); }
+        browse-dir-requested => { root.browse_setting_dir("terminal_log"); }
+        reset-dir-requested => { root.reset_setting_dir("terminal_log"); }
+    }
+
+    // ============================================================
+    //  根层级「全局设置 - 日志与截图目录」遮罩层（v0.3.2）
+    // ============================================================
+    settings-modal := SettingsModal {
+        width: root.width;
+        height: root.height;
+        show: root.show_settings_modal;
+        app-log-dir: root.app_log_dir_display;
+        terminal-log-dir: root.terminal_log_dir_display;
+        screenshot-dir: root.screenshot_dir_display;
+
+        close-requested => { root.close_settings_modal(); }
+        browse-key(key) => { root.browse_setting_dir(key); }
+        open-key(key) => { root.open_setting_dir(key); }
+        reset-key(key) => { root.reset_setting_dir(key); }
+    }
+
+    // ============================================================
+    //  根层级「关于 TLToolBox」遮罩层（v0.3.2：版本 / 开源地址 / 检查更新）
+    // ============================================================
+    about-modal := AboutModal {
+        width: root.width;
+        height: root.height;
+        show: root.show_about_modal;
+        version: root.app-version;
+        update-status: root.update_status;
+        update-available: root.update_available;
+        latest-version: root.latest_version;
+
+        close-requested => { root.close_about_modal(); }
+        open-repo-requested => { root.open_repo_url(); }
+        check-update-requested => { root.check_for_updates(); }
+        open-download-requested => { root.open_download_url(); }
     }
 
     // ============================================================

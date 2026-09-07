@@ -1,6 +1,6 @@
 [package]
 name = "tltoolbox"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 build = "build.rs"
 
@@ -93,6 +93,25 @@ features = [
     # 脚本把非 ASCII 日志根路径按机器 OEM 代码页内嵌，运行时与控制台默认
     # 代码页一致，见 terminal_logger::cmd 模块文档）
     "Win32_Globalization",
+    # Win32_Graphics_GdiPlus：GDI+ 位图 → PNG 编码（弹窗拦截截图留痕把
+    # PrintWindow 捕获的 HBITMAP 经 GdipCreateBitmapFromHBITMAP /
+    # GdipSaveImageToFile 持久化为 PNG，零第三方图像库依赖，见 platform）
+    "Win32_Graphics_GdiPlus",
+    # Win32_Storage_Xps：PrintWindow 本体位于 Storage\Xps 模块（windows-0.58
+    # 的生成布局），连同 PW_CLIENTONLY / PW_RENDERFULLCONTENT 标志一起按需启用
+    "Win32_Storage_Xps",
+    # Win32_Networking_WinHttp：检查更新走 WinHttp 原生 API 请求 GitHub
+    # Releases 接口（WinHttpOpen / Connect / OpenRequest / SendRequest /
+    # ReceiveResponse / ReadData / CloseHandle），保持零额外网络库依赖
+    "Win32_Networking_WinHttp",
+    # Win32_System_Com：CoTaskMemFree（SHBrowseForFolderW 返回的 PIDL 由
+    # 调用方以 CoTaskMemFree 释放，见 platform::browse_for_folder）
+    "Win32_System_Com",
+    # Win32_UI_Shell_Common：SHBrowseForFolderW / SHGetPathFromIDListW /
+    # BROWSEINFOW（原生文件夹选择对话框，见 platform::browse_for_folder）。
+    # windows-0.58 把这些符号单独门控在 Win32_UI_Shell_Common 之下，
+    # 与既有的 Win32_UI_Shell（ShellExecuteW）互不包含、须显式并启。
+    "Win32_UI_Shell_Common",
 ]
 
 [build-dependencies]

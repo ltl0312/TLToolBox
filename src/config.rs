@@ -30,6 +30,14 @@ pub const DEFAULT_CONFIG_PATH: &str = "config/tltoolbox.toml";
 /// 终端日志目录的默认相对路径（相对 exe 同级目录；`terminal_log_dir` 缺省时使用）。
 pub const DEFAULT_TERMINAL_LOG_DIR: &str = "logs/terminals";
 
+/// 应用日志（程序运行日志 + 用户操作审计日志）目录的默认相对路径
+/// （相对 exe 同级目录；`app_log_dir` 缺省时使用）。
+pub const DEFAULT_APP_LOG_DIR: &str = "logs";
+
+/// 弹窗拦截截图目录的默认相对路径（相对 exe 同级目录；
+/// `popup_screenshot_dir` 缺省时使用）。
+pub const DEFAULT_POPUP_SCREENSHOT_DIR: &str = "logs/popup_screenshots";
+
 /// 终端日志保留期限的默认值（天）：超过该期限的 `.log` / `.state.log`
 /// 会话日志由终端日志模块的过期清理守护自动删除，防止日志碎文件无限积压。
 ///
@@ -115,6 +123,29 @@ pub struct AppConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub terminal_log_dir: Option<PathBuf>,
+    /// 程序运行日志（tracing 按天滚动文件）与用户操作审计日志
+    /// （`logs/app_audit.log`，见 [`crate::logging`]）的落盘目录。
+    ///
+    /// `None`（缺省 / 旧配置无此键）→ 消费方回退为 exe 同级 `logs/`
+    /// （见 [`DEFAULT_APP_LOG_DIR`]）；显式给出时按 [`resolve_app_path`]
+    /// 语义锚定：绝对路径原样使用，相对路径以 exe 同级目录为基准拼接。
+    /// 消费方必须经 [`AppConfig::effective_app_log_dir`] 取最终目录。
+    #[serde(
+        default = "AppConfig::default_app_log_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub app_log_dir: Option<PathBuf>,
+    /// 弹窗拦截截图（拦截留痕）的落盘目录。
+    ///
+    /// `None`（缺省 / 旧配置无此键）→ 消费方回退为 exe 同级
+    /// `logs/popup_screenshots`（见 [`DEFAULT_POPUP_SCREENSHOT_DIR`]）；
+    /// 显式给出时按 [`resolve_app_path`] 语义锚定。消费方必须经
+    /// [`AppConfig::effective_popup_screenshot_dir`] 取最终目录。
+    #[serde(
+        default = "AppConfig::default_popup_screenshot_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub popup_screenshot_dir: Option<PathBuf>,
     /// 终端日志（`logs/terminals/` 下 `.log` 与 `.state.log`）的保留期限（天）。
     ///
     /// `None`（缺省 / 旧配置无此键）→ 消费方回退
@@ -165,6 +196,14 @@ impl AppConfig {
         None
     }
 
+    fn default_app_log_dir() -> Option<PathBuf> {
+        None
+    }
+
+    fn default_popup_screenshot_dir() -> Option<PathBuf> {
+        None
+    }
+
     fn default_terminal_log_retention_days() -> Option<u32> {
         None
     }
@@ -195,6 +234,33 @@ impl AppConfig {
         self.terminal_log_retention_days
             .unwrap_or(DEFAULT_TERMINAL_LOG_RETENTION_DAYS)
     }
+
+    /// 应用日志目录的**有效路径**（消费方唯一入口）。
+    ///
+    /// `app_log_dir` 为 `None`（缺省 / 旧配置）时回退到可执行文件同级目录下的
+    /// `logs/`（与配置 `config/`、终端日志 `logs/terminals` 同锚定基准，见
+    /// [`resolve_app_path`] 与 [`DEFAULT_APP_LOG_DIR`]）；显式给出时按
+    /// [`resolve_app_path`] 语义处理绝对 / 相对路径（相对路径同样锚定 exe 目录，
+    /// 与 CWD 解耦，自启 / 双击拉起均指向同一目录）。
+    pub fn effective_app_log_dir(&self) -> PathBuf {
+        match &self.app_log_dir {
+            Some(dir) => resolve_app_path(dir),
+            None => resolve_app_path(Path::new(DEFAULT_APP_LOG_DIR)),
+        }
+    }
+
+    /// 弹窗拦截截图目录的**有效路径**（消费方唯一入口）。
+    ///
+    /// `popup_screenshot_dir` 为 `None`（缺省 / 旧配置）时回退到可执行文件同级
+    /// 目录下的 `logs/popup_screenshots`（见 [`DEFAULT_POPUP_SCREENSHOT_DIR`]）；
+    /// 显式给出时按 [`resolve_app_path`] 语义处理绝对 / 相对路径（相对路径同样
+    /// 锚定 exe 目录，与 CWD 解耦）。
+    pub fn effective_popup_screenshot_dir(&self) -> PathBuf {
+        match &self.popup_screenshot_dir {
+            Some(dir) => resolve_app_path(dir),
+            None => resolve_app_path(Path::new(DEFAULT_POPUP_SCREENSHOT_DIR)),
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -206,6 +272,8 @@ impl Default for AppConfig {
             minimize_to_tray: Self::default_minimize_to_tray(),
             terminal_log_dir: Self::default_terminal_log_dir(),
             terminal_log_retention_days: Self::default_terminal_log_retention_days(),
+            app_log_dir: Self::default_app_log_dir(),
+            popup_screenshot_dir: Self::default_popup_screenshot_dir(),
             enabled_shells: Self::default_enabled_shells(),
             module_custom_params: HashMap::new(),
         }
@@ -577,6 +645,98 @@ mod tests {
             DEFAULT_TERMINAL_LOG_RETENTION_DAYS,
             "缺省保留期限应精确回退默认常量（14 天）"
         );
+
+        // v0.3.2 全局日志路径自定义：应用日志 / 弹窗截图目录同样不显式指定
+        //（None → 消费方回退 exe 同级 logs/ 与 logs/popup_screenshots）。
+        assert_eq!(
+            cfg.app_log_dir, None,
+            "应用日志目录默认不应显式指定（None → exe 同级 logs/）"
+        );
+        assert_eq!(
+            cfg.popup_screenshot_dir, None,
+            "弹窗截图目录默认不应显式指定（None → exe 同级 logs/popup_screenshots）"
+        );
+    }
+
+    #[test]
+    fn app_log_dir_default_falls_back_to_exe_adjacent_logs() {
+        // None 时 effective_app_log_dir 必须落在 exe 同级 logs/。
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.app_log_dir, None, "前置条件：默认无显式目录");
+        let effective = cfg.effective_app_log_dir();
+        assert!(
+            effective.is_absolute(),
+            "回退目录应为绝对路径（exe 锚定），实际: {}",
+            effective.display()
+        );
+        assert!(
+            effective.ends_with(Path::new(DEFAULT_APP_LOG_DIR)),
+            "回退目录应以 logs/ 收尾，实际: {}",
+            effective.display()
+        );
+    }
+
+    #[test]
+    fn popup_screenshot_dir_default_falls_back_to_exe_adjacent_logs() {
+        // None 时 effective_popup_screenshot_dir 必须落在 exe 同级
+        // logs/popup_screenshots（与配置 / 应用日志同锚定基准）。
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.popup_screenshot_dir, None, "前置条件：默认无显式目录");
+        let effective = cfg.effective_popup_screenshot_dir();
+        assert!(
+            effective.is_absolute(),
+            "回退目录应为绝对路径（exe 锚定），实际: {}",
+            effective.display()
+        );
+        assert!(
+            effective.ends_with(Path::new(DEFAULT_POPUP_SCREENSHOT_DIR)),
+            "回退目录应以 logs/popup_screenshots 收尾，实际: {}",
+            effective.display()
+        );
+    }
+
+    #[test]
+    fn explicit_app_and_screenshot_dirs_resolve_absolute_and_relative() {
+        // 显式绝对路径：原样使用（不改写调用方意图）。
+        let mut cfg = AppConfig::default();
+        let abs_app = std::env::temp_dir().join("tltoolbox-app-logs");
+        cfg.app_log_dir = Some(abs_app.clone());
+        assert_eq!(cfg.effective_app_log_dir(), abs_app, "显式绝对路径应原样返回");
+
+        let abs_shot = std::env::temp_dir().join("tltoolbox-shots");
+        cfg.popup_screenshot_dir = Some(abs_shot.clone());
+        assert_eq!(
+            cfg.effective_popup_screenshot_dir(),
+            abs_shot,
+            "显式绝对路径应原样返回"
+        );
+
+        // 显式相对路径：按 resolve_app_path 语义锚定到 exe 目录（与 CWD 解耦）。
+        cfg.app_log_dir = Some(PathBuf::from("data/app-logs"));
+        let effective_app = cfg.effective_app_log_dir();
+        assert!(
+            effective_app.is_absolute(),
+            "相对路径应被锚定为绝对路径，实际: {}",
+            effective_app.display()
+        );
+        assert!(
+            effective_app.ends_with(Path::new("data").join("app-logs")),
+            "锚定结果应以 data/app-logs 收尾，实际: {}",
+            effective_app.display()
+        );
+
+        cfg.popup_screenshot_dir = Some(PathBuf::from("data/shots"));
+        let effective_shot = cfg.effective_popup_screenshot_dir();
+        assert!(
+            effective_shot.is_absolute(),
+            "相对路径应被锚定为绝对路径，实际: {}",
+            effective_shot.display()
+        );
+        assert!(
+            effective_shot.ends_with(Path::new("data").join("shots")),
+            "锚定结果应以 data/shots 收尾，实际: {}",
+            effective_shot.display()
+        );
     }
 
     #[test]
@@ -639,6 +799,9 @@ mod tests {
             // 终端日志字段显式给出（含 Some 目录 / Some 保留期限的序列化往返）。
             terminal_log_dir: Some(PathBuf::from("terminal-log-roundtrip")),
             terminal_log_retention_days: Some(30),
+            // v0.3.2 全局日志路径：应用日志 / 弹窗截图目录显式给出（绝对路径）。
+            app_log_dir: Some(std::env::temp_dir().join("tltoolbox-app-log-roundtrip")),
+            popup_screenshot_dir: Some(PathBuf::from("shot-roundtrip")),
             enabled_shells: vec!["powershell".into(), "wt".into()],
             ..AppConfig::default()
         };
@@ -727,6 +890,14 @@ mod tests {
             DEFAULT_TERMINAL_LOG_RETENTION_DAYS,
             "旧配置无保留期限键时有效天数应回退默认 14 天"
         );
+        assert_eq!(
+            cfg.app_log_dir, None,
+            "缺省时应用日志目录应为 None（消费方回退 exe 同级 logs/）"
+        );
+        assert_eq!(
+            cfg.popup_screenshot_dir, None,
+            "缺省时弹窗截图目录应为 None（消费方回退 exe 同级 logs/popup_screenshots）"
+        );
 
         remove_if_exists(&path).await;
     }
@@ -808,6 +979,46 @@ mod tests {
         remove_if_exists(&path).await;
     }
 
+    /// v0.3.2 全局日志路径：显式声明 app_log_dir / popup_screenshot_dir 时
+    /// 应原样解析（相对路径在 effective 访问器消费时再锚定），其余键回退默认。
+    #[tokio::test]
+    async fn global_log_dirs_parse_when_present() {
+        let path = temp_cfg_path("global-log-dirs");
+        remove_if_exists(&path).await;
+        fs::write(
+            &path,
+            "app_log_dir = \"data/app-logs\"\n\
+             popup_screenshot_dir = \"D:/Custom/Shots\"\n\
+             terminal_log_dir = \"data/terminal-logs\"\n",
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("含全局日志目录字段的配置应正常解析");
+        assert_eq!(
+            cfg.app_log_dir,
+            Some(PathBuf::from("data/app-logs")),
+            "显式应用日志目录应原样读入"
+        );
+        assert_eq!(
+            cfg.popup_screenshot_dir,
+            Some(PathBuf::from("D:/Custom/Shots")),
+            "显式弹窗截图目录应原样读入"
+        );
+        // 缺省值互不影响。
+        assert_eq!(
+            cfg.auto_start_modules,
+            AppConfig::default().auto_start_modules
+        );
+        assert_eq!(
+            cfg.terminal_log_retention_days, None,
+            "未声明的保留期限键仍应回退 None"
+        );
+
+        remove_if_exists(&path).await;
+    }
+
     #[tokio::test]
     async fn popup_blacklist_field_parses_and_roundtrips() {
         let path = temp_cfg_path("blacklist");
@@ -875,6 +1086,14 @@ mod tests {
             "旧版配置缺保留期限键时应为 None（不阻断解析）"
         );
         assert_eq!(
+            cfg.app_log_dir, None,
+            "旧版配置缺应用日志目录键时应为 None（不阻断解析）"
+        );
+        assert_eq!(
+            cfg.popup_screenshot_dir, None,
+            "旧版配置缺弹窗截图目录键时应为 None（不阻断解析）"
+        );
+        assert_eq!(
             cfg.effective_terminal_log_retention_days(),
             DEFAULT_TERMINAL_LOG_RETENTION_DAYS,
             "旧版配置的有效保留期限应回退默认 14 天"
@@ -888,6 +1107,10 @@ mod tests {
         assert!(
             !serialized.contains("terminal_log_dir"),
             "None 的日志目录键不应序列化落盘: {serialized}"
+        );
+        assert!(
+            !serialized.contains("app_log_dir") && !serialized.contains("popup_screenshot_dir"),
+            "None 的全局日志目录键不应序列化落盘: {serialized}"
         );
 
         remove_if_exists(&path).await;

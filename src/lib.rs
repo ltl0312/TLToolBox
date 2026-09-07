@@ -29,3 +29,4 @@ pub mod modules;
 pub mod platform;
 pub mod single_instance;
 pub mod tray;
+pub mod update;
