@@ -381,7 +381,11 @@ impl PopupBlockerModule {
                 "捕获目标弹窗: 标题=\"{title}\", 类名=\"{class_name}\", HWND=0x{:X}; 下发 WM_CLOSE 关闭指令",
                 hwnd.0 as usize,
             );
-            // 关闭指令为异步消息投递，不等待目标窗口处理，杜绝在系统回调中阻塞。
+            // 关闭指令为**异步消息投递**（PostMessageW），不等待目标窗口处理。
+            // 严禁改用同步阻塞式 SendMessageW：WinEvent 回调运行在系统回调上下文
+            // 中，同步等待目标窗口响应会阻塞本进程消息泵，且受 UIPI 限制向高权限
+            // 窗口同步发送会直接失败——异步投递 + 不等待是防卡死钩子消息泵的唯一
+            // 正确形态（SendMessageTimeoutW 亦可用，但此处无需任何应答，Post 最优）。
             let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }

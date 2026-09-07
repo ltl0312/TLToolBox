@@ -1151,7 +1151,7 @@ mod tests {
         let head_ascii = bytes[..seg_start].iter().all(u8::is_ascii);
         let tail_ascii = bytes
             .get(after + 1..)
-            .map_or(true, |tail| tail.iter().all(u8::is_ascii));
+            .is_none_or(|tail| tail.iter().all(u8::is_ascii));
         if !head_ascii || !tail_ascii {
             problems.push("路径段之外存在非 ASCII 字节".into());
         }

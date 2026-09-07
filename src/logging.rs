@@ -195,6 +195,10 @@ fn build_file_writer(directory: &Path) -> io::Result<(NonBlocking, WorkerGuard)>
     })?;
 
     // 2) builder 构造（返回 Result，绝不 panic；内部仍会 create_dir_all + 打开当日文件）。
+    let sample_name = format!(
+        "{}.{}.{}",
+        DEFAULT_LOG_PREFIX, "YYYY-MM-DD", DEFAULT_LOG_SUFFIX
+    );
     let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix(DEFAULT_LOG_PREFIX)
@@ -202,17 +206,10 @@ fn build_file_writer(directory: &Path) -> io::Result<(NonBlocking, WorkerGuard)>
         .max_log_files(MAX_LOG_FILES)
         .build(directory)
         .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "无法打开日志文件 '{}'（目录: {}）: {err}",
-                    format!(
-                        "{}.{}.{}",
-                        DEFAULT_LOG_PREFIX, "YYYY-MM-DD", DEFAULT_LOG_SUFFIX
-                    ),
-                    directory.display()
-                ),
-            )
+            io::Error::other(format!(
+                "无法打开日志文件 '{sample_name}'（目录: {}）: {err}",
+                directory.display()
+            ))
         })?;
 
     // 3) 接入专用写线程（默认 128_000 行缓冲、lossy 语义：极端积压时丢弃新事件

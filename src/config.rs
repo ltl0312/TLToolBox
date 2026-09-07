@@ -30,6 +30,21 @@ pub const DEFAULT_CONFIG_PATH: &str = "config/tltoolbox.toml";
 /// 终端日志目录的默认相对路径（相对 exe 同级目录；`terminal_log_dir` 缺省时使用）。
 pub const DEFAULT_TERMINAL_LOG_DIR: &str = "logs/terminals";
 
+/// 终端日志保留期限的默认值（天）：超过该期限的 `.log` / `.state.log`
+/// 会话日志由终端日志模块的过期清理守护自动删除，防止日志碎文件无限积压。
+///
+/// `terminal_log_retention_days` 缺省（`None` / 旧配置无此键）时消费方回退本值。
+pub const DEFAULT_TERMINAL_LOG_RETENTION_DAYS: u32 = 14;
+
+/// Windows 持久化写入的共享冲突重试配置：
+/// 目标文件正被其他进程以不兼容共享模式打开（`ERROR_SHARING_VIOLATION`，错误码
+/// 32，常见于杀毒软件 / 索引器瞬态扫描、其他实例并发读取）时，短暂退避后重试。
+///
+/// 重试 3 次、每次间隔 20ms——总退避上限 60ms，既保证绝大多数瞬态冲突得以
+/// 平滑降级，又不至于让写入路径长时间挂起。
+const SHARING_VIOLATION_RETRIES: usize = 3;
+const SHARING_VIOLATION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// 把应用资源相对路径解析为「以可执行文件目录为基准」的绝对路径。
 ///
 /// # 背景（路径锚定的必要性）
@@ -100,6 +115,18 @@ pub struct AppConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub terminal_log_dir: Option<PathBuf>,
+    /// 终端日志（`logs/terminals/` 下 `.log` 与 `.state.log`）的保留期限（天）。
+    ///
+    /// `None`（缺省 / 旧配置无此键）→ 消费方回退
+    /// [`DEFAULT_TERMINAL_LOG_RETENTION_DAYS`]（14 天）；显式给出时按实际天数
+    /// 生效（`0` = 立即清理全部已过期会话日志，一般不建议在生产配置中使用）。
+    /// 消费方必须经 [`AppConfig::effective_terminal_log_retention_days`] 取最终
+    /// 天数，禁止直接读取本字段绕开回退逻辑。
+    #[serde(
+        default = "AppConfig::default_terminal_log_retention_days",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub terminal_log_retention_days: Option<u32>,
     /// 启用终端会话日志的 Shell 名单（模块 ID → 仅向本名单内的 Shell 注入钩子；
     /// 实际注入目标与实现策略由终端日志模块后续阶段决定）。
     ///
@@ -138,6 +165,10 @@ impl AppConfig {
         None
     }
 
+    fn default_terminal_log_retention_days() -> Option<u32> {
+        None
+    }
+
     fn default_enabled_shells() -> Vec<String> {
         vec!["powershell".into(), "cmd".into(), "bash".into()]
     }
@@ -155,6 +186,15 @@ impl AppConfig {
             None => resolve_app_path(Path::new(DEFAULT_TERMINAL_LOG_DIR)),
         }
     }
+
+    /// 终端日志保留期限的**有效天数**（消费方唯一入口）。
+    ///
+    /// `terminal_log_retention_days` 为 `None`（缺省 / 旧配置无此键）时回退到
+    /// [`DEFAULT_TERMINAL_LOG_RETENTION_DAYS`]（14 天）；显式给出时按实际天数生效。
+    pub fn effective_terminal_log_retention_days(&self) -> u32 {
+        self.terminal_log_retention_days
+            .unwrap_or(DEFAULT_TERMINAL_LOG_RETENTION_DAYS)
+    }
 }
 
 impl Default for AppConfig {
@@ -165,6 +205,7 @@ impl Default for AppConfig {
             auto_start_windows: Self::default_auto_start_windows(),
             minimize_to_tray: Self::default_minimize_to_tray(),
             terminal_log_dir: Self::default_terminal_log_dir(),
+            terminal_log_retention_days: Self::default_terminal_log_retention_days(),
             enabled_shells: Self::default_enabled_shells(),
             module_custom_params: HashMap::new(),
         }
@@ -219,6 +260,44 @@ impl std::error::Error for ConfigError {
             ConfigError::Io { source, .. } => Some(source),
             ConfigError::Parse { source, .. } => Some(source),
             ConfigError::Serialize { source, .. } => Some(source),
+        }
+    }
+}
+
+/// 是否判定为 Windows `SharingViolation`（`ERROR_SHARING_VIOLATION`，错误码 32）。
+///
+/// 该错误表示目标文件正被另一进程以不兼容共享模式打开（典型场景：杀毒 /
+/// 索引器瞬态扫描、另一实例并发读写）。仅 Windows 平台按 32 号错误码判定——
+/// Unix 的 32 是 `EPIPE`，语义完全不同，不得误判。
+fn is_sharing_violation(err: &std::io::Error) -> bool {
+    cfg!(windows) && err.raw_os_error() == Some(32)
+}
+
+/// 针对 Windows `SharingViolation` 的通用异步重试执行器。
+///
+/// - 至多执行 **1 + [`SHARING_VIOLATION_RETRIES`]** 次（初次 + 3 次重试），
+///   仅当错误被 [`is_sharing_violation`] 判定为共享冲突时按 20ms 退避重试；
+/// - 其余任意错误**立即上抛**，不做无谓重试（如磁盘满、权限不足等重试无益）；
+/// - 返回 `Ok((value, attempts))`，`attempts` 为实际执行次数，供测试断言。
+async fn retry_on_sharing_violation<T, F, Fut>(mut op: F) -> std::io::Result<(T, usize)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut attempts = 0usize;
+    loop {
+        match op().await {
+            Ok(value) => return Ok((value, attempts + 1)),
+            Err(err) if is_sharing_violation(&err) && attempts < SHARING_VIOLATION_RETRIES => {
+                attempts += 1;
+                tracing::debug!(
+                    target: "config",
+                    "配置落盘遭遇 SharingViolation（第 {attempts}/{SHARING_VIOLATION_RETRIES} 次重试，{}ms 退避）: {err}",
+                    SHARING_VIOLATION_BACKOFF.as_millis()
+                );
+                tokio::time::sleep(SHARING_VIOLATION_BACKOFF).await;
+            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -288,6 +367,13 @@ impl ConfigManager {
     /// 异步保存配置：临时文件 + 原子替换，保证任意时刻磁盘上都存在一份完整配置。
     ///
     /// 写锁仅在本次写入期间持有，且不存在嵌套加锁，无死锁隐患。
+    ///
+    /// ## Windows `SharingViolation` 适配
+    ///
+    /// 临时文件写入与原子替换两步都经由 [`retry_on_sharing_violation`] 执行：
+    /// 目标文件被其他进程（杀毒 / 索引器 / 另一实例）瞬态占用而返回
+    /// `ERROR_SHARING_VIOLATION`（错误码 32）时，退避 20ms 重试至多 3 次后
+    /// 才放弃，平滑降级而非一次失败即报错；非共享冲突错误立即上抛。
     pub async fn save(&self, config: &AppConfig) -> Result<(), ConfigError> {
         let _write_guard = self.write_lock.lock().await;
 
@@ -310,8 +396,10 @@ impl ConfigManager {
         }
 
         // 1) 写入同目录临时文件（保证与目标文件处于同一文件系统，rename 才可能原子）。
+        //    经 SharingViolation 重试执行器落盘：瞬态共享冲突平滑降级。
         let tmp_path = self.tmp_path();
-        if let Err(source) = fs::write(&tmp_path, content.as_bytes()).await {
+        if let Err(source) = retry_on_sharing_violation(|| fs::write(&tmp_path, content.as_bytes())).await
+        {
             return Err(ConfigError::Io {
                 path: tmp_path,
                 source,
@@ -319,7 +407,11 @@ impl ConfigManager {
         }
 
         // 2) 原子替换目标文件。失败时尽力清理临时文件，避免残留。
-        if let Err(source) = fs::rename(&tmp_path, &self.file_path).await {
+        //    rename 同样可能遭遇 SharingViolation（目标被其他进程打开），
+        //    与写入一致地重试。
+        if let Err(source) =
+            retry_on_sharing_violation(|| fs::rename(&tmp_path, &self.file_path)).await
+        {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(ConfigError::Io {
                 path: self.file_path.clone(),
@@ -476,6 +568,15 @@ mod tests {
             cfg.terminal_log_dir, None,
             "终端日志目录默认不应显式指定（None → exe 同级 logs/terminals）"
         );
+        assert_eq!(
+            cfg.terminal_log_retention_days, None,
+            "终端日志保留期限默认不应显式指定（None → 回退默认 14 天）"
+        );
+        assert_eq!(
+            cfg.effective_terminal_log_retention_days(),
+            DEFAULT_TERMINAL_LOG_RETENTION_DAYS,
+            "缺省保留期限应精确回退默认常量（14 天）"
+        );
     }
 
     #[test]
@@ -530,14 +631,17 @@ mod tests {
         remove_if_exists(&path).await;
 
         let mgr = ConfigManager::new(&path);
-        let mut cfg = AppConfig::default();
-        cfg.auto_start_modules = vec!["popup_blocker".into(), "fake_module".into()];
-        cfg.auto_start_windows = true;
-        cfg.minimize_to_tray = false;
-        cfg.popup_blacklist = vec!["弹窗测试关键词".into(), "Popup Test Ad".into()];
-        // 终端日志字段显式给出（含 Some 目录的序列化 / 反序列化路径）。
-        cfg.terminal_log_dir = Some(PathBuf::from("terminal-log-roundtrip"));
-        cfg.enabled_shells = vec!["powershell".into(), "wt".into()];
+        let mut cfg = AppConfig {
+            auto_start_modules: vec!["popup_blocker".into(), "fake_module".into()],
+            auto_start_windows: true,
+            minimize_to_tray: false,
+            popup_blacklist: vec!["弹窗测试关键词".into(), "Popup Test Ad".into()],
+            // 终端日志字段显式给出（含 Some 目录 / Some 保留期限的序列化往返）。
+            terminal_log_dir: Some(PathBuf::from("terminal-log-roundtrip")),
+            terminal_log_retention_days: Some(30),
+            enabled_shells: vec!["powershell".into(), "wt".into()],
+            ..AppConfig::default()
+        };
         cfg.module_custom_params
             .insert("popup_blocker".into(), "aggressive".into());
 
@@ -614,6 +718,15 @@ mod tests {
             cfg.terminal_log_dir, None,
             "缺省时日志目录应为 None（消费方回退 exe 同级 logs/terminals）"
         );
+        assert_eq!(
+            cfg.terminal_log_retention_days, None,
+            "缺省时保留期限应为 None（消费方回退默认 14 天）"
+        );
+        assert_eq!(
+            cfg.effective_terminal_log_retention_days(),
+            DEFAULT_TERMINAL_LOG_RETENTION_DAYS,
+            "旧配置无保留期限键时有效天数应回退默认 14 天"
+        );
 
         remove_if_exists(&path).await;
     }
@@ -622,10 +735,11 @@ mod tests {
     async fn terminal_log_fields_parse_when_present() {
         let path = temp_cfg_path("terminal-log");
         remove_if_exists(&path).await;
-        // 显式声明终端日志字段（相对目录 + 自定义 Shell 名单）：应原样解析。
+        // 显式声明终端日志字段（相对目录 + 保留期限 + 自定义 Shell 名单）：应原样解析。
         fs::write(
             &path,
             "terminal_log_dir = \"data/terminal-logs\"\n\
+             terminal_log_retention_days = 30\n\
              enabled_shells = [\"powershell\", \"wsl\"]\n",
         )
         .await
@@ -637,6 +751,16 @@ mod tests {
             cfg.terminal_log_dir,
             Some(PathBuf::from("data/terminal-logs")),
             "显式目录应原样读入（相对路径由 effective 访问器消费时再锚定）"
+        );
+        assert_eq!(
+            cfg.terminal_log_retention_days,
+            Some(30),
+            "显式保留期限应原样读入"
+        );
+        assert_eq!(
+            cfg.effective_terminal_log_retention_days(),
+            30,
+            "显式保留期限应经有效天数访问器原样生效"
         );
         assert_eq!(
             cfg.enabled_shells,
@@ -652,18 +776,52 @@ mod tests {
         remove_if_exists(&path).await;
     }
 
+    /// 保留期限字段的往返与边界：`0` 显式给出时应被**精确保留**（不会被
+    /// 当作缺省吞掉），`None` 序列化时键不落盘、反序列化后仍为 `None`。
+    #[tokio::test]
+    async fn retention_days_roundtrips_and_zero_is_preserved() {
+        let path = temp_cfg_path("retention");
+        remove_if_exists(&path).await;
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = AppConfig {
+            terminal_log_retention_days: Some(0),
+            ..AppConfig::default()
+        };
+        mgr.save(&cfg).await.expect("保存应成功");
+
+        let loaded = mgr.load().await.expect("加载应成功");
+        assert_eq!(
+            loaded.terminal_log_retention_days,
+            Some(0),
+            "显式 0 天必须原样保留（= 立即清理全部过期日志的显式语义）"
+        );
+        assert_eq!(loaded.effective_terminal_log_retention_days(), 0);
+
+        // None 的保留期限键不应序列化落盘（与 terminal_log_dir 的既有约定一致）。
+        let serialized = toml::to_string_pretty(&AppConfig::default()).expect("序列化应成功");
+        assert!(
+            !serialized.contains("terminal_log_retention_days"),
+            "None 的保留期限键不应落盘: {serialized}"
+        );
+
+        remove_if_exists(&path).await;
+    }
+
     #[tokio::test]
     async fn popup_blacklist_field_parses_and_roundtrips() {
         let path = temp_cfg_path("blacklist");
         remove_if_exists(&path).await;
 
         let mgr = ConfigManager::new(&path);
-        let mut cfg = AppConfig::default();
-        cfg.popup_blacklist = vec![
-            "购物返利".into(),
-            "Flash Helper Service".into(),
-            "Update Notice".into(),
-        ];
+        let cfg = AppConfig {
+            popup_blacklist: vec![
+                "购物返利".into(),
+                "Flash Helper Service".into(),
+                "Update Notice".into(),
+            ],
+            ..AppConfig::default()
+        };
         mgr.save(&cfg).await.expect("保存应成功");
 
         let loaded = mgr.load().await.expect("加载应成功");
@@ -712,6 +870,15 @@ mod tests {
             cfg.terminal_log_dir, None,
             "旧版配置缺日志目录键时应为 None（不阻断解析）"
         );
+        assert_eq!(
+            cfg.terminal_log_retention_days, None,
+            "旧版配置缺保留期限键时应为 None（不阻断解析）"
+        );
+        assert_eq!(
+            cfg.effective_terminal_log_retention_days(),
+            DEFAULT_TERMINAL_LOG_RETENTION_DAYS,
+            "旧版配置的有效保留期限应回退默认 14 天"
+        );
 
         let serialized = toml::to_string_pretty(&cfg).expect("重新序列化应成功");
         assert!(
@@ -741,6 +908,128 @@ mod tests {
         let mgr = ConfigManager::new(&path);
         let cfg = mgr.load().await.expect("未知键应被容忍");
         assert!(cfg.auto_start_windows, "已声明键仍应正常解析");
+
+        remove_if_exists(&path).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Windows SharingViolation 写盘重试（v0.3.1 加固）
+    // -----------------------------------------------------------------------
+
+    /// 构造一个 `ERROR_SHARING_VIOLATION`（错误码 32）语义的 IO 错误。
+    fn sharing_violation_error() -> std::io::Error {
+        std::io::Error::from_raw_os_error(32)
+    }
+
+    /// 判定谓词：仅 Windows 平台 + 错误码 32 才算共享冲突；其余错误码 / 其他
+    /// 平台一律不算（Unix 的 32 是 EPIPE，不得误判）。
+    #[test]
+    fn sharing_violation_predicate_matches_only_windows_error_32() {
+        let violation = sharing_violation_error();
+        assert_eq!(
+            is_sharing_violation(&violation),
+            cfg!(windows),
+            "错误码 32 仅在 Windows 平台视为共享冲突"
+        );
+        // 非 32 号错误（如 5 = AccessDenied）在任何平台都不算共享冲突。
+        let denied = std::io::Error::from_raw_os_error(5);
+        assert!(!is_sharing_violation(&denied));
+    }
+
+    /// 重试执行器：首次尝试失败 + 连续 3 次共享冲突重试失败，第 4 次成功 →
+    /// 返回成功值且实际执行 4 次（初次 + 3 次重试）。
+    #[tokio::test]
+    async fn retry_on_sharing_violation_retries_up_to_three_times_then_succeeds() {
+        let mut calls = 0usize;
+        let (value, attempts) =
+            retry_on_sharing_violation(|| {
+                calls += 1;
+                async move {
+                    if calls < 4 {
+                        Err(sharing_violation_error())
+                    } else {
+                        Ok("落盘成功")
+                    }
+                }
+            })
+            .await
+            .expect("第 4 次尝试应成功");
+        assert_eq!(value, "落盘成功");
+        assert_eq!(attempts, 4, "应为 初次 + 3 次重试 = 4 次实际执行");
+        assert_eq!(calls, 4);
+    }
+
+    /// 重试执行器：全部 4 次（初次 + 3 次重试）均为共享冲突 → 重试次数耗尽后
+    /// 上抛最后一次错误，绝不无限重试。
+    #[tokio::test]
+    async fn retry_on_sharing_violation_exhausts_retries_and_reports_error() {
+        let mut calls = 0usize;
+        let err = retry_on_sharing_violation(|| {
+            calls += 1;
+            // 显式标注 Ok 分支类型（T = ()）：闭包只产生 Err，推理需要锚点。
+            async move { Err::<(), _>(sharing_violation_error()) }
+        })
+        .await
+        .expect_err("重试耗尽后应上抛错误");
+        assert!(is_sharing_violation(&err), "应上抛共享冲突错误本身");
+        assert_eq!(
+            calls,
+            1 + SHARING_VIOLATION_RETRIES,
+            "应为 初次 + 3 次重试 = 4 次，之后停止"
+        );
+    }
+
+    /// 重试执行器：非共享冲突错误（如权限不足）必须**立即**上抛，不做无谓重试。
+    #[tokio::test]
+    async fn retry_on_sharing_violation_aborts_immediately_on_other_errors() {
+        let mut calls = 0usize;
+        let err = retry_on_sharing_violation(|| {
+            calls += 1;
+            async move { Err::<(), _>(std::io::Error::from_raw_os_error(5)) }
+        })
+        .await
+        .expect_err("非共享冲突应直接上抛");
+        assert_eq!(err.raw_os_error(), Some(5));
+        assert_eq!(calls, 1, "非共享冲突不得重试");
+    }
+
+    /// 真实 Windows 集成：以独占共享模式（share_mode=0）持有目标配置文件时，
+    /// `save()` 的原子替换步骤会持续命中 `ERROR_SHARING_VIOLATION`；重试 3 次
+    /// 耗尽后应**优雅失败**（返回 Io 错误）而非 panic；释放句柄后再次保存成功。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn save_with_held_exclusive_handle_fails_gracefully_then_recovers() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let path = temp_cfg_path("sharing-violation");
+        remove_if_exists(&path).await;
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = AppConfig::default();
+
+        // 首次保存：创建目标文件（后续步骤依赖其存在）。
+        mgr.save(&cfg).await.expect("首次保存应成功");
+
+        // 以独占共享模式（share_mode=0，不共享读/写/删除）重新打开目标：
+        // 持有期间任何写入 / 重命名都返回共享冲突（ERROR_SHARING_VIOLATION）。
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("以独占模式打开目标文件");
+
+        // 持锁期间 save 必须优雅失败（重试耗尽后上抛 Io 错误），绝不 panic。
+        let err = mgr.save(&cfg).await.expect_err("持独占句柄期间保存应失败");
+        assert!(
+            matches!(err, ConfigError::Io { .. }),
+            "应为 Io 错误变体，实际: {err:?}"
+        );
+
+        // 释放句柄后，后续保存应恢复正常（重试机制只是平滑降级，不永久破坏写盘）。
+        drop(holder);
+        mgr.save(&cfg).await.expect("释放句柄后保存应成功");
+        let loaded = mgr.load().await.expect("恢复后配置应可读");
+        assert_eq!(loaded, cfg);
 
         remove_if_exists(&path).await;
     }

@@ -88,8 +88,10 @@
 //! ## 失败语义（与状态机一致性）
 //!
 //! - `start` 建窗 / 注册监听失败 → 保持停止态并上报错误（UI 开关自然回滚）；
-//! - 运行期单次净化失败（剪贴板被其他进程占用、延迟渲染提供方无响应等）→ 仅记录
-//!   日志并放弃本次，不 panic、不影响后续事件——剪贴板监听天然是“尽力而为”型服务；
+//! - 运行期 `OpenClipboard` 遭遇并发锁争用（其他进程正持有剪贴板）→ 以递增
+//!   退避重试至多 5 次（初次 + 4 次重试，总等待上限 225ms）平滑降级，仍失败
+//!   才放弃本次；单次净化失败（延迟渲染提供方无响应等）→ 仅记录日志并放弃
+//!   本次，不 panic、不影响后续事件——剪贴板监听天然是“尽力而为”型服务；
 //! - `stop` 仅负责信号与 Join，不触碰剪贴板，不存在半途状态。
 //!
 //! # Safety 说明
@@ -134,6 +136,33 @@ use windows::Win32::{
 /// 采用延迟渲染的剪贴板提供方应答的系统内部窗口）下可能略慢，故设置宽松上限。
 #[cfg(windows)]
 const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `OpenClipboard` 的重试配置（v0.3.1 加固）。
+///
+/// 剪贴板是**系统级互斥资源**：其他进程（正在进行的拖放、延迟渲染、另一款
+/// 剪贴板工具）持有期间 `OpenClipboard` 立即返回失败。并发锁争用属正常竞争
+/// 而非故障——本模块以小步递增退避重试数次，对“剪贴板被瞬态占用”做到平滑
+/// 降级，避免单次失败即放弃本次净化。
+///
+/// - 总尝试次数 **5**（初次 + 4 次重试，符合 3~5 次重试的加固要求）；
+/// - 退避序列 15ms / 30ms / 60ms / 120ms，重试总等待上限 **225ms**——远小于
+///   [`PUMP_JOIN_TIMEOUT`]，且绝大多数毫秒级瞬态争用在第一、二次重试内即让出；
+/// - 等待期间泵线程不取消息（`WM_QUIT` 的响应至多延后 225ms），仍满足停机
+///   协议的宽松超时窗口。
+#[cfg(windows)]
+const OPEN_CLIPBOARD_MAX_ATTEMPTS: usize = 5;
+
+/// 各次重试的退避时长（毫秒）：下标 = 第几次重试（0 起）。
+#[cfg(windows)]
+const OPEN_CLIPBOARD_BACKOFF_MS: [u64; 4] = [15, 30, 60, 120];
+
+/// 第 `retry_index` 次重试（0 起）应等待的退避时长；重试序列耗尽返回 `None`。
+#[cfg(windows)]
+fn clipboard_retry_backoff(retry_index: usize) -> Option<Duration> {
+    OPEN_CLIPBOARD_BACKOFF_MS
+        .get(retry_index)
+        .map(|&ms| Duration::from_millis(ms))
+}
 
 /// 纯文本剪贴板格式 `CF_UNICODETEXT`（13）。
 ///
@@ -256,12 +285,29 @@ impl ClipboardPurifierModule {
         rtf_format: u32,
         rtf_wo_format: u32,
     ) -> bool {
-        // 1) 打开剪贴板。携带本监听窗口句柄；失败 = 其他进程正持有剪贴板（如
-        //    正在进行的拖放 / 长渲染），属正常竞争——放弃本次，等待下一条更新。
-        if OpenClipboard(listener).is_err() {
+        // 1) 打开剪贴板（携带本监听窗口句柄）。失败 = 其他进程正持有剪贴板
+        //    （正在进行的拖放 / 长渲染 / 其它剪贴板工具），属正常竞争：以递增
+        //    退避重试至多 [`OPEN_CLIPBOARD_MAX_ATTEMPTS`] 次（初次 + 4 次重试）
+        //    平滑降级；重试耗尽后记录日志并放弃本次，等待下一条更新事件。
+        let mut open_error: Option<windows::core::Error> = None;
+        for attempt in 0..OPEN_CLIPBOARD_MAX_ATTEMPTS {
+            match OpenClipboard(listener) {
+                Ok(()) => {
+                    open_error = None;
+                    break;
+                }
+                Err(err) => {
+                    open_error = Some(err);
+                    if let Some(backoff) = clipboard_retry_backoff(attempt) {
+                        std::thread::sleep(backoff);
+                    }
+                }
+            }
+        }
+        if let Some(err) = open_error {
             tracing::debug!(
                 target: "clipboard_purifier",
-                "OpenClipboard 失败（剪贴板可能正被其他进程占用），放弃本次净化"
+                "OpenClipboard 在 {OPEN_CLIPBOARD_MAX_ATTEMPTS} 次尝试内未获锁（剪贴板被其他进程长期占用），放弃本次净化: {err}"
             );
             return false;
         }
@@ -840,5 +886,31 @@ mod tests {
         assert!(!guard.armed, "无写回则不得布防");
         // 后续外部事件仍正常放行，不产生误跳过。
         assert!(!guard.on_clipboard_update());
+    }
+
+    // -----------------------------------------------------------------------
+    // OpenClipboard 重试退避（v0.3.1 加固）
+    // -----------------------------------------------------------------------
+
+    /// 退避序列契约：前四次重试依次 15 / 30 / 60 / 120ms，序列耗尽后返回
+    /// `None`——配合 [`OPEN_CLIPBOARD_MAX_ATTEMPTS`]（5 次尝试）保证重试
+    /// 总等待上限 225ms，且绝不无限重试。
+    #[cfg(windows)]
+    #[test]
+    fn open_clipboard_retry_backoff_follows_sequence_then_exhausts() {
+        assert_eq!(
+            clipboard_retry_backoff(0),
+            Some(Duration::from_millis(15)),
+            "第 1 次重试退避 15ms"
+        );
+        assert_eq!(clipboard_retry_backoff(1), Some(Duration::from_millis(30)));
+        assert_eq!(clipboard_retry_backoff(2), Some(Duration::from_millis(60)));
+        assert_eq!(clipboard_retry_backoff(3), Some(Duration::from_millis(120)));
+        assert_eq!(
+            clipboard_retry_backoff(4),
+            None,
+            "重试序列耗尽（第 5 次尝试后）不再退避"
+        );
+        assert_eq!(clipboard_retry_backoff(usize::MAX), None);
     }
 }

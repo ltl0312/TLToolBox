@@ -779,9 +779,13 @@ mod platform {
 
         unsafe {
             // 1) 系统共享「应用程序」图标句柄（hInstance=None + IDI_APPLICATION）。
+            //    注意：这是**系统共享句柄**（非本进程创建），按文档不得
+            //    DestroyIcon——本函数只读取位图，绝不释放它。
             let hicon = LoadIconW(None, IDI_APPLICATION).ok()?;
 
             // 2) 取位图句柄（hbmColor 缺失 → 单色图标，无法可靠转 RGBA，放弃）。
+            //    GetIconInfo 成功时 hbmColor / hbmMask 为**本进程新建**的位图
+            //    句柄，调用方负责 DeleteObject 释放（下方每条路径均成对清理）。
             let mut info = ICONINFO::default();
             GetIconInfo(hicon, &mut info).ok()?;
             if info.hbmColor.is_invalid() {
@@ -805,7 +809,15 @@ mod platform {
             let (w, h) = (w as u32, h as u32);
 
             // 4) 32bpp 颜色位图（GetDIBits，bottom-up 原始行序）。
+            //    CreateCompatibleDC 失败返回 NULL 句柄：随后 SelectObject /
+            //    GetDIBits 对 NULL DC 只会返回失败而不会崩溃，但显式判空可让
+            //    失败路径更早、更明确地收敛（DC 不释放，因为从未成功创建）。
             let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                let _ = DeleteObject(info.hbmMask);
+                let _ = DeleteObject(info.hbmColor);
+                return None;
+            }
             SelectObject(dc, info.hbmColor);
             let mut color = vec![0u8; (w * h * 4) as usize];
             let mut bmi = BITMAPINFO {
@@ -842,7 +854,9 @@ mod platform {
             if color.iter().step_by(4).all(|&a| a == 0) {
                 // 颜色位图不含 alpha：读 1bpp AND 掩码。
                 if !info.hbmMask.is_invalid() {
-                    let mut mono = vec![0u8; (((w as usize + 31) / 32) * 4) * h as usize];
+                    // 1bpp 掩码行字节数 = ceil(宽/32) * 4（按 32 位对齐的位行）。
+                    let row_bytes = (w as usize).div_ceil(32) * 4;
+                    let mut mono = vec![0u8; row_bytes * h as usize];
                     let mut mask_bmi = BITMAPINFO {
                         bmiHeader: BITMAPINFOHEADER {
                             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -865,7 +879,7 @@ mod platform {
                         DIB_RGB_COLORS,
                     ) != 0
                     {
-                        let row_bytes = (((w as usize + 31) / 32) * 4) as usize;
+                        // 行字节数复用上方 outer 的 row_bytes（同为 ceil(宽/32)*4）。
                         let mut mask = vec![false; (w * h) as usize];
                         for y in 0..h as usize {
                             let row = row_bytes * (h as usize - 1 - y); // bottom-up → top-down
@@ -880,6 +894,10 @@ mod platform {
                 }
             }
 
+            // 6) 释放全部 GDI 资源（唯一释放点，与第 2) 步的 GetIconInfo 成对）：
+            //    - HDC 由 CreateCompatibleDC 创建 → DeleteDC；
+            //    - hbmMask / hbmColor 由 GetIconInfo 创建 → DeleteObject（两次）。
+            //    顺序不可颠倒：先删 DC（解除位图在 DC 中的选中），再删位图本身。
             let _ = DeleteDC(dc);
             let _ = DeleteObject(info.hbmMask);
             let _ = DeleteObject(info.hbmColor);

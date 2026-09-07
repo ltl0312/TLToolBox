@@ -8,7 +8,7 @@
 //! - [`anchor`]：通用**无损文本锚点插拔引擎**——以带 TAG 的成对标记行在
 //!   Shell 配置文件中圈出 TLToolBox 管理的区块，支持注入 / 更新 / 彻底移除，
 //!   且不破坏文件其余任何用户内容（详见模块内文档）；
-//! - [`ps_bash`]：**PowerShell / Bash 挂载器**——经锚点引擎向 PowerShell
+//! - [`ps_bash`]：**PowerShell / Bash 挂载器**——经锚点引擎向 PowerShell——经锚点引擎向 PowerShell
 //!   5.1 / 7.x 两套引擎、每引擎 `$PROFILE` 的 CurrentUserCurrentHost 与
 //!   AllHosts（[`PowerShellHook`]，**静默** `Start-Transcript` 转录 + 提示符
 //!   状态记录）以及 bash `.bashrc` 与 `.bash_profile`（[`BashHook`]，
@@ -20,6 +20,11 @@
 //!   **原生非侵入**会话记录」：不包裹 / 不接管 cmd，仅借 AutoRun 写会话头、
 //!   借 doskey `exit` 宏在会话结束时把 `doskey /history` 键入命令清单与
 //!   会话尾落盘（[`CmdHook`]，详见模块内文档）；
+//! - [`retention`]：**日志过期清理守护**——`start` 时立即（并以每日为周期）
+//!   递归扫描日志根目录（`powershell/` `bash/` `cmd/` 及任意子目录），删除
+//!   超出保留期限（[`crate::config::AppConfig::terminal_log_retention_days`]，
+//!   缺省 14 天）的 `.log` / `.state.log` 会话日志，防止日志碎文件无限积压
+//!   （详见模块内文档）；
 //! - 配置侧：[`crate::config::AppConfig`] 的 `terminal_log_dir` /
 //!   `enabled_shells` 字段（缺省键回退默认值，见
 //!   [`crate::config::AppConfig::effective_terminal_log_dir`]）。
@@ -61,6 +66,7 @@
 pub mod anchor;
 pub mod cmd;
 pub mod ps_bash;
+pub mod retention;
 
 pub use anchor::{block_end_marker, block_start_marker, inject_block, remove_block};
 pub use cmd::CmdHook;
@@ -69,11 +75,12 @@ pub use ps_bash::{BashHook, PowerShellHook};
 use super::{ModuleError, ToolModule};
 use crate::config::AppConfig;
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as SyncMutex;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Shell ID 常量（与配置 `enabled_shells` 名单的取值约定）
@@ -280,6 +287,10 @@ struct TerminalLoggerInner {
     running: AtomicBool,
     /// 本次运行是否包含 cmd AutoRun 钩子（`is_running` 的注册表核验开关）。
     cmd_hook_active: AtomicBool,
+    /// 日志过期清理守护任务的取消令牌（`start` 派生、`stop` 取消；
+    /// `None` = 守护未在运行）。修复式重装 / 重复启动时先取消旧令牌，
+    /// 杜绝双守护任务并存。
+    retention_guard: SyncMutex<Option<CancellationToken>>,
 }
 
 impl TerminalLoggerModule {
@@ -295,6 +306,7 @@ impl TerminalLoggerModule {
                 lifecycle: AsyncMutex::new(()),
                 running: AtomicBool::new(false),
                 cmd_hook_active: AtomicBool::new(false),
+                retention_guard: SyncMutex::new(None),
             }),
         }
     }
@@ -336,6 +348,61 @@ impl TerminalLoggerModule {
             }
         }
     }
+
+    /// 派生日志过期清理守护任务：**立即**扫一轮过期日志，此后按
+    /// [`retention::CLEANUP_INTERVAL`]（每日）定时清理。
+    ///
+    /// - 先取消既有守护令牌再派生新任务：修复式重装（运行标志为 true 但
+    ///   AutoRun 片段被外部清理后重新 `start`）与重复启动场景下，保证任意
+    ///   时刻至多存在一个守护任务，杜绝双守护并存；
+    /// - 守护任务在 `select!` 的定时等待点响应取消令牌（`stop` 成功时调用），
+    ///   最迟一个周期内退出，不阻塞任何调用方、不遗留后台任务；
+    /// - 目录尚不存在（模块首次启动前）时扫描返回零报告，属正常语义。
+    fn spawn_retention_guard(&self, log_base: PathBuf, retention_days: u32) {
+        // 取消既有守护（若有）：修复式重装 / 重复启动不产生双守护任务。
+        if let Some(old) = self
+            .inner
+            .retention_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            old.cancel();
+        }
+
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        tokio::spawn(async move {
+            // 消费 interval 的首个「立即」tick，随后进入「先清理、再等待」循环：
+            // 模块启动即执行第一轮扫描，此后每个周期清理一次。
+            let mut interval = tokio::time::interval(retention::CLEANUP_INTERVAL);
+            interval.tick().await;
+            loop {
+                let report =
+                    retention::cleanup_expired_logs(log_base.clone(), retention_days).await;
+                tracing::info!(
+                    target: "terminal_logger",
+                    dir = %log_base.display(),
+                    retention_days,
+                    scanned = report.scanned,
+                    removed = report.removed,
+                    skipped = report.skipped,
+                    "日志过期清理完成（保留 {retention_days} 天）"
+                );
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = task_token.cancelled() => break,
+                }
+            }
+            tracing::debug!(target: "terminal_logger", "日志过期清理守护已退出");
+        });
+
+        *self
+            .inner
+            .retention_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
+    }
 }
 
 #[async_trait]
@@ -361,10 +428,14 @@ impl ToolModule for TerminalLoggerModule {
         }
         // 运行标志为 true 但 AutoRun 片段已被外部清理 → 不短路，走修复式重装。
 
-        // 1) 从运行期配置解析最终日志存储目录与启用的 Shell 名单。
-        let (log_base, enabled_shells) = {
+        // 1) 从运行期配置解析最终日志存储目录、保留期限与启用的 Shell 名单。
+        let (log_base, retention_days, enabled_shells) = {
             let cfg = self.inner.config.lock().await;
-            (cfg.effective_terminal_log_dir(), cfg.enabled_shells.clone())
+            (
+                cfg.effective_terminal_log_dir(),
+                cfg.effective_terminal_log_retention_days(),
+                cfg.enabled_shells.clone(),
+            )
         };
 
         // 2) 按名单装配挂载器（未启用 / 无法定位的 Shell 被剔除）并统一安装。
@@ -390,11 +461,16 @@ impl ToolModule for TerminalLoggerModule {
             .store(hooks.cmd_active(), Ordering::Release);
         self.inner.running.store(true, Ordering::Release);
 
+        // 4) 启动日志过期清理守护：立即扫一轮过期日志，此后按固定周期（每日）
+        //    定时清理，防止 `logs/terminals/` 下会话日志碎文件无限积压。
+        self.spawn_retention_guard(log_base.clone(), retention_days);
+
         tracing::info!(
             target: "terminal_logger",
             log_base = %log_base.display(),
             enabled_shells = ?enabled_shells,
-            "终端交互日志已启动（会话日志将写入 '{}' 下的 powershell/ bash/ cmd/ 子目录）",
+            retention_days,
+            "终端交互日志已启动（会话日志将写入 '{}' 下的 powershell/ bash/ cmd/ 子目录，保留 {retention_days} 天）",
             log_base.display()
         );
         Ok(())
@@ -422,7 +498,17 @@ impl ToolModule for TerminalLoggerModule {
 
         self.inner.cmd_hook_active.store(false, Ordering::Release);
         self.inner.running.store(false, Ordering::Release);
-        tracing::info!(target: "terminal_logger", "终端交互日志已停止：全部会话钩子已卸载");
+        // 取消日志过期清理守护（仅成功卸载后）：守护任务在下一个周期等待点退出。
+        if let Some(token) = self
+            .inner
+            .retention_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            token.cancel();
+        }
+        tracing::info!(target: "terminal_logger", "终端交互日志已停止：全部会话钩子已卸载，日志清理守护已停止");
         Ok(())
     }
 
@@ -512,6 +598,57 @@ mod tests {
             module.stop().await.expect("重复停止应幂等成功");
             assert!(!module.is_running(), "重复停止不得破坏停止态");
         }
+    }
+
+    // ---- 日志过期清理守护（v0.3.1 加固）----
+
+    /// 清理守护随模块生命周期启停：`start` 后守护令牌就位（立即扫一轮 +
+    /// 每日定时），`stop` 后取消并清空；多轮启停不遗留旧守护任务。
+    /// （实际的文件过期删除语义由 `retention` 模块的单测覆盖，此处只验证
+    /// 守护任务的装配 / 取消接线。）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retention_guard_follows_module_lifecycle() {
+        // enabled_shells 为空：不触碰真实 Shell 配置 / 注册表，仅验证守护接线。
+        let module = module_with(vec![], Some(PathBuf::from("unused-retention-dir")));
+
+        for cycle in 1..=2 {
+            module.start().await.expect("启动应成功");
+            assert!(
+                module.inner.retention_guard.lock().unwrap().is_some(),
+                "第 {cycle} 轮：启动后日志清理守护应就位"
+            );
+            assert!(module.is_running());
+
+            module.stop().await.expect("停止应成功");
+            assert!(
+                module.inner.retention_guard.lock().unwrap().is_none(),
+                "第 {cycle} 轮：停止后日志清理守护应已取消"
+            );
+            assert!(!module.is_running());
+        }
+    }
+
+    /// 修复式重装（运行中再次 `start`）不得产生双守护任务：令牌被整体替换，
+    /// 旧守护在下一个周期点退出。多次重复 `start` 后仅保留一枚活跃令牌。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_start_replaces_retention_guard_without_duplication() {
+        let module = module_with(vec![], None);
+
+        module.start().await.expect("首次启动应成功");
+        for _ in 0..3 {
+            // 运行中重复 start：幂等短路（running && registry_state_ok）……
+            module.start().await.expect("重复启动应幂等成功");
+            // ……不新增守护任务（令牌仍是同一枚）。
+            module
+                .inner
+                .retention_guard
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("守护令牌应保持就位");
+        }
+        module.stop().await.expect("停止应成功");
+        assert!(module.inner.retention_guard.lock().unwrap().is_none());
     }
 
     // ---- 调度器过滤与装配 ----

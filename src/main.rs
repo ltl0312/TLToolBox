@@ -125,8 +125,8 @@ use tokio::sync::Mutex;
 /// - `terminal_logger`（终端交互日志）：齿轮点击打开「终端日志记录 - 存储管理」
 ///   弹窗（展示当前生效的日志存储目录，可一键在文件资源管理器中打开，见函数体
 ///   8.4.1 / 8.4.5 的按模块 ID 分派与回调接线）。
-/// 其余模块（如 keep_awake）不渲染齿轮。
-/// 未来新增带设置面板的模块时在此扩展。
+///   其余模块（如 keep_awake）不渲染齿轮。
+///   未来新增带设置面板的模块时在此扩展。
 fn module_has_settings(id: &str) -> bool {
     matches!(id, "popup_blocker" | "terminal_logger")
 }

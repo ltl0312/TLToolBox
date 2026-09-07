@@ -157,7 +157,8 @@ mod tests {
 
     #[test]
     fn default_capacity_is_sane() {
-        assert!(DEFAULT_CHANNEL_CAPACITY >= 16);
+        // 编译期常量断言：容量常量改动时立即在构建期暴露回归。
+        const { assert!(DEFAULT_CHANNEL_CAPACITY >= 16) };
     }
 
     #[tokio::test]
