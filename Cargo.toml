@@ -1,6 +1,6 @@
 [package]
 name = "tltoolbox"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 build = "build.rs"
 
@@ -112,6 +112,9 @@ features = [
     # windows-0.58 把这些符号单独门控在 Win32_UI_Shell_Common 之下，
     # 与既有的 Win32_UI_Shell（ShellExecuteW）互不包含、须显式并启。
     "Win32_UI_Shell_Common",
+    # Win32_Graphics_Dwm：DwmGetWindowAttribute / DWMWA_CLOAKED（v0.4.0 窗口置顶
+    # 守护的枚举过滤——排除 DWM 挂起 / 虚拟桌面隐藏的窗口，见 topmost_manager）
+    "Win32_Graphics_Dwm",
 ]
 
 [build-dependencies]

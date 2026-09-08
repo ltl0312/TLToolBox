@@ -61,7 +61,6 @@ pub mod popup_blocker;
 
 /// 剪贴板纯文本净化模块（阶段三原生落地：第三个常驻守护模块）。
 pub mod clipboard_purifier;
-
 /// 终端交互日志模块（阶段收官 · 第四个常驻守护模块）。
 ///
 /// 底层为无损锚点引擎（[`terminal_logger::anchor`]）+ PowerShell 5.1/7.x
@@ -73,3 +72,13 @@ pub mod clipboard_purifier;
 /// `enabled_shells` 名单安装钩子，`stop` 统一卸载，`is_running` 由内存标志
 /// 与 cmd AutoRun 注册表状态联合判定。
 pub mod terminal_logger;
+
+/// 全局窗口置顶守护模块（v0.4.0 · 第五个常驻守护模块）。
+///
+/// 基于 Win32 原生 API（零重型第三方依赖）实现轻量可视化窗口置顶管理：
+/// 1~9 级优先级链式守护（[`topmost_manager::engine`]）、严苛窗口过滤与纯文本
+/// 轻量枚举（[`topmost_manager::enum_windows`]）、专用原生泵线程监听前台事件
+/// 以纠偏低优先级窗口激活造成的下压（WinEventHook + 防抖），UIPI 拦截经
+/// Toast 总线提示用户提权运行；置顶规则经 [`ToolModule`] 生命周期与
+/// `AppConfig::topmost_manager` 持久化记忆、启动恢复。
+pub mod topmost_manager;

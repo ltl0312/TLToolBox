@@ -522,7 +522,10 @@ mod tests {
         sink.record("检查更新", "found v9.9.9", "发现新版本");
         drop(sink); // 关闭发送端，落盘任务在排空后退出
 
-        let content = wait_for_audit_line(&dir, "popup_blocker -> 开启 -> 成功", Duration::from_secs(3));
+        // 轮询等待两条记录各自出现（逐条 write_all 落盘；先等第二条再断言，
+        // 避免“第一条刚出现、第二条尚未写盘”的瞬态竞态）。
+        let _ = wait_for_audit_line(&dir, "popup_blocker -> 开启 -> 成功", Duration::from_secs(3));
+        let content = wait_for_audit_line(&dir, "found v9.9.9", Duration::from_secs(3));
         assert!(
             content.contains("[模块开关] popup_blocker -> 开启 -> 成功"),
             "审计行应含动作/详情/结果三段，实际: {content:?}"

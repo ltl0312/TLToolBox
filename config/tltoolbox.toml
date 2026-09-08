@@ -18,3 +18,12 @@ auto_start_windows = false
 minimize_to_tray = true
 
 [module_custom_params]
+
+# 全局窗口置顶守护（v0.4.0）：
+#   enabled：模块全局启停（默认关闭，由 UI 开关切换后经本文件持久化；
+#            开启 = 安装 WinEvent 前台钩子守护 1~9 级优先级链）；
+#   pinned_rules：置顶记忆（进程名 + 标题子串 + 优先级 1~9 + enabled），
+#            模块启动时按规则重新枚举窗口自动恢复置顶。
+[topmost_manager]
+enabled = false
+pinned_rules = []

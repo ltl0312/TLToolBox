@@ -58,6 +58,14 @@ pub enum AppEvent {
     /// 具体执行由装配层（`crate::main`）的“生命周期控制器”订阅者完成，
     /// 从而把平台回调线程与 Tokio 异步世界彻底解耦。
     TrayAction(TrayAction),
+    /// 后台守护线程请求弹出一条 Toast（v0.4.0：窗口置顶模块的守护线程在
+    /// `SetWindowPos` 遭遇 UIPI 拦截时发布，提示用户提权运行）。
+    ///
+    /// 构造点位于模块的原生守护线程（无法直接触碰 UI）；总线桥接层收到后经
+    /// `show_toast` 在 UI 线程展示。与 UI 回调路径的同步 Toast 互为补充——
+    /// UI 同步操作仍直接调用 Toast 入口，只有“后台线程需要提示用户”的
+    /// 场景才走本事件。
+    ToastRequested(String),
 }
 
 /// 托盘用户操作 → 应用级常驻指令。

@@ -167,6 +167,40 @@ pub struct AppConfig {
     /// 各模块的自定义参数（模块 ID → 配置值），供模块级扩展配置使用。
     #[serde(default)]
     pub module_custom_params: HashMap<String, String>,
+    /// 全局窗口置顶守护（v0.4.0，见 [`TopmostManagerConfig`]）。
+    ///
+    /// - `enabled`：模块全局启停的配置镜像（默认关闭，由 UI / 托盘切换时持久化）；
+    /// - `pinned_rules`：置顶记忆（窗口级规则：进程名 + 标题子串匹配 + 优先级
+    ///   1~9，1 最顶层），模块启动时按规则枚举窗口自动恢复上次会话的置顶。
+    #[serde(default)]
+    pub topmost_manager: TopmostManagerConfig,
+}
+
+/// 全局窗口置顶守护（v0.4.0）的配置节。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopmostManagerConfig {
+    /// 模块全局启停（默认 `false`）。由装配层在 UI / 托盘切换
+    /// `topmost_manager` 模块时持久化（配置为准，与 `auto_start_windows` 同模式）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 置顶规则记忆（可选手动维护，运行时由模块在每次置顶变更后整体重建落盘）。
+    #[serde(default)]
+    pub pinned_rules: Vec<PinnedRule>,
+}
+
+/// 单条窗口置顶规则（v0.4.0 的持久化形态，进程内对应
+/// [`ActivePinnedWindow`](crate::modules::topmost_manager::ActivePinnedWindow)）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedRule {
+    /// 目标窗口所属进程的可执行文件名（如 `notepad.exe`，大小写不敏感匹配）。
+    pub process_name: String,
+    /// 标题匹配模式（**子串匹配、忽略大小写**；持久化时写入窗口的完整标题，
+    /// 模块启动恢复时按子串语义放宽匹配窗口标题的细微变化）。
+    pub title_pattern: String,
+    /// 置顶优先级（1~9，1 位于最顶层；越界值由引擎归一化夹紧）。
+    pub priority: u8,
+    /// 规则是否启用（`false` 的规则在启动恢复时跳过）。
+    pub enabled: bool,
 }
 
 impl AppConfig {
@@ -276,6 +310,7 @@ impl Default for AppConfig {
             popup_screenshot_dir: Self::default_popup_screenshot_dir(),
             enabled_shells: Self::default_enabled_shells(),
             module_custom_params: HashMap::new(),
+            topmost_manager: TopmostManagerConfig::default(),
         }
     }
 }
@@ -1253,6 +1288,109 @@ mod tests {
         mgr.save(&cfg).await.expect("释放句柄后保存应成功");
         let loaded = mgr.load().await.expect("恢复后配置应可读");
         assert_eq!(loaded, cfg);
+
+        remove_if_exists(&path).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 全局窗口置顶守护配置节（v0.4.0）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn topmost_manager_defaults_to_disabled_with_empty_rules() {
+        let cfg = AppConfig::default();
+        assert!(
+            !cfg.topmost_manager.enabled,
+            "窗口置顶默认应关闭（显式开启才守护）"
+        );
+        assert!(
+            cfg.topmost_manager.pinned_rules.is_empty(),
+            "默认不应携带任何置顶规则"
+        );
+        // 旧配置缺省该节时也应回退同等的默认值（serde(default) 语义）。
+        let toml_text = "auto_start_modules = [\"popup_blocker\"]\n";
+        let parsed: AppConfig = toml::from_str(toml_text).expect("旧配置应可解析");
+        assert_eq!(
+            parsed.topmost_manager,
+            TopmostManagerConfig::default(),
+            "旧配置缺省 topmost_manager 节应回退默认值"
+        );
+    }
+
+    /// 置顶规则的 TOML 序列化往返：进程名 / 标题模式 / 优先级边界 / enabled 标志
+    /// 必须逐字段保真（结构体序列化契约测试之一）。
+    #[tokio::test]
+    async fn pinned_rules_roundtrip_through_toml() {
+        let path = temp_cfg_path("topmost");
+        remove_if_exists(&path).await;
+
+        let rules = vec![
+            PinnedRule {
+                process_name: "notepad.exe".into(),
+                title_pattern: "无标题 - 记事本".into(),
+                priority: 1,
+                enabled: true,
+            },
+            PinnedRule {
+                process_name: "WindowsTerminal.exe".into(),
+                title_pattern: "PowerShell".into(),
+                priority: 9,
+                enabled: false,
+            },
+        ];
+        let cfg = AppConfig {
+            topmost_manager: TopmostManagerConfig {
+                enabled: true,
+                pinned_rules: rules,
+            },
+            ..AppConfig::default()
+        };
+
+        let mgr = ConfigManager::new(&path);
+        mgr.save(&cfg).await.expect("保存应成功");
+        let loaded = mgr.load().await.expect("加载应成功");
+        assert_eq!(loaded, cfg, "置顶配置节应逐字段往返一致");
+        assert!(loaded.topmost_manager.enabled);
+        assert_eq!(loaded.topmost_manager.pinned_rules.len(), 2);
+        assert_eq!(loaded.topmost_manager.pinned_rules[0].priority, 1);
+        assert_eq!(loaded.topmost_manager.pinned_rules[1].priority, 9);
+        assert!(!loaded.topmost_manager.pinned_rules[1].enabled);
+
+        remove_if_exists(&path).await;
+    }
+
+    /// 显式声明 [topmost_manager] 配置节时应原样解析（含中文标题模式与优先级边界）。
+    #[tokio::test]
+    async fn topmost_manager_section_parses_when_present() {
+        let path = temp_cfg_path("topmost-section");
+        remove_if_exists(&path).await;
+        fs::write(
+            &path,
+            "[topmost_manager]\n\
+             enabled = true\n\
+             [[topmost_manager.pinned_rules]]\n\
+             process_name = \"chrome.exe\"\n\
+             title_pattern = \"Gmail\"\n\
+             priority = 3\n\
+             enabled = true\n",
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("含置顶配置节的 TOML 应正常解析");
+        assert!(cfg.topmost_manager.enabled);
+        assert_eq!(cfg.topmost_manager.pinned_rules.len(), 1);
+        let rule = &cfg.topmost_manager.pinned_rules[0];
+        assert_eq!(rule.process_name, "chrome.exe");
+        assert_eq!(rule.title_pattern, "Gmail");
+        assert_eq!(rule.priority, 3);
+        assert!(rule.enabled);
+        // 其余键缺省仍回退默认值，互不影响。
+        assert_eq!(
+            cfg.auto_start_modules,
+            AppConfig::default().auto_start_modules
+        );
 
         remove_if_exists(&path).await;
     }
