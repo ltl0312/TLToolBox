@@ -93,8 +93,12 @@ export struct CaptureItem {
 
 // —— 全局窗口置顶候选窗口行（与 topmost_manager 的枚举 + 置顶状态合并） ——
 export struct TopmostWindowItem {
-    // 窗口句柄十六进制简报（0x…，同时作为操作回路的稳定键）
+    // 窗口句柄十六进制简报（0x…，仅作展示；**不参与操作回路**）
     hwnd: string,
+    // 窗口句柄裸值（Win32 HWND 落在 32 位 USER 句柄表内，截断到 i32 安全）：
+    // 置顶开关 / 优先级步进器的回调一律携带本值回传 Rust（v0.4.1 起废除
+    // 行索引与文本解析——搜索过滤后仍按 HWND 绝对匹配，杜绝误操作）。
+    hwnd_value: int,
     // 所属进程可执行文件名（notepad.exe）
     process_name: string,
     // 窗口标题（截断显示）
@@ -175,6 +179,13 @@ export global Theme {
     in-out property <color> update-badge-bg: #fbbf2426;  // “发现新版本”徽标底（琥珀淡底）
     in-out property <color> update-badge-border: #fbbf2480;
     in-out property <color> update-badge-text: #fcd34d;  // 琥珀强调文字
+
+    // —— 全局窗口置顶弹窗 · 模块停用警示条（v0.4.1）专用令牌 ——
+    // 模块主开关处于「已停止」时，弹窗顶部渲染琥珀警示条 + 列表控件全部禁用
+    //（Switch / 优先级步进器 enabled: false，禁止无效操作）。
+    in-out property <color> warn-bar-bg: #f59e0b1a;       // 警示条底（琥珀淡底）
+    in-out property <color> warn-bar-border: #f59e0b80;   // 警示条描边
+    in-out property <color> warn-bar-text: #fcd34d;       // 警示条文字（琥珀强调）
 }
 
 // —— 轻量操作按钮：全部启用 / 全部停用 / 关于 / 设置（幽灵样式，低打扰） ——
@@ -1313,10 +1324,16 @@ component PriorityStepper inherits Rectangle {
 // 行内三栏固定列宽对齐规范：左栏·信息区（stretch 吸余、文本左对齐 + 省略）→
 // 中栏·优先级步进器（96 × 28 固定）→ 右栏·置顶开关（44px 固定列宽、贴列右缘）。
 // 行内不加载任何窗口图标（防爆显存）。
+//
+// v0.4.1 事件通信契约：置顶开关 / 优先级步进器的回调**必须**把目标窗口的
+// `hwnd_value`（HWND 裸值的 32 位截断）作为首个参数回传 Rust——绝不携带行索引，
+// 保证搜索过滤 / 列表重排后操作的仍是 HWND 绝对匹配的真实窗口。
+// `module_enabled` 为模块主开关联锁：模块「已停止」时整行开关 / 步进器禁用。
 component TopmostWindowRow inherits Rectangle {
     in property <TopmostWindowItem> window;
-    callback pin-toggled(bool);
-    callback priority-changed(int);
+    in property <bool> module_enabled: true;
+    callback toggle-pin(int, bool);
+    callback change-priority(int, int);
 
     height: 52px;
     border-radius: 9px;
@@ -1381,25 +1398,29 @@ component TopmostWindowRow inherits Rectangle {
             }
         }
 
-        // 中栏·优先级步进器：96 × 28 固定列宽（未置顶时灰化禁用；行内垂直居中）
+        // 中栏·优先级步进器：96 × 28 固定列宽（行内垂直居中）。
+        // enabled 双条件：未置顶 **或** 模块已停止 → 灰化禁用（整组不响应点击）。
         Rectangle {
             width: 96px;
             height: parent.height;
+            opacity: root.module_enabled ? 1.0 : 0.45;
 
             PriorityStepper {
                 width: 96px;
                 height: 28px;
                 y: (parent.height - self.height) / 2;
                 value: root.window.priority;
-                enabled: root.window.pinned;
-                changed(p) => { root.priority-changed(p); }
+                enabled: root.window.pinned && root.module_enabled;
+                changed(p) => { root.change-priority(root.window.hwnd_value, p); }
             }
         }
 
         // 右栏·置顶开关：44px 固定列宽；开关贴列右缘、垂直居中。
+        // 模块已停止 → enabled: false（禁止无效操作）+ 整列降低透明度提示。
         Rectangle {
             width: 44px;
             height: parent.height;
+            opacity: root.module_enabled ? 1.0 : 0.45;
 
             Switch {
                 width: 40px;
@@ -1407,8 +1428,9 @@ component TopmostWindowRow inherits Rectangle {
                 x: parent.width - self.width;
                 y: (parent.height - self.height) / 2;
                 checked: root.window.pinned;
+                enabled: root.module_enabled;
                 toggled => {
-                    root.pin-toggled(self.checked);
+                    root.toggle-pin(root.window.hwnd_value, self.checked);
                 }
             }
         }
@@ -1419,15 +1441,20 @@ component TopmostWindowRow inherits Rectangle {
 // 顶栏：标题 + 刷新按钮 + 关闭按钮；下方实时搜索过滤框；中部纯文本窗口列表
 //（每行 = 优先级步进器 + 置顶开关）；操作即时联动（底层立即应用 / 解除置顶）。
 // 输入 / 动画架构与其余弹窗一致：遮罩常驻渐变 + 卡片仅展示期挂载。
+//
+// v0.4.1 模块主开关联锁：`module_enabled = false`（模块「已停止」）时——
+// 顶部渲染琥珀警示条「全局置顶功能已停止，请在主界面开启后操作」，且列表内
+// 全部 Switch / 优先级步进器禁用，禁止无效操作。
 component TopmostModal inherits Rectangle {
     in property <bool> show;
     in property <[TopmostWindowItem]> windows;
+    in property <bool> module_enabled: true;
     in-out property <string> search: "";
     callback close-requested;
     callback refresh-requested;
     callback search-changed(string);
-    callback pin-toggled(string, bool);
-    callback priority-changed(string, int);
+    callback pin-toggled(int, bool);
+    callback priority-changed(int, int);
 
     background: Theme.overlay-scrim;
     opacity: root.show ? 1.0 : 0.0;
@@ -1497,6 +1524,27 @@ component TopmostModal inherits Rectangle {
                 }
             }
 
+            // —— 顶部警示条（v0.4.1）：模块主开关「已停止」时的联锁提示 ——
+            // 琥珀警示条 + 列表控件禁用（见 TopmostWindowRow.module_enabled）。
+            if !root.module_enabled : Rectangle {
+                height: 30px;
+                border-radius: 8px;
+                background: Theme.warn-bar-bg;
+                border-width: 1px;
+                border-color: Theme.warn-bar-border;
+
+                Text {
+                    text: "⚠ 全局置顶功能已停止，请在主界面开启后操作";
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: Theme.warn-bar-text;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
             // —— 实时搜索过滤 ——
             LineEdit {
                 placeholder-text: "搜索进程名 / 标题 / HWND…";
@@ -1544,11 +1592,12 @@ component TopmostModal inherits Rectangle {
 
                     for win in root.windows : TopmostWindowRow {
                         window: win;
-                        pin-toggled(checked) => {
-                            root.pin-toggled(win.hwnd, checked);
+                        module-enabled: root.module_enabled;
+                        toggle-pin(hwnd_value, checked) => {
+                            root.pin-toggled(hwnd_value, checked);
                         }
-                        priority-changed(p) => {
-                            root.priority-changed(win.hwnd, p);
+                        change-priority(hwnd_value, p) => {
+                            root.priority-changed(hwnd_value, p);
                         }
                     }
                 }
@@ -2000,9 +2049,12 @@ export component MainWindow inherits Window {
     in property <string> app_log_dir_display: "";
     in property <string> screenshot_dir_display: "";
     // 全局窗口置顶管理弹窗（v0.4.0）：显隐开关 + 候选窗口列表 + 实时搜索文本。
+    // v0.4.1：`topmost_module_enabled` = 模块主开关的**真实运行态**（Rust 装配层
+    // 在模块状态变更时随模块列表一并回写）——弹窗据此渲染警示条并禁用全部控件。
     in property <bool> show_topmost_modal: false;
     in property <[TopmostWindowItem]> topmost_windows;
     in-out property <string> topmost_search: "";
+    in property <bool> topmost_module_enabled: true;
     // 关于弹窗（v0.3.2）：显隐开关、更新状态文本 / 下载入口。
     in property <bool> show_about_modal: false;
     in property <string> update_status: "";
@@ -2046,13 +2098,13 @@ export component MainWindow inherits Window {
     callback browse_setting_dir(string);
     callback open_setting_dir(string);
     callback reset_setting_dir(string);
-    // 全局窗口置顶（v0.4.0）。
+    // 全局窗口置顶（v0.4.0；v0.4.1 起回调首参为 HWND 整数值，废除字符串文本解析）。
     callback open_topmost_modal();
     callback close_topmost_modal();
     callback refresh_topmost();
     callback topmost_search_changed(string);
-    callback topmost_toggle_pin(string, bool);
-    callback topmost_set_priority(string, int);
+    callback topmost_toggle_pin(int, bool);
+    callback topmost_set_priority(int, int);
 
     // ============================================================
     //  顶部系统与全局控制栏 + 单栏模块卡片流
@@ -2254,13 +2306,14 @@ export component MainWindow inherits Window {
         height: root.height;
         show: root.show_topmost_modal;
         windows: root.topmost_windows;
+        module-enabled: root.topmost_module_enabled;
         search: root.topmost_search;
 
         close-requested => { root.close_topmost_modal(); }
         refresh-requested => { root.refresh_topmost(); }
         search-changed(text) => { root.topmost_search_changed(text); }
-        pin-toggled(hwnd, checked) => { root.topmost_toggle_pin(hwnd, checked); }
-        priority-changed(hwnd, priority) => { root.topmost_set_priority(hwnd, priority); }
+        pin-toggled(hwnd_value, checked) => { root.topmost_toggle_pin(hwnd_value, checked); }
+        priority-changed(hwnd_value, priority) => { root.topmost_set_priority(hwnd_value, priority); }
     }
 
     // ============================================================

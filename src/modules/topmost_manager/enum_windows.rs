@@ -1,7 +1,7 @@
-//! # Win32 顶层窗口轻量枚举与严苛过滤（v0.4.0 · 全局窗口置顶守护）
+//! # Win32 顶层窗口轻量枚举与严苛过滤（v0.4.1 · 全局窗口置顶守护）
 //!
 //! 经 [`EnumWindows`] 一次性遍历当前桌面会话的全部顶层窗口，逐窗口完成
-//! 五重严苛过滤与元数据采集，产出供 UI 弹窗列表与置顶引擎使用的
+//! 六重严苛过滤与元数据采集，产出供 UI 弹窗列表与置顶引擎使用的
 //! [`WindowInfo`] 快照：
 //!
 //! 1. **可见性 + 有标题**：`IsWindowVisible` 为真且 `GetWindowTextLengthW > 0`
@@ -13,9 +13,12 @@
 //!    窗口（被 DWM 隐藏——如虚拟桌面切换后隐藏、UWP 挂起等）一律剔除。注意该调用
 //!    在无 DWM 合成（远程桌面会话、旧回退驱动）时返回 `E_NOTIMPL` / `S_FALSE`，
 //!    此时按“不隐藏”放行（保守语义：宁可多列一个窗口，不可漏掉用户窗口）；
-//! 4. **自身剥离**：排除 TLToolBox 自己的主窗口（防止用户把工具本体置顶造成
+//! 4. **最小化剥离**（v0.4.1）：`IsIconic` 为真的窗口（最小化到任务栏）一律
+//!    不出现在候选列表——置顶对最小化窗口无视觉意义，且最小化触发的自动解置顶
+//!    会与列表展示产生时序噪音；
+//! 5. **自身剥离**：排除 TLToolBox 自己的主窗口（防止用户把工具本体置顶造成
 //!    “自己钉自己”的循环）；
-//! 5. **桌面容器剥离**：排除系统任务栏（`Shell_TrayWnd`）、桌面（`Progman`）、
+//! 6. **桌面容器剥离**：排除系统任务栏（`Shell_TrayWnd`）、桌面（`Progman`）、
 //!    开始按钮（`Button`）等桌面背景容器——它们属于 Shell 而非用户窗口。
 //!
 //! 采集字段：进程可执行文件名（`GetWindowThreadProcessId` + `OpenProcess` +
@@ -53,7 +56,7 @@ use windows::Win32::{
     },
     UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, WS_EX_APPWINDOW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_APPWINDOW,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     },
 };
@@ -233,36 +236,43 @@ fn is_cloaked(hwnd: HWND) -> bool {
     }
 }
 
-/// 单条窗口是否通过全部五重过滤（供测试与实现共用的**纯判定函数**）。
+/// 单条窗口是否通过全部六重过滤（供测试与实现共用的**纯判定函数**）。
 ///
 /// # 参数
+/// - `ex_style`：窗口扩展样式（工具条剥离 / 置顶位回读）；
 /// - `title` / `class_name`：已采集的窗口标题 / 类名（非空标题前置校验由调用方做）；
 /// - `own_title` / `own_class`：TLToolBox 自身窗口的标题 / 类名（自身剥离）；
-/// - `topmost`：调用方是否已按 [`WS_EX_TOPMOST`] 读取该窗口的置顶扩展样式。
+/// - `is_iconic`：窗口是否处于最小化态（由调用方以 Win32 `IsIconic` 采集；
+///   v0.4.1 起最小化的窗口一律不入列）。
 ///
 /// # 测试便利
-/// 本函数把「工具条剥离 / 自身剥离 / 桌面容器剥离」三条**纯字符串规则**独立出来，
-/// 使过滤算法无需真实窗口即可单测（真实窗口路径经 [`enumerate_top_level_windows`]
-/// 集成验证）。
+/// 本函数把「工具条剥离 / 自身剥离 / 桌面容器剥离 / 最小化剥离」四条**纯判定规则**
+/// 独立出来，使过滤算法无需真实窗口即可单测（真实窗口路径经
+/// [`enumerate_top_level_windows`] 集成验证）。
 pub fn passes_visible_filter(
     ex_style: u32,
     title: &str,
     class_name: &str,
     own_title: &str,
     own_class: &str,
+    is_iconic: bool,
 ) -> bool {
+    // 规则 4（v0.4.1）：最小化剥离——最小化到任务栏的窗口不在列表中展示。
+    if is_iconic {
+        return false;
+    }
     // 规则 2：工具条剥离——带 WS_EX_TOOLWINDOW 且未声明 WS_EX_APPWINDOW。
     let is_tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0 && ex_style & WS_EX_APPWINDOW.0 == 0;
     if is_tool_window {
         return false;
     }
-    // 规则 4：自身剥离。
+    // 规则 5：自身剥离。
     if is_self_window(title, class_name)
         || (title == own_title && class_name == own_class && !own_title.is_empty())
     {
         return false;
     }
-    // 规则 5：桌面容器剥离。
+    // 规则 6：桌面容器剥离。
     if is_desktop_shell_container(class_name) {
         return false;
     }
@@ -272,8 +282,8 @@ pub fn passes_visible_filter(
 /// 枚举全部符合置顶候选条件的顶层窗口（`Vec` 顺序即 `EnumWindows` 的 Z-Order
 /// 自顶向下顺序，UI 列表按此排布）。
 ///
-/// 每条窗口均通过可见性 / 有标题 / 工具条 / DWM cloak / 自身 / 桌面容器六重过滤
-/// （标题为空串或不可见者直接短路，不再消耗后续查询）。
+/// 每条窗口均通过可见性 / 有标题 / 工具条 / DWM cloak / 最小化 / 自身 / 桌面容器
+/// 七重过滤（标题为空串、不可见或最小化者直接短路，不再消耗后续查询）。
 pub fn enumerate_top_level_windows() -> Vec<WindowInfo> {
     #[cfg(windows)]
     {
@@ -332,6 +342,10 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     if !IsWindowVisible(hwnd).as_bool() {
         return true.into();
     }
+    // 最小化剥离（规则 4，v0.4.1）：最小化到任务栏的窗口一律不在列表中展示。
+    if IsIconic(hwnd).as_bool() {
+        return true.into();
+    }
     let title_len = GetWindowTextLengthW(hwnd);
     if title_len <= 0 {
         return true.into();
@@ -349,7 +363,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     }
 
     let ex_style = get_ex_style(hwnd);
-    if !passes_visible_filter(ex_style, &title, &class_name, "", "") {
+    if !passes_visible_filter(ex_style, &title, &class_name, "", "", false) {
         return true.into();
     }
 
@@ -368,7 +382,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
 
 /// 单测只读校验用的守卫常量：确认编译期过滤器名单不被误删（配合纯函数测试）。
 #[cfg(test)]
-const _FILTER_CONTRACT: fn(u32, &str, &str, &str, &str) -> bool = passes_visible_filter;
+const _FILTER_CONTRACT: fn(u32, &str, &str, &str, &str, bool) -> bool = passes_visible_filter;
 
 #[cfg(test)]
 mod tests {
@@ -380,6 +394,27 @@ mod tests {
     // 过滤算法纯判定测试（不依赖真实窗口）
     // -----------------------------------------------------------------------
 
+    /// 最小化窗口（IsIconic 为真）必须被剔除（v0.4.1：最小化到任务栏不入列）。
+    #[test]
+    fn minimized_window_is_filtered() {
+        assert!(!passes_visible_filter(0, "无标题 - 记事本", "Notepad", "", "", true));
+        // 即使带工具条扩展样式，最小化也优先剥离（最小化是最强过滤前置）。
+        assert!(!passes_visible_filter(
+            WS_EX_TOOLWINDOW.0,
+            "浮动工具条",
+            "ToolWindowClass",
+            "",
+            "",
+            true
+        ));
+    }
+
+    /// 非最小化普通窗口应通过最小化剥离。
+    #[test]
+    fn non_minimized_window_passes_iconic_check() {
+        assert!(passes_visible_filter(0, "无标题 - 记事本", "Notepad", "", "", false));
+    }
+
     /// 工具条窗口（WS_EX_TOOLWINDOW 且无 WS_EX_APPWINDOW）必须被剔除。
     #[test]
     fn tool_window_without_appwindow_is_filtered() {
@@ -389,7 +424,8 @@ mod tests {
             "浮动工具条",
             "ToolWindowClass",
             "",
-            ""
+            "",
+            false
         ));
     }
 
@@ -397,25 +433,25 @@ mod tests {
     #[test]
     fn tool_window_with_appwindow_is_kept() {
         let ex = WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0;
-        assert!(passes_visible_filter(ex, "工具面板", "SomeApp", "", ""));
+        assert!(passes_visible_filter(ex, "工具面板", "SomeApp", "", "", false));
     }
 
     /// 普通窗口（无工具条扩展样式）应通过。
     #[test]
     fn plain_window_passes() {
-        assert!(passes_visible_filter(0, "无标题 - 记事本", "Notepad", "", ""));
+        assert!(passes_visible_filter(0, "无标题 - 记事本", "Notepad", "", "", false));
     }
 
     /// 自身窗口剥离：标题以产品名开头即视为 TLToolBox 自身。
     #[test]
     fn self_window_by_title_is_filtered() {
-        assert!(!passes_visible_filter(0, "TLToolBox - 桌面实用工具箱", "SomeWin", "", ""));
+        assert!(!passes_visible_filter(0, "TLToolBox - 桌面实用工具箱", "SomeWin", "", "", false));
     }
 
     /// 自身窗口剥离：类名含 slint 标记即视为 TLToolBox 自身（winit 后端窗口）。
     #[test]
     fn self_window_by_slint_class_is_filtered() {
-        assert!(!passes_visible_filter(0, "任意标题", "slint-window-0x1", "", ""));
+        assert!(!passes_visible_filter(0, "任意标题", "slint-window-0x1", "", "", false));
     }
 
     /// 显式传入的“自身窗口”完整匹配也剥离（模块装配时把主窗口句柄带名注入）。
@@ -426,7 +462,8 @@ mod tests {
             "TLToolBox - 桌面实用工具箱",
             "slint-window",
             "TLToolBox - 桌面实用工具箱",
-            "slint-window"
+            "slint-window",
+            false
         ));
     }
 
@@ -441,7 +478,7 @@ mod tests {
             "shell_traywnd", // 大小写不敏感
         ] {
             assert!(
-                !passes_visible_filter(0, "任务栏", class, "", ""),
+                !passes_visible_filter(0, "任务栏", class, "", "", false),
                 "桌面容器类名 {class} 应被剔除"
             );
         }
@@ -450,13 +487,13 @@ mod tests {
     /// 名称贴近但并非系统容器的类名不得误杀（如用户窗口自定义类名 ButtonEx）。
     #[test]
     fn lookalike_classes_are_not_over_filtered() {
-        assert!(passes_visible_filter(0, "应用窗口", "ButtonEx", "", ""));
-        assert!(passes_visible_filter(0, "应用窗口", "WorkerWnd", "", ""));
+        assert!(passes_visible_filter(0, "应用窗口", "ButtonEx", "", "", false));
+        assert!(passes_visible_filter(0, "应用窗口", "WorkerWnd", "", "", false));
     }
 
     /// 判定谓词在空标题等已由调用方短路的前提下仍不 panic（容错）。
     #[test]
     fn predicate_tolerates_empty_inputs() {
-        assert!(passes_visible_filter(0, "", "", "", ""));
+        assert!(passes_visible_filter(0, "", "", "", "", false));
     }
 }

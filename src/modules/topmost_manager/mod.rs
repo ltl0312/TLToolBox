@@ -1,4 +1,4 @@
-//! # 全局窗口置顶守护器（v0.4.0 · 第五个常驻守护模块）
+//! # 全局窗口置顶守护器（v0.4.1 · 第五个常驻守护模块）
 //!
 //! 基于 Win32 原生 API（零重型第三方依赖）实现**轻量可视化窗口置顶管理系统**：
 //! 支持 1~9 级优先级（1 级最顶层），经 [`enum_windows`] 轻量枚举候选窗口并产出
@@ -8,19 +8,23 @@
 //! # 模块模型
 //!
 //! - **运行态（守护）**：`start()` 派生专用原生泵线程（`win32-topmost-pump`）安装
-//!   [`SetWinEventHook`]（`EVENT_SYSTEM_FOREGROUND`）。系统每次前台窗口切换都向
-//!   泵线程投递 WinEvent 回调：回调只记录“被激活的窗口”并（重新）武装一枚 15ms
-//!   一次性 `SetTimer` 防抖，随后立即返回（回调内绝无重活）。泵线程收到 `WM_TIMER`
-//!   时执行**前台抢占纠偏**——若用户激活了受管置顶窗口，系统已把它顶到绝对顶层，
-//!   守护按 [`engine::plan_shield_refresh`] 把其前方的 1 / 2 级窗口沿链序重刷
-//!   （全程 `SWP_NOACTIVATE`，**绝不抢占用户焦点**）。无事时泵线程阻塞于
-//!   `GetMessageW`，CPU 占用为零；
+//!   [`SetWinEventHook`]（事件区间 `EVENT_SYSTEM_FOREGROUND` ~
+//!   `EVENT_SYSTEM_MINIMIZESTART`，v0.4.1 并入最小化监听）。系统每次前台窗口
+//!   切换都向泵线程投递 WinEvent 回调：回调只记录“被激活的窗口”并（重新）武装
+//!   一枚 15ms 一次性 `SetTimer` 防抖（v0.4.1 起受管窗口被最小化时改投递
+//!   `PostMessageW(WM_APP)` 定制消息，泵线程立即执行自动解置顶），随后立即返回
+//!   （回调内绝无重活）。泵线程收到 `WM_TIMER` 时执行**前台抢占纠偏**——若用户
+//!   激活了受管置顶窗口，系统已把它顶到绝对顶层，守护按
+//!   [`engine::plan_shield_refresh`] 把其前方的 1 / 2 级窗口沿链序重刷（全程
+//!   `SWP_NOACTIVATE`，**绝不抢占用户焦点**）。无事时泵线程阻塞于 `GetMessageW`，
+//!   CPU 占用为零；
 //! - **停止态**：`stop()` 卸载钩子 / 计时器并 Join 泵线程。已置顶窗口的
 //!   `WS_EX_TOPMOST` 属性由操作系统在会话期间持续保持——停止只冻结“守护”，
 //!   不撤销用户已建立的置顶（避免全量关闭误伤用户手工置顶）；
 //! - **窗口级操作与运行态正交**：弹窗内的置顶开关 / 优先级步进器（[`apply_pin`] /
 //!   [`apply_unpin`] / [`set_priority`](Self::set_priority)）在模块运行与否时都可
-//!   执行——直接 `SetWindowPos` 即时生效并持久化规则记忆。
+//!   执行——直接 `SetWindowPos` 即时生效并持久化规则记忆。UI 侧（v0.4.1）在模块
+//!   「已停止」时以警示条 + 控件禁用联锁，避免用户在停止态无效操作。
 //!
 //! # 并发模型（延续既有模块铁律）
 //!
@@ -32,13 +36,24 @@
 //! - 前台纠偏与 UI 操作并发收敛：纠偏只对“已受管窗口”重定位、不增删条目；
 //!   窗口消亡清理以 `IsWindow` 前置校验 + 惰性清扫完成。
 //!
-//! # 规则记忆与恢复
+//! # 规则记忆与优先级记忆（v0.4.1 强化）
 //!
 //! 每次置顶 / 解除 / 改级落定后，模块把当前受管条目序列化为
 //! [`PinnedRule`](crate::config::PinnedRule) 列表（进程名 + 标题原文 + 优先级 +
 //! enabled），经单写者通道交给装配层持久化（`[topmost_manager]` 节）。
+//! **优先级记忆**：用户对某进程窗口设定过的优先级（1~9）以 `process_name` 为主键
+//! 记入 `memorized` 映射并在落盘时合并为 `enabled = false` 的记忆规则——解除置顶
+//! 不抹除记忆；下次枚举 / 重启后同一进程的未受管窗口自动回填该历史优先级
+//! （[`TopmostManagerModule::remembered_priority`]）。
 //! `start()` 时按装配期注入的规则恢复：重新枚举窗口 → 进程名（大小写不敏感）+
 //! 标题**子串**双向匹配 → 恢复置顶与优先级。
+//!
+//! # 最小化自动解置顶（v0.4.1）
+//!
+//! 泵线程经 `EVENT_SYSTEM_MINIMIZESTART` 感知受管窗口被最小化：立即对该窗口执行
+//! [`apply_unpin`]（先移除受管条目 → `SetWindowPos(HWND_NOTOPMOST)` → 剩余链条
+//! 重排，杜绝 15ms 纠偏定时器恢复尸体）并经事件总线发布 Toast
+//! “窗口已最小化，自动取消置顶”。
 //!
 //! # UIPI 拦截与审计
 //!
@@ -53,6 +68,7 @@ pub mod enum_windows;
 use crate::bus::{AppEvent, EventBus};
 use crate::config::PinnedRule;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use tokio::sync::Mutex as AsyncMutex;
@@ -69,13 +85,14 @@ use windows::Win32::{
     System::Threading::GetCurrentThreadId,
     UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
     UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostThreadMessageW, SetTimer,
-        TranslateMessage, EVENT_SYSTEM_FOREGROUND, MSG, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT,
+        DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
+        PostThreadMessageW, SetTimer, TranslateMessage, EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_MINIMIZESTART, MSG, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT,
         WINEVENT_SKIPOWNPROCESS, WM_QUIT, WM_TIMER,
     },
 };
 
-/// 置顶条目优先级默认值（用户新建置顶 / UI 行未指定时使用；1~9，1 最顶层）。
+/// 前置优先级默认值（用户新建置顶 / UI 行未指定时使用；1~9，1 最顶层）。
 pub const DEFAULT_PRIORITY: u8 = 3;
 /// 前台抢占纠偏的防抖窗口（15ms，落在任务书 10~20ms 区间；合并同一次用户操作的
 /// 连续前台事件为一次纠偏）。
@@ -87,6 +104,13 @@ const SHIELD_TIMER_ID: usize = 0x544C;
 /// 停机协议中 Join 原生泵线程的等待上限（与弹窗拦截模块同一纪律）。
 #[cfg(windows)]
 const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// 泵线程定制的「受管窗口被最小化 → 自动解置顶」消息（v0.4.1）。
+///
+/// 落在 `WM_APP`（0x8000 ~ 0xBFFF）应用保留区，绝无系统冲突；WinEvent 回调经
+/// `PostMessageW(None, …)` 投递到泵线程队列，消息泵收到后执行解置顶（回调内
+/// 不做任何重活）。
+#[cfg(windows)]
+const MSG_MINIMIZE_UNPIN: u32 = 0x8000; // = WM_APP
 
 // ---------------------------------------------------------------------------
 // 进程内活动置顶窗口条目（模块核心数据形态）
@@ -232,6 +256,12 @@ struct TopmostManagerInner {
     state: Arc<TopmostState>,
     /// 启动恢复用的置顶规则记忆（装配期注入；每次 `start` 重新恢复）。
     startup_rules: StdMutex<Vec<PinnedRule>>,
+    /// 进程级优先级记忆（v0.4.1：`process_name` → 历史设定优先级 1~9）。
+    ///
+    /// 置顶 / 改级落定时写入，解除置顶**不**抹除；落盘时对「无受管窗口的进程」
+    /// 合并为 `enabled = false` 的记忆规则（见 [`TopmostManagerInner::rules_snapshot`]），
+    /// 下次枚举 / 重启后同一进程的未受管窗口自动回填该历史优先级。
+    memorized: StdMutex<HashMap<String, u8>>,
     /// 规则持久化单写者通道发送端（置顶 / 解除 / 改级后投递最新规则列表）。
     rules_tx: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<PinnedRule>>>>,
     /// 可选事件总线（守护线程的 UIPI 失败 → `ToastRequested`；构造期装配后不变）。
@@ -251,14 +281,29 @@ struct ActiveRun {
 
 impl TopmostManagerModule {
     /// 以装配期注入的置顶规则记忆构造模块。
+    ///
+    /// v0.4.1：`pinned_rules` 中的**全部**规则（含 `enabled = false` 的记忆规则）
+    /// 同时播种进 `memorized`（进程 → 优先级），供未受管窗口的优先级回填。
     pub fn with_rules(rules: impl IntoIterator<Item = PinnedRule>) -> Self {
+        let rules: Vec<PinnedRule> = rules.into_iter().collect();
+        // 同进程多条规则时后者覆盖前者（collect 语义：后写先得，迭代序稳定）。
+        let memorized: HashMap<String, u8> = rules
+            .iter()
+            .map(|rule| {
+                (
+                    rule.process_name.clone(),
+                    engine::clamp_priority(rule.priority),
+                )
+            })
+            .collect();
         Self {
             inner: Arc::new(TopmostManagerInner {
                 lifecycle: AsyncMutex::new(()),
                 running: AtomicBool::new(false),
                 active: StdMutex::new(None),
                 state: Arc::new(TopmostState::default()),
-                startup_rules: StdMutex::new(rules.into_iter().collect()),
+                startup_rules: StdMutex::new(rules),
+                memorized: StdMutex::new(memorized),
                 rules_tx: StdMutex::new(None),
                 bus: StdMutex::new(None),
             }),
@@ -287,6 +332,20 @@ impl TopmostManagerModule {
         self.inner.state.snapshot()
     }
 
+    /// 读取某进程的历史优先级记忆（v0.4.1，`process_name` 大小写敏感主键）。
+    ///
+    /// 记忆来源为 `with_rules` 播种的 `pinned_rules`（含 `enabled = false` 记忆
+    /// 规则）与运行期每次置顶 / 改级的落定写入；装配层在枚举弹窗行时对未受管
+    /// 窗口调用本方法回填历史设定值（受管窗口直接取条目的实时优先级）。
+    pub fn remembered_priority(&self, process_name: &str) -> Option<u8> {
+        self.inner
+            .memorized
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(process_name)
+            .copied()
+    }
+
     /// 拉取并清除守护失败标志（装配层轮询消费，触发一次性告警 Toast）。
     pub fn take_guard_failure(&self) -> bool {
         self.inner.state.take_guard_failure()
@@ -303,7 +362,8 @@ impl TopmostManagerModule {
 
     /// 把窗口置顶并纳入受管（链式重刷使新窗口落在正确链位）。
     ///
-    /// `priority` 越界自动夹紧 1~9；成功后持久化规则记忆。错误上抛：
+    /// `priority` 越界自动夹紧 1~9；成功后把（进程名 → 优先级）写入记忆并持久化
+    /// 规则。错误上抛：
     /// - [`engine::Win32Error::AccessDenied`]：UIPI 拦截（提示用户提权）；
     /// - [`engine::Win32Error::InvalidWindow`]：窗口已销毁。
     pub fn apply_pin(&self, hwnd: isize, priority: u8) -> Result<(), engine::Win32Error> {
@@ -314,6 +374,8 @@ impl TopmostManagerModule {
         // 2) 采集实时元数据并入状态（进程名 / 标题以置顶时刻为准）。
         let (process_name, title) = window_identity(hwnd)
             .unwrap_or_else(|| ("<unknown.exe>".to_string(), String::new()));
+        // 3) 写入进程级优先级记忆（v0.4.1：解除置顶后仍可回填 / 持久化）。
+        self.memorize_priority(&process_name, priority);
         self.upsert_entry(ActivePinnedWindow {
             hwnd,
             process_name,
@@ -322,21 +384,39 @@ impl TopmostManagerModule {
             enabled: true,
         });
 
-        // 3) 沿整条优先级链重刷，保证新窗口落在正确的链位（含未运行态——
+        // 4) 沿整条优先级链重刷，保证新窗口落在正确的链位（含未运行态——
         //    链式重刷等价于 set_topmost + 锚定关系，即时生效）。
         self.refresh_chain();
         Ok(())
     }
 
-    /// 取消窗口置顶并移除受管条目（持久化规则随之更新）。
+    /// 取消窗口置顶（v0.4.1 根治「取消失效 / 死尸复活」的时序纪律）。
+    ///
+    /// 执行顺序**不可颠倒**：
+    /// 1. 先把 HWND 从内存受管活跃集合（`active_pinned` / 规则列表）**彻底移除**
+    ///    （含持久化）——即使随后 Win32 调用失败（窗口已消亡），该窗口也绝不再
+    ///    滞留受管集，15ms 纠偏定时器 /
+    ///    前台抢占纠偏拿到的永远是移除后的快照，无法复活死尸；
+    /// 2. 调用 `SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+    ///    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` 归还普通层（引擎
+    ///    [`engine::set_notopmost`] 前置 `IsWindow` 校验）；
+    /// 3. **无论结果如何**都强制重刷剩余链条：移除该窗口后，其余受管窗口的相对
+    ///    锚定关系必须重新收敛（原「无需整链重刷」的假设在窗口消亡 / 最小化
+    ///    自动解置顶等路径上不成立）。
+    ///
+    /// 优先级记忆不受影响（解除置顶不抹除进程级历史设定）。
     pub fn apply_unpin(&self, hwnd: isize) -> Result<(), engine::Win32Error> {
-        engine::set_notopmost(hwnd)?;
+        // 1) 先移除（不可前置 Win32 校验：窗口已消亡也必须清出受管集）。
         self.remove_entry(hwnd);
-        // 其余受管窗口保持既有置顶（系统锚定关系未破坏），无需整链重刷。
-        Ok(())
+        // 2) Win32 层取消置顶（窗口已消亡 → InvalidWindow，供调用方提示）。
+        let outcome = engine::set_notopmost(hwnd);
+        // 3) 强制剩余链条重排（见函数文档）。
+        self.refresh_chain();
+        outcome
     }
 
-    /// 修改窗口优先级：更新条目标记后沿新优先级整链重刷（免去先解后置的闪烁）。
+    /// 修改窗口优先级：更新条目标记 + 写入进程级记忆后沿新优先级整链重刷
+    /// （免去先解后置的闪烁）。
     pub fn set_priority(&self, hwnd: isize, priority: u8) -> Result<(), engine::Win32Error> {
         let priority = engine::clamp_priority(priority);
         let Some(entry) = self.inner.state.find(hwnd) else {
@@ -348,6 +428,8 @@ impl TopmostManagerModule {
         }
         let mut updated = entry.clone();
         updated.priority = priority;
+        // v0.4.1：进程级优先级记忆紧随改级落定（解除置顶后仍可回填）。
+        self.memorize_priority(&updated.process_name, priority);
         self.upsert_entry(updated);
         self.refresh_chain();
         Ok(())
@@ -367,15 +449,50 @@ impl TopmostManagerModule {
         self.persist_rules();
     }
 
-    /// 把当前受管条目序列化为规则列表并投递给持久化通道（若有装配）。
-    fn persist_rules(&self) {
-        let rules: Vec<PinnedRule> = self
+    /// 写入进程级优先级记忆（v0.4.1；不触发持久化，由随后的 persist 一并落盘）。
+    fn memorize_priority(&self, process_name: &str, priority: u8) {
+        self.inner
+            .memorized
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(process_name.to_string(), engine::clamp_priority(priority));
+    }
+
+    /// 由「受管条目 + 进程级记忆」收敛出完整规则列表（v0.4.1 语义）。
+    ///
+    /// - 受管条目 → `enabled = true` 规则（标题原文落盘，供启动恢复子串匹配）；
+    /// - 无受管窗口的进程 → `enabled = false` 的**记忆规则**（空标题模式 = 仅进程
+    ///   名主键；启动恢复跳过，仅承担优先级回填——见 [`Self::remembered_priority`]）。
+    fn rules_snapshot(&self) -> Vec<PinnedRule> {
+        let managed = self.inner.state.snapshot();
+        let memorized = self
             .inner
-            .state
-            .snapshot()
+            .memorized
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut rules: Vec<PinnedRule> = managed.iter().map(ActivePinnedWindow::to_rule).collect();
+        let managed_processes: std::collections::HashSet<&str> = managed
             .iter()
-            .map(ActivePinnedWindow::to_rule)
+            .map(|entry| entry.process_name.as_str())
             .collect();
+        for (process_name, priority) in memorized {
+            if !managed_processes.contains(process_name.as_str()) {
+                rules.push(PinnedRule {
+                    process_name,
+                    title_pattern: String::new(),
+                    priority: engine::clamp_priority(priority),
+                    enabled: false,
+                });
+            }
+        }
+        rules
+    }
+
+    /// 把最新规则列表投递给持久化通道（若有装配；单写者通道保证最后写入为
+    /// 最后一次操作）。
+    fn persist_rules(&self) {
+        let rules = self.rules_snapshot();
         let tx = self
             .inner
             .rules_tx
@@ -440,6 +557,51 @@ impl TopmostManagerModule {
         if stats.failed > 0 {
             self.inner.state.note_guard_failure();
         }
+    }
+
+    /// 受管窗口被最小化 → 立即自动解除置顶（v0.4.1；泵线程经
+    /// `EVENT_SYSTEM_MINIMIZESTART` 投递 `MSG_MINIMIZE_UNPIN` 后调用）。
+    ///
+    /// 只干预**受管**窗口（非受管的最小化不产生任何动作）；解置顶走
+    /// [`Self::apply_unpin`]（先移除受管条目 → `SetWindowPos(HWND_NOTOPMOST)` →
+    /// 剩余链条重排），随后经事件总线发布 Toast“窗口已最小化，自动取消置顶”。
+    /// 窗口在解置顶前已消亡（`InvalidWindow`）同样视为解除完成——条目已被移除。
+    fn handle_minimized(&self, hwnd: isize) {
+        let Some(entry) = self.inner.state.find(hwnd) else {
+            return; // 非受管窗口：不干预
+        };
+        let process_name = entry.process_name.clone();
+        match self.apply_unpin(hwnd) {
+            Ok(()) | Err(engine::Win32Error::InvalidWindow) => {
+                self.notify_minimized_unpin(&process_name);
+            }
+            Err(other) => {
+                tracing::warn!(
+                    target: "topmost_manager",
+                    "最小化自动解置顶失败（HWND: 0x{hwnd:X} 进程: {process_name}）: {other}"
+                );
+            }
+        }
+    }
+
+    /// 经事件总线发布「最小化自动取消置顶」Toast（泵线程路径；UI 由
+    /// 总线 → UI 桥接层展示）。
+    fn notify_minimized_unpin(&self, process_name: &str) {
+        let bus = self
+            .inner
+            .bus
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(bus) = bus {
+            bus.publish(AppEvent::ToastRequested(format!(
+                "窗口已最小化，自动取消置顶（{process_name}）"
+            )));
+        }
+        tracing::info!(
+            target: "topmost_manager",
+            "受管窗口 {process_name} 已最小化，自动取消置顶"
+        );
     }
 
     /// 启动恢复：按装配期注入的规则记忆重新枚举并置顶。
@@ -758,7 +920,8 @@ fn chain_stats_from_entries(entries: &[ActivePinnedWindow]) -> engine::ChainAppl
 // ---------------------------------------------------------------------------
 
 // 最近一次前台事件激活的窗口（回调写入、泵线程在 `WM_TIMER` 防抖到期后消费；
-// 全部发生在同一条泵线程上，`Cell` 即线程安全）。
+// 全部发生在同一条泵线程上，`Cell` 即线程安全）。最小化事件不走本槽位——它经
+// `PostMessageW` 定制消息直达泵线程（见 [`MSG_MINIMIZE_UNPIN`]）。
 #[cfg(windows)]
 thread_local! {
     static RECENT_FOREGROUND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -786,17 +949,19 @@ fn pump_thread_main(
         let _ = PeekMessageW(&mut seed, None, 0, 0, PM_NOREMOVE);
 
         let callback_module: Option<&windows::Win32::Foundation::HMODULE> = None;
+        // v0.4.1：事件区间扩为 FOREGROUND ~ MINIMIZESTART（0x0003 ~ 0x0016），
+        // 同一钩子同时承载「前台抢占纠偏」与「最小化自动解置顶」两条事件流。
         let hook = SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_MINIMIZESTART,
             callback_module,
-            Some(foreground_proc as ForegroundCallback),
+            Some(win_event_proc as WinEventCallback),
             0,
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         if hook.0.is_null() {
-            let _ = ready_tx.send(Err("SetWinEventHook 安装失败（前台事件钩子）".to_string()));
+            let _ = ready_tx.send(Err("SetWinEventHook 安装失败（前台 / 最小化事件钩子）".to_string()));
             return;
         }
 
@@ -805,9 +970,10 @@ fn pump_thread_main(
             let _ = UnhookWinEvent(hook);
             return;
         }
-        tracing::info!(target: "topmost_manager", "前台事件钩子已就绪（泵线程 {thread_id}）");
+        tracing::info!(target: "topmost_manager", "前台 / 最小化事件钩子已就绪（泵线程 {thread_id}）");
 
-        // 消息泵：WM_QUIT → 退出；WM_TIMER(防抖) → 前台抢占纠偏；其余消息
+        // 消息泵：WM_QUIT → 退出；WM_TIMER(防抖) → 前台抢占纠偏；
+        // MSG_MINIMIZE_UNPIN → 受管窗口最小化自动解置顶；其余消息
         //（含 WinEvent 回调的派发）走 Translate + Dispatch。
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -827,6 +993,16 @@ fn pump_thread_main(
                 }
                 continue;
             }
+            if msg.message == MSG_MINIMIZE_UNPIN {
+                // 受管窗口被最小化 → 立即自动解置顶（消息由 WinEvent 回调经
+                // PostMessageW(None, …) 投递；wParam 携带窗口句柄）。
+                let hwnd = msg.wParam.0 as isize;
+                let module = TopmostManagerModule {
+                    inner: Arc::clone(&inner),
+                };
+                module.handle_minimized(hwnd);
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             let _ = DispatchMessageW(&msg);
         }
@@ -834,24 +1010,32 @@ fn pump_thread_main(
         // 泵退出：先 KillTimer 再卸载钩子（同一线程）。
         let _ = KillTimer(None, SHIELD_TIMER_ID);
         let _ = UnhookWinEvent(hook);
-        tracing::info!(target: "topmost_manager", "前台事件钩子已安全卸载，泵线程退出");
+        tracing::info!(target: "topmost_manager", "前台 / 最小化事件钩子已安全卸载，泵线程退出");
     }
 }
 
-/// 前台事件回调的裸函数指针类型（与 `WINEVENTPROC` 载荷一致）。
+/// WinEvent 回调的裸函数指针类型（与 `WINEVENTPROC` 载荷一致）。
 #[cfg(windows)]
-type ForegroundCallback = unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32, i32, u32, u32);
+type WinEventCallback = unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32, i32, u32, u32);
 
-/// WinEvent 回调：记录“被激活的窗口”并武装防抖计时器（泵线程派发）。
+/// WinEvent 回调（v0.4.1 双事件分派：前台激活 / 最小化开始）。
+///
+/// - `EVENT_SYSTEM_FOREGROUND`：记录“被激活的窗口”并（重新）武装 15ms 一次性
+///   防抖计时器（泵线程在 `WM_TIMER` 到期后执行前台抢占纠偏）；
+/// - `EVENT_SYSTEM_MINIMIZESTART`：经 `PostMessageW(None, MSG_MINIMIZE_UNPIN, …)`
+///   把“受管窗口被最小化”投递给泵线程消息队列——回调内不执行任何解置顶逻辑，
+///   由消息泵立即处理（最小化的即时性由消息队列保证，无额外防抖延迟）。
 ///
 /// # Safety / 约束
 /// - 布局与 `WINEVENTPROC` 一致；运行于本模块泵线程的系统回调上下文；
-/// - 回调内严禁重活 / 异步操作：只做一次线程局部写 + 武装计时器；
-/// - `SetTimer(None, …)` 要求调用线程已建消息队列（泵线程满足）。
+/// - 回调内严禁重活 / 异步操作：前台路径只做一次线程局部写 + 武装计时器，
+///   最小化路径只做一次 `PostMessageW` 投递；
+/// - `SetTimer(None, …)` / `PostMessageW(None, …)` 均要求调用线程已建消息队列
+///   （泵线程满足）。
 #[cfg(windows)]
-unsafe extern "system" fn foreground_proc(
+unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     hwnd: HWND,
     _id_object: i32,
     _id_child: i32,
@@ -861,10 +1045,17 @@ unsafe extern "system" fn foreground_proc(
     if hwnd.0.is_null() {
         return;
     }
-    // 记录激活窗口（本线程 Cell；泵线程在防抖到期后消费）。
-    RECENT_FOREGROUND.with(|cell| cell.set(hwnd.0 as usize));
-    // (重新)武装 15ms 一次性防抖计时器：连续前台事件自动合并为一次纠偏。
-    let _ = SetTimer(None, SHIELD_TIMER_ID, FOREGROUND_DEBOUNCE_MS, None);
+    if event == EVENT_SYSTEM_FOREGROUND {
+        // 记录激活窗口（本线程 Cell；泵线程在防抖到期后消费）。
+        RECENT_FOREGROUND.with(|cell| cell.set(hwnd.0 as usize));
+        // (重新)武装 15ms 一次性防抖计时器：连续前台事件自动合并为一次纠偏。
+        let _ = SetTimer(None, SHIELD_TIMER_ID, FOREGROUND_DEBOUNCE_MS, None);
+    } else if event == EVENT_SYSTEM_MINIMIZESTART {
+        // 最小化开始：把事件翻译成泵线程定制消息（wParam 携带窗口句柄）。
+        // SAFETY: PostMessageW(None, …) 把消息投递到调用线程（泵线程）自己的
+        // 队列；失败仅返回错误码，无未定义行为。
+        let _ = PostMessageW(None, MSG_MINIMIZE_UNPIN, WPARAM(hwnd.0 as usize), LPARAM(0));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1310,170 @@ mod tests {
         assert!(
             matches!(err, Err(engine::Win32Error::InvalidWindow)),
             "解除不存在的窗口应返回 InvalidWindow，实际: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.4.1 修复回归防线：apply_unpin 时序纪律 / 优先级记忆 / 最小化自动解置顶
+    // -----------------------------------------------------------------------
+
+    /// 死尸复活根治：`apply_unpin` 即使遇到 Win32 失败（窗口已消亡）也必须已把
+    /// 条目从受管集移除——15ms 纠偏定时器 / 前台抢占纠偏拿到的永远是移除后的
+    /// 快照，无法把已取消的窗口重新置顶。
+    #[test]
+    fn apply_unpin_removes_entry_even_when_win32_fails() {
+        let module = TopmostManagerModule::default();
+        // 直接向状态容器注入一条“受管窗口”（绕过 FFI，模拟已置顶条目）。
+        module
+            .inner
+            .state
+            .upsert(entry(0x1234, "notepad.exe", "文档 - 记事本", 2));
+        assert_eq!(module.pinned().len(), 1);
+
+        // 伪句柄 0x1234 在 IsWindow 下必然失效 → set_notopmost 返回 InvalidWindow；
+        // 但移除必须先于该失败完成，返回错误的同时受管集必须已清空。
+        let err = module.apply_unpin(0x1234);
+        assert!(
+            matches!(err, Err(engine::Win32Error::InvalidWindow)),
+            "伪句柄应返回 InvalidWindow，实际: {err:?}"
+        );
+        assert!(
+            module.pinned().is_empty(),
+            "即使 Win32 失败，受管条目也必须已彻底移除（防死尸复活）"
+        );
+    }
+
+    /// 优先级记忆种子：`with_rules` 注入的规则（含 `enabled = false` 记忆规则）
+    /// 全部播种进 `memorized`，供未受管窗口回填历史优先级。
+    #[test]
+    fn remembered_priority_is_seeded_from_rules() {
+        let rules = vec![
+            PinnedRule {
+                process_name: "notepad.exe".into(),
+                title_pattern: "无标题".into(),
+                priority: 5,
+                enabled: true,
+            },
+            // enabled = false 的记忆规则同样参与回填（v0.4.1 核心语义）。
+            PinnedRule {
+                process_name: "chrome.exe".into(),
+                title_pattern: String::new(),
+                priority: 8,
+                enabled: false,
+            },
+        ];
+        let module = TopmostManagerModule::with_rules(rules);
+        assert_eq!(module.remembered_priority("notepad.exe"), Some(5));
+        assert_eq!(module.remembered_priority("chrome.exe"), Some(8));
+        // 无记忆进程 / 大小写敏感主键无匹配。
+        assert_eq!(module.remembered_priority("calc.exe"), None);
+        assert_eq!(module.remembered_priority("NOTEPAD.EXE"), None);
+    }
+
+    /// 优先级记忆持久化形态：受管条目收敛为 `enabled = true` 规则，无受管窗口
+    /// 的进程收敛为 `enabled = false` 记忆规则（空标题模式 = 仅进程主键）。
+    #[test]
+    fn rules_snapshot_merges_memory_only_rules() {
+        let rules = vec![PinnedRule {
+            process_name: "chrome.exe".into(),
+            title_pattern: String::new(),
+            priority: 8,
+            enabled: false,
+        }];
+        let module = TopmostManagerModule::with_rules(rules);
+        // 未受管时的快照 = 纯记忆规则。
+        let snapshot = module.rules_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(!snapshot[0].enabled, "记忆规则应保持 enabled = false");
+        assert_eq!(snapshot[0].process_name, "chrome.exe");
+        assert_eq!(snapshot[0].priority, 8);
+        assert!(snapshot[0].title_pattern.is_empty(), "记忆规则用空标题模式");
+
+        // 置顶 notepad 后：受管规则 + chrome 的记忆规则并存（记忆不因其它窗口
+        // 的操作丢失）。
+        let pinned_entry = entry(0x5678, "notepad.exe", "文档 - 记事本", 3);
+        module.inner.state.upsert(pinned_entry.clone());
+        let snapshot = module.rules_snapshot();
+        assert_eq!(snapshot.len(), 2, "受管规则 + 记忆规则");
+        let managed_rule = snapshot
+            .iter()
+            .find(|rule| rule.process_name == "notepad.exe")
+            .expect("应有 notepad 的受管规则");
+        assert!(managed_rule.enabled);
+        assert_eq!(managed_rule.priority, 3);
+        assert!(snapshot
+            .iter()
+            .any(|rule| rule.process_name == "chrome.exe" && !rule.enabled && rule.priority == 8));
+    }
+
+    /// 解除置顶不抹除进程级优先级记忆（用户下次打开弹窗 / 重启应用仍可回填）。
+    #[test]
+    fn apply_unpin_preserves_memorized_priority() {
+        let rules = vec![PinnedRule {
+            process_name: "notepad.exe".into(),
+            title_pattern: String::new(),
+            priority: 4,
+            enabled: false,
+        }];
+        let module = TopmostManagerModule::with_rules(rules);
+        module.inner.state.upsert(entry(0x1111, "notepad.exe", "文档 - 记事本", 4));
+        assert_eq!(module.remembered_priority("notepad.exe"), Some(4));
+
+        let _ = module.apply_unpin(0x1111); // 伪句柄 → InvalidWindow，但移除已完成
+        assert!(module.pinned().is_empty());
+        assert_eq!(
+            module.remembered_priority("notepad.exe"),
+            Some(4),
+            "解除置顶不得抹除优先级记忆"
+        );
+        // 快照仍保留该进程的记忆规则，下次枚举可回填。
+        let snapshot = module.rules_snapshot();
+        assert!(snapshot
+            .iter()
+            .any(|rule| rule.process_name == "notepad.exe" && !rule.enabled && rule.priority == 4));
+    }
+
+    /// 最小化自动解置顶：受管窗口被最小化 → 条目移除 + 事件总线收到 Toast。
+    #[test]
+    fn handle_minimized_unpins_managed_window_and_toasts() {
+        let bus = EventBus::new(4);
+        let mut rx = bus.subscribe();
+        let module = TopmostManagerModule::default().with_bus(Some(bus));
+        module
+            .inner
+            .state
+            .upsert(entry(0x2222, "calc.exe", "计算器", 1));
+
+        // 直接以守护线程的入口调用（伪句柄在 IsWindow 下失效 → InvalidWindow，
+        // 与“窗口在解置顶前已消亡”同语义，同样视为解除完成）。
+        module.handle_minimized(0x2222);
+
+        assert!(
+            module.pinned().is_empty(),
+            "最小化受管窗口后条目必须被移除"
+        );
+        match rx.try_recv() {
+            Ok(AppEvent::ToastRequested(message)) => {
+                assert!(
+                    message.contains("窗口已最小化，自动取消置顶"),
+                    "Toast 文案应含最小化解置顶语义，实际: {message}"
+                );
+            }
+            other => panic!("应收到最小化解置顶 Toast，实际: {other:?}"),
+        }
+    }
+
+    /// 最小化自动解置顶：非受管窗口的最小化不产生任何动作（无 Toast、状态不变）。
+    #[test]
+    fn handle_minimized_ignores_unmanaged_window() {
+        let bus = EventBus::new(4);
+        let mut rx = bus.subscribe();
+        let module = TopmostManagerModule::default().with_bus(Some(bus));
+        module.handle_minimized(0x9999);
+        assert!(module.pinned().is_empty());
+        assert!(
+            matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+            "非受管窗口最小化不应发布任何事件"
         );
     }
 }

@@ -177,12 +177,22 @@ fn module_items_from_manager(manager: &ModuleManager) -> Vec<ModuleItem> {
 /// 使 Switch 的 `checked: item.enabled` 绑定重新求值，从而无论用户点击是否已改写
 /// Switch 内部状态，视觉开关最终都会收敛到底层模块的真实运行态（含启动失败回滚）。
 /// 模块数量极少且 toggle 为低频事件，重建成本可忽略。
+///
+/// v0.4.1 附加职责：把 `topmost_manager` 的真实运行态同步到
+/// `topmost_module_enabled`（窗口置顶弹窗的警示条 / 控件禁用联锁，见 app.slint）——
+/// 模块状态事件驱动本函数，运行态落定即联锁收敛，无需单独事件通道。
 fn refresh_modules_model(ui: &MainWindow, manager: &ModuleManager) {
     let items = module_items_from_manager(manager);
     let model: ModelRc<ModuleItem> = ui.get_modules();
     if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<ModuleItem>>() {
         vec_model.set_vec(items);
     }
+    ui.set_topmost_module_enabled(
+        manager
+            .get_module("topmost_manager")
+            .map(|module| module.is_running())
+            .unwrap_or(false),
+    );
 }
 
 /// 【UI 线程内】整体替换弹窗规则列表模型（`popup_rules` in-property）。
@@ -307,19 +317,31 @@ fn topmost_full_rows() -> &'static std::sync::Mutex<Vec<TopmostWindowItem>> {
     TOPMOST_FULL_ROWS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// 由枚举窗口 + 模块受管条目合并出弹窗行。
+/// 由枚举窗口 + 模块受管条目 + 优先级记忆合并出弹窗行。
 ///
 /// `pinned` 为模块当前受管条目；命中受管的窗口行带优先级 / 置顶态，未受管的
-/// 用默认优先级 [`DEFAULT_PRIORITY`](tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY)
+/// 行按 v0.4.1 的**优先级记忆**回填（该进程在 `pinned_rules` 中留有历史设定 →
+/// 显示记忆值；无记忆 → 默认优先级 [`DEFAULT_PRIORITY`](tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY)
 /// 并保持 `pinned = false`（系统 `WS_EX_TOPMOST` 仅是展示指示，不与受管挂钩）。
-fn topmost_row_from(window: &tltoolbox::modules::topmost_manager::enum_windows::WindowInfo, pinned: &[tltoolbox::modules::topmost_manager::ActivePinnedWindow]) -> TopmostWindowItem {
+/// `hwnd_value` 为操作回路的稳定键（HWND 裸值截断到 32 位，落在 USER 句柄表内）。
+fn topmost_row_from(
+    window: &tltoolbox::modules::topmost_manager::enum_windows::WindowInfo,
+    pinned: &[tltoolbox::modules::topmost_manager::ActivePinnedWindow],
+    module: &TopmostManagerModule,
+) -> TopmostWindowItem {
     let entry = pinned.iter().find(|p| p.hwnd == window.hwnd);
+    // 优先级事实源：受管条目 > 进程级记忆（v0.4.1）> 默认值。
+    let priority = entry
+        .map(|e| e.priority as i32)
+        .or_else(|| module.remembered_priority(&window.process_name).map(|p| p as i32))
+        .unwrap_or(tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY as i32);
     TopmostWindowItem {
         hwnd: SharedString::from(format!("0x{:X}", window.hwnd)),
+        hwnd_value: window.hwnd as i32,
         process_name: SharedString::from(window.process_name.clone()),
         title: SharedString::from(window.title.clone()),
         topmost: window.topmost,
-        priority: entry.map(|e| e.priority as i32).unwrap_or_else(|| tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY as i32),
+        priority,
         pinned: entry.is_some(),
     }
 }
@@ -354,7 +376,7 @@ fn refresh_topmost_rows(
         let pinned = module.pinned();
         let rows: Vec<TopmostWindowItem> = windows
             .iter()
-            .map(|window| topmost_row_from(window, &pinned))
+            .map(|window| topmost_row_from(window, &pinned, &module))
             .collect();
         *topmost_full_rows().lock().unwrap_or_else(|e| e.into_inner()) = rows.clone();
 
@@ -382,25 +404,18 @@ fn apply_topmost_search(ui: &MainWindow) {
     ))));
 }
 
-/// 解析弹窗行回传的 HWND 文本（`0x1A2B3C` → 句柄值；失败返回 `None`）。
-fn parse_hwnd_text(text: &str) -> Option<isize> {
-    let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))?;
-    isize::from_str_radix(hex, 16).ok()
-}
-
 /// 置顶 / 解除置顶 / 改级操作的回调载体：执行模块操作 → 审计 → Toast → 刷新列表。
+///
+/// v0.4.1 起 `hwnd` 由 Slint 行控件的 `hwnd_value`（HWND 裸值截断）**直接**传入，
+/// 不再经十六进制文本解析——搜索过滤 / 列表重排后仍是 HWND 绝对匹配的真实窗口。
 fn handle_topmost_pin(
     ui_weak: &slint::Weak<MainWindow>,
     module: Arc<TopmostManagerModule>,
     audit: AuditSink,
-    hwnd_text: String,
+    hwnd: isize,
     priority: i32,
     pinned: bool,
 ) {
-    let Some(hwnd) = parse_hwnd_text(&hwnd_text) else {
-        show_toast(ui_weak, "无效的窗口句柄");
-        return;
-    };
     let result = if pinned {
         module.apply_pin(hwnd, priority as u8)
     } else {
@@ -472,13 +487,9 @@ fn handle_topmost_priority(
     ui_weak: &slint::Weak<MainWindow>,
     module: Arc<TopmostManagerModule>,
     audit: AuditSink,
-    hwnd_text: String,
+    hwnd: isize,
     priority: i32,
 ) {
-    let Some(hwnd) = parse_hwnd_text(&hwnd_text) else {
-        show_toast(ui_weak, "无效的窗口句柄");
-        return;
-    };
     match module.set_priority(hwnd, priority as u8) {
         Ok(()) => {
             let process = module
@@ -1458,6 +1469,9 @@ async fn main() -> Result<(), AppError> {
     ui.set_modules(ModelRc::new(VecModel::from(module_items_from_manager(
         &shared_mgr,
     ))));
+    // v0.4.1：窗口置顶弹窗的模块联锁初始值——以自动启动段落定后的真实运行态注入
+    //（此后由 refresh_modules_model 随模块状态事件持续收敛）。
+    ui.set_topmost_module_enabled(topmost_manager.is_running());
     ui.set_autostart_enabled(autostart::is_autostart_enabled());
     ui.set_app_version(SharedString::from(env!("CARGO_PKG_VERSION")));
     // 提权状态驱动 UI 展示形态：elevated = true → 标题旁「管理员 (Admin)」翡翠徽标、
@@ -1668,6 +1682,9 @@ async fn main() -> Result<(), AppError> {
             "topmost_manager" => {
                 if let Some(ui) = weak.upgrade() {
                     ui.set_topmost_search(SharedString::from(""));
+                    // v0.4.1：打开弹窗瞬间再同步一次模块运行态联锁（警示条 /
+                    // 控件禁用以打开时刻的真实状态为准，不等总线事件回流）。
+                    ui.set_topmost_module_enabled(open_topmost_module.is_running());
                 }
                 // 全量枚举 + 置顶状态合并（阻塞线程枚举 → UI 线程交付模型）。
                 refresh_topmost_rows(&weak, Arc::clone(&open_topmost_module));
@@ -1949,14 +1966,15 @@ async fn main() -> Result<(), AppError> {
         }
     });
 
-    // 8.8 全局窗口置顶 · 管理弹窗回调接线（v0.4.0）：
+    // 8.8 全局窗口置顶 · 管理弹窗回调接线（v0.4.0；v0.4.1 事件契约修订）：
     //     - close_topmost_modal：弹窗右上角「×」/ 点击遮罩空白 → 复位显隐；
     //     - refresh_topmost：顶栏「⟳ 刷新」→ 重新全量枚举 + 合并置顶状态；
     //     - topmost_search_changed：搜索框实时输入 → 按当前搜索词重刷模型；
-    //     - topmost_toggle_pin(hwnd, pinned)：行开关 → 立即应用 / 解除置顶
-    //       （审计 + Toast + 刷新列表）；
-    //     - topmost_set_priority(hwnd, priority)：优先级步进器 → 改级（含非受管
-    //       行上步进器未启用的防御：仅对已置顶窗口生效）。
+    //     - topmost_toggle_pin(hwnd_value, pinned)：行开关 → 立即应用 / 解除置顶
+    //       （hwnd_value 为 HWND 裸值截断，**绝不携带行索引**——搜索过滤后仍按
+    //       HWND 绝对匹配真实窗口；审计 + Toast + 刷新列表）；
+    //     - topmost_set_priority(hwnd_value, priority)：优先级步进器 → 改级
+    //       （含非受管行上步进器未启用的防御：仅对已置顶窗口生效）。
     let close_tm_ui = ui.as_weak();
     ui.on_close_topmost_modal(move || {
         if let Some(ui) = close_tm_ui.upgrade() {
@@ -1980,14 +1998,15 @@ async fn main() -> Result<(), AppError> {
     let pin_tm_ui = ui.as_weak();
     let pin_tm_module = Arc::clone(&topmost_manager);
     let pin_tm_audit = audit.clone();
-    ui.on_topmost_toggle_pin(move |hwnd, pinned| {
-        // 置顶时优先级取行内当前值（未置顶行用默认优先级，见 topmost_row_from）。
+    ui.on_topmost_toggle_pin(move |hwnd_value, pinned| {
+        // 置顶时优先级取行内当前值（模型按 hwnd_value 绝对匹配；未命中回退默认）。
+        // 行内步进器显示的优先级即为置顶生效值，模型 reset 后仍按句柄找得到。
         let priority = pin_tm_ui
             .upgrade()
             .and_then(|ui| {
                 ui.get_topmost_windows()
                     .iter()
-                    .find(|row| row.hwnd.as_str() == hwnd.as_str())
+                    .find(|row| row.hwnd_value == hwnd_value)
                     .map(|row| row.priority)
             })
             .unwrap_or(tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY as i32);
@@ -1995,7 +2014,7 @@ async fn main() -> Result<(), AppError> {
             &pin_tm_ui,
             Arc::clone(&pin_tm_module),
             pin_tm_audit.clone(),
-            hwnd.to_string(),
+            hwnd_value as isize,
             priority,
             pinned,
         );
@@ -2004,12 +2023,12 @@ async fn main() -> Result<(), AppError> {
     let prio_tm_ui = ui.as_weak();
     let prio_tm_module = Arc::clone(&topmost_manager);
     let prio_tm_audit = audit.clone();
-    ui.on_topmost_set_priority(move |hwnd, priority| {
+    ui.on_topmost_set_priority(move |hwnd_value, priority| {
         handle_topmost_priority(
             &prio_tm_ui,
             Arc::clone(&prio_tm_module),
             prio_tm_audit.clone(),
-            hwnd.to_string(),
+            hwnd_value as isize,
             priority,
         );
     });

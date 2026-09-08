@@ -436,4 +436,40 @@ mod tests {
         let plan = plan_shield_refresh(&ordered, 0x30).expect("应有纠偏动作");
         assert_eq!(plan, vec![(0x10, false), (0x11, true)]);
     }
+
+    // -----------------------------------------------------------------------
+    // v0.4.1 死尸复活回归防线：取消置顶后剩余链条重排
+    // -----------------------------------------------------------------------
+
+    /// 被移除（取消置顶）的窗口绝不再出现在任何链条规划中——15ms 纠偏定时器 /
+    /// 整链重刷输入的都是移除后的快照，无法复活已取消的窗口。
+    #[test]
+    fn removed_window_is_absent_from_all_chain_plans() {
+        // 链条：0x10(1) → 0x20(2) → 0x30(3)；取消 0x20 后。
+        let before = order_entries(vec![entry(0x10, 1, 0), entry(0x20, 2, 0), entry(0x30, 3, 0)]);
+        let remaining: Vec<ChainEntry> = before
+            .iter()
+            .copied()
+            .filter(|e| e.hwnd != 0x20)
+            .collect();
+
+        let plan = chain_apply_plan(&remaining);
+        assert_eq!(
+            plan,
+            vec![(0x10, false), (0x30, true)],
+            "移除后首项锚置顶层、后续锚前一窗口——链条连续且不含已取消窗口"
+        );
+        assert!(
+            !plan.iter().any(|(hwnd, _)| *hwnd == 0x20),
+            "已取消的窗口不得进入任何重排规划"
+        );
+
+        // 纠偏规划同样不得触碰已取消窗口：激活 0x30 时保护带只含 0x10。
+        let shield = plan_shield_refresh(&remaining, 0x30).expect("应有纠偏动作");
+        assert_eq!(shield, vec![(0x10, false)]);
+        assert!(
+            !shield.iter().any(|(hwnd, _)| *hwnd == 0x20),
+            "纠偏规划不得包含已取消窗口"
+        );
+    }
 }

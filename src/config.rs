@@ -1394,4 +1394,54 @@ mod tests {
 
         remove_if_exists(&path).await;
     }
+
+    // -----------------------------------------------------------------------
+    // 全局窗口置顶 · 优先级记忆规则持久化（v0.4.1）
+    // -----------------------------------------------------------------------
+
+    /// v0.4.1 优先级记忆的落盘形态：体系内以 `enabled = false` + 空标题模式表示
+    /// 「仅进程级主键的记忆规则」（不参与启动恢复，只承担优先级回填）。该形态
+    /// 必须能经 TOML 原子往返逐字段保真——解除置顶后记忆若丢，下次枚举 / 重启
+    /// 便无法回填历史优先级。
+    #[tokio::test]
+    async fn memory_only_priority_rule_roundtrips_through_toml() {
+        let path = temp_cfg_path("topmost-memory");
+        remove_if_exists(&path).await;
+
+        let cfg = AppConfig {
+            topmost_manager: TopmostManagerConfig {
+                enabled: false,
+                pinned_rules: vec![
+                    // 受管规则（正常置顶记忆）。
+                    PinnedRule {
+                        process_name: "notepad.exe".into(),
+                        title_pattern: "文档 - 记事本".into(),
+                        priority: 2,
+                        enabled: true,
+                    },
+                    // v0.4.1 记忆规则：进程名主键 + 空标题模式 + enabled = false。
+                    PinnedRule {
+                        process_name: "chrome.exe".into(),
+                        title_pattern: String::new(),
+                        priority: 7,
+                        enabled: false,
+                    },
+                ],
+            },
+            ..AppConfig::default()
+        };
+
+        let mgr = ConfigManager::new(&path);
+        mgr.save(&cfg).await.expect("保存应成功");
+        let loaded = mgr.load().await.expect("加载应成功");
+        assert_eq!(loaded, cfg, "记忆规则应逐字段原子往返一致");
+
+        let memory_rule = &loaded.topmost_manager.pinned_rules[1];
+        assert_eq!(memory_rule.process_name, "chrome.exe");
+        assert!(memory_rule.title_pattern.is_empty(), "记忆规则标题模式应为空串");
+        assert_eq!(memory_rule.priority, 7);
+        assert!(!memory_rule.enabled, "记忆规则必须保持 enabled = false");
+
+        remove_if_exists(&path).await;
+    }
 }
