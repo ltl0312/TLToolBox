@@ -22,6 +22,10 @@
 //!
 //! - **[`open_url`]**：经 `ShellExecuteW(verb="open")` 调用系统默认浏览器打开
 //!   URL（“关于”对话框的开源地址 / 更新下载入口）；
+//! - **[`open_folder`]**：在资源管理器中打开指定目录（目录不存在自动创建）。
+//!   **修复 Windows 已知坑**：`explorer.exe` 收到磁盘上尚不存在的路径时不会
+//!   报错，而是**静默回退打开用户的「文档」文件夹**——因此投递前必须先把
+//!   路径绝对化、统一分隔符并 `create_dir_all` 落盘创建（详细见函数文档）；
 //! - **[`browse_for_folder`]**：原生文件夹选择对话框
 //!   （`SHBrowseForFolderW` + `SHGetPathFromIDListW`，`CoTaskMemFree` 释放
 //!   PIDL），供“主设置 / 模块设置弹窗”浏览切换自定义日志 / 截图路径；
@@ -43,7 +47,8 @@
 //! # 平台差异
 //!
 //! 权限令牌与 `ShellExecuteW`、`SHBrowseForFolderW`、`PrintWindow` / GDI+、
-//! `EmptyWorkingSet` 均为 Windows 原生能力；非 Windows 目标上相关函数返回
+//! `EmptyWorkingSet`、资源管理器打开（`explorer.exe`）均为 Windows 原生能力；
+//! 非 Windows 目标上相关函数返回
 //! 对应的 [`UnsupportedPlatform`] 错误或 `Ok(None)`（目录浏览返回取消语义），
 //! 保证装配代码跨平台可编译。
 //!
@@ -281,6 +286,40 @@ pub fn open_url(url: &str) -> Result<(), ShellError> {
     {
         let _ = url;
         Err(ShellError::UnsupportedPlatform)
+    }
+}
+
+/// 在文件资源管理器中打开指定目录（目录不存在自动创建）。
+///
+/// # 为什么必须先创建目录（Windows 已知坑修复）
+///
+/// `explorer.exe` 在收到一个**磁盘上尚不存在**的目录路径时不会报错，而是
+/// **静默回退打开用户的「文档」文件夹**——用户看到的是“点开目录却落在文档库”。
+/// 因此本函数在把路径投递给 explorer 之前保证三件事：
+///
+/// 1. **绝对化**：相对路径以当前工作目录为基准拼接为绝对路径（explorer 对
+///    相对路径的解析不可靠，缺失时同样容易触发「文档」回退）；
+/// 2. **分隔符归一化**：经 `components()` 逐段重建，把用户配置中的正斜杠 /
+///    混用分隔符（如 `C:/a/b`）统一为平台原生反斜杠（`C:\a\b`），避免
+///    explorer 对非原生分隔符路径识别失败；
+/// 3. **落盘创建**：[`std::fs::create_dir_all`] 确保目标目录真实存在
+///    （幂等：目录已存在时为无操作）。
+///
+/// 打开方式（仅 Windows）：`std::process::Command::new("explorer").arg(&dir)`
+/// 以单参数拉起 explorer GUI 进程（返回的 `Child` 随即丢弃、从不 `wait`，
+/// 由调用方保证在阻塞线程中执行）。失败返回 [`std::io::Error`]
+/// （目录创建失败 / explorer 进程无法拉起）。
+pub fn open_folder(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        imp::open_folder_impl(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(std::io::Error::other(
+            "在文件资源管理器中打开目录仅支持 Windows",
+        ))
     }
 }
 
@@ -599,6 +638,47 @@ mod imp {
         } else {
             Err(ShellError::ShellExecute { code })
         }
+    }
+
+    // -------------------------------------------------------------------
+    // v0.4.0 修复：资源管理器打开目录（explorer.exe，杜绝「文档」回退）
+    // -------------------------------------------------------------------
+
+    /// 把待打开目录归一化为「绝对路径 + 平台原生分隔符」形态。
+    ///
+    /// - 相对路径以当前工作目录为基准拼接，保证绝对化；
+    /// - 经 `components()` 逐段重建：Windows 上把用户配置中的正斜杠 / 混用
+    ///   分隔符统一为反斜杠（如 `C:/a/b` → `C:\a\b`），避免 explorer 对
+    ///   非原生分隔符路径识别失败而静默回退「文档」文件夹。
+    pub(super) fn normalize_open_path(dir: &Path) -> PathBuf {
+        let absolute = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(dir))
+                .unwrap_or_else(|_| dir.to_path_buf())
+        };
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            normalized.push(component.as_os_str());
+        }
+        normalized
+    }
+
+    /// 在文件资源管理器中打开目录（见 [`super::open_folder`] 语义）。
+    pub(super) fn open_folder_impl(dir: &Path) -> std::io::Result<()> {
+        // 1) 绝对化 + 分隔符归一化（explorer 对相对 / 正斜杠路径解析不可靠，
+        //    缺失时容易静默回退到「文档」文件夹）。
+        let dir = normalize_open_path(dir);
+        // 2) 先落盘创建：explorer 收到磁盘上不存在的目录路径不会报错，而是
+        //    静默回退打开用户的「文档」目录——必须先让目录真实存在
+        //    （create_dir_all 幂等：已存在则为无操作）。
+        std::fs::create_dir_all(&dir)?;
+        // 3) 以规范化绝对路径拉起 explorer（单参数传递，空格 / 引号无歧义；
+        //    Child 随即丢弃、从不 wait：explorer 是 GUI 进程，独立存活）。
+        std::process::Command::new("explorer").arg(&dir).spawn()?;
+        tracing::debug!(target: "platform", "资源管理器打开目录: '{}'", dir.display());
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -1037,5 +1117,35 @@ mod tests {
     fn memory_error_display_mentions_platform_capability() {
         let text = format!("{}", MemoryError::UnsupportedPlatform);
         assert!(text.contains("Windows"), "文案应点名平台: {text}");
+    }
+
+    /// 打开目录的路径归一化（explorer 投递前置，杜绝「文档」回退）：
+    /// 正斜杠统一为反斜杠、相对路径锚定到当前工作目录（绝对化）。
+    #[cfg(windows)]
+    #[test]
+    fn normalize_open_path_yields_absolute_native_separators() {
+        use super::imp::normalize_open_path;
+
+        // 绝对路径 + 正斜杠 → 原样绝对、分隔符归一为反斜杠（含非 ASCII 段）。
+        let forward = normalize_open_path(Path::new("C:/Users/测试/Logs"));
+        assert_eq!(
+            forward.to_string_lossy(),
+            "C:\\Users\\测试\\Logs",
+            "正斜杠应被归一为反斜杠且绝对前缀保留: {}",
+            forward.display()
+        );
+
+        // 相对路径 → 以当前工作目录为基准锚定为绝对路径。
+        let relative = normalize_open_path(Path::new("logs/terminals"));
+        assert!(
+            relative.is_absolute(),
+            "相对路径应被锚定为绝对路径: {}",
+            relative.display()
+        );
+        assert!(
+            !relative.to_string_lossy().contains('/'),
+            "拼接结果不应残留正斜杠: {}",
+            relative.display()
+        );
     }
 }

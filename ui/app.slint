@@ -91,6 +91,22 @@ export struct CaptureItem {
     path: string,
 }
 
+// —— 全局窗口置顶候选窗口行（与 topmost_manager 的枚举 + 置顶状态合并） ——
+export struct TopmostWindowItem {
+    // 窗口句柄十六进制简报（0x…，同时作为操作回路的稳定键）
+    hwnd: string,
+    // 所属进程可执行文件名（notepad.exe）
+    process_name: string,
+    // 窗口标题（截断显示）
+    title: string,
+    // 系统当前是否带 WS_EX_TOPMOST（只读指示，随刷新收敛）
+    topmost: bool,
+    // 当前优先级（1~9，1 最顶层；由 Rust 夹紧后回写）
+    priority: int,
+    // 是否受本模块管理（= 当前置顶中，驱动 Switch 与步进器）
+    pinned: bool,
+}
+
 // —— 全局设置目录行的键（与 Rust 侧 browse/reset/open 分派一致） ——
 export enum PathKind {
     app-log,
@@ -411,47 +427,83 @@ component ModuleCard inherits Rectangle {
             }
         }
 
-        // 右侧控件组：状态徽标 + 设置齿轮（按需）+ 物理开关
+        // 右侧控件组（固定列宽规范，保证 5 张卡片右侧横平竖直严格对齐）：
+        //   状态指示区 72px → 设置齿轮插槽 28px → 物理开关（40 × 20 固定）。
+        // 行本身不设 alignment；三列宽度恒定为显式值，无论卡片有无设置弹窗，
+        // 状态文本 / 开关的横纵位置都绝对一致——无齿轮的卡片渲染等宽透明占位。
         HorizontalBox {
-            spacing: 10px;
-            alignment: center;
+            spacing: 8px;
 
-            // 状态徽标：运行中绿点 / 已停止灰点（跟随调度层真实运行态着色）
-            HorizontalBox {
-                spacing: 6px;
+            // 状态指示区：72px 固定列宽；圆点 + 状态文本贴齐列右缘、垂直居中
+            Rectangle {
+                width: 72px;
+                height: parent.height;
 
-                Rectangle {
-                    width: 8px;
-                    height: 8px;
+                HorizontalBox {
+                    width: parent.width;
+                    spacing: 6px;
+                    alignment: end;
                     y: (parent.height - self.height) / 2;
-                    border-radius: 4px;
-                    background: root.module.enabled ? Theme.running-dot : Theme.stopped-dot;
-                }
-                Text {
-                    text: root.module.enabled ? "运行中" : "已停止";
-                    font-size: 10px;
-                    color: root.module.enabled ? Theme.accent-strong : Theme.text-muted;
-                    vertical-alignment: center;
+
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 4px;
+                        background: root.module.enabled ? Theme.running-dot : Theme.stopped-dot;
+                    }
+                    Text {
+                        text: root.module.enabled ? "运行中" : "已停止";
+                        font-size: 10px;
+                        color: root.module.enabled ? Theme.accent-strong : Theme.text-muted;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
                 }
             }
 
-            // 设置齿轮：仅在模块声明 has_settings 时渲染；点击上抛模块 ID，由 Rust
-            // 装配层按模块分派各自的设置面板入口。
-            if root.module.has_settings : GhostIconButton {
-                icon: @image-url("icons/settings.svg");
-                icon-size: 14px;
-                icon-color: Theme.text-secondary;
-                width: 24px;
-                height: 24px;
-                clicked => { root.settings-clicked(); }
+            // 设置齿轮插槽：28px 固定列宽。有设置弹窗的卡片渲染齿轮按钮（24 × 24
+            // 于列内居中）；无设置弹窗的卡片渲染同尺寸透明占位，状态指示区与
+            // 开关列因此绝不左右漂移。
+            Rectangle {
+                width: 28px;
+                height: parent.height;
+
+                if root.module.has_settings : GhostIconButton {
+                    icon: @image-url("icons/settings.svg");
+                    icon-size: 14px;
+                    icon-color: Theme.text-secondary;
+                    width: 24px;
+                    height: 24px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    clicked => { root.settings-clicked(); }
+                }
+                if !root.module.has_settings : Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    background: transparent;
+                }
             }
 
-            // 硬开关：状态以 modules 模型为唯一真源；点击即上报回调，底层落定后的
-            // 权威状态（含失败回滚）由 Rust 经事件总线刷新模型驱动本绑定收敛。
-            Switch {
-                checked: root.module.enabled;
-                toggled => {
-                    root.toggled(self.checked);
+            // 开关区：40 × 20 固定宽高（列内垂直居中，与状态 / 齿轮两列同位对齐）
+            Rectangle {
+                width: 40px;
+                height: parent.height;
+
+                // 硬开关：状态以 modules 模型为唯一真源；点击即上报回调，底层落定
+                // 后的权威状态（含失败回滚）由 Rust 经事件总线刷新模型驱动绑定收敛。
+                Switch {
+                    width: 40px;
+                    height: 20px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    checked: root.module.enabled;
+                    toggled => {
+                        root.toggled(self.checked);
+                    }
                 }
             }
         }
@@ -1148,11 +1200,371 @@ component TerminalSettingsModal inherits Rectangle {
     }
 }
 
+// —— 优先级步进器：1~9 级数字调节（全局窗口置顶弹窗行内控件） ——
+// 左侧「−」/ 右侧「+」两个轻量按钮夹中间数值；数值恒夹紧 1..=9。
+// `enabled=false`（未置顶）时整组灰化且不响应点击。
+component PriorityStepper inherits Rectangle {
+    in property <int> value: 3;
+    in property <bool> enabled: true;
+    callback changed(int);
+
+    // 固定 96 × 28：置顶弹窗行内中栏的钉死列宽（三栏对齐规范的一部分，见 TopmostWindowRow）。
+    width: 96px;
+    height: 28px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: root.enabled ? Theme.btn-border : #2e2e33;
+    background: root.enabled ? Theme.btn-bg : #1c1c20;
+
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 28px;
+        height: parent.height;
+        border-radius: 8px;
+        background: transparent;
+
+        states [
+            hover when minus-touch.has-hover && root.enabled && !minus-touch.pressed : {
+                background: Theme.btn-bg-hover;
+            }
+            pressed when root.enabled && minus-touch.pressed : {
+                background: Theme.btn-bg-pressed;
+            }
+        ]
+        animate background { duration: 90ms; }
+
+        Text {
+            text: "−";
+            font-size: 14px;
+            font-weight: 700;
+            color: root.enabled ? Theme.text-primary : Theme.text-muted;
+            width: parent.width;
+            height: parent.height;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        minus-touch := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            enabled: root.enabled;
+            clicked => {
+                root.changed(max(1, root.value - 1));
+            }
+        }
+    }
+
+    Text {
+        x: 28px;
+        width: parent.width - 56px;
+        height: parent.height;
+        text: root.value;
+        font-size: 12px;
+        font-weight: 700;
+        color: root.enabled ? Theme.text-strong : Theme.text-muted;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: parent.width - 28px;
+        y: 0;
+        width: 28px;
+        height: parent.height;
+        border-radius: 8px;
+        background: transparent;
+
+        states [
+            hover when plus-touch.has-hover && root.enabled && !plus-touch.pressed : {
+                background: Theme.btn-bg-hover;
+            }
+            pressed when root.enabled && plus-touch.pressed : {
+                background: Theme.btn-bg-pressed;
+            }
+        ]
+        animate background { duration: 90ms; }
+
+        Text {
+            text: "+";
+            font-size: 14px;
+            font-weight: 700;
+            color: root.enabled ? Theme.text-primary : Theme.text-muted;
+            width: parent.width;
+            height: parent.height;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        plus-touch := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            enabled: root.enabled;
+            clicked => {
+                root.changed(min(9, root.value + 1));
+            }
+        }
+    }
+}
+
+// —— 全局窗口置顶弹窗的候选窗口行：纯文本（进程名 + 截断标题 + HWND 简报） ——
+// 行内三栏固定列宽对齐规范：左栏·信息区（stretch 吸余、文本左对齐 + 省略）→
+// 中栏·优先级步进器（96 × 28 固定）→ 右栏·置顶开关（44px 固定列宽、贴列右缘）。
+// 行内不加载任何窗口图标（防爆显存）。
+component TopmostWindowRow inherits Rectangle {
+    in property <TopmostWindowItem> window;
+    callback pin-toggled(bool);
+    callback priority-changed(int);
+
+    height: 52px;
+    border-radius: 9px;
+    background: transparent;
+
+    states [
+        hover when row-hover.has-hover : {
+            background: Theme.row-bg-hover;
+        }
+    ]
+    animate background { duration: 90ms; }
+
+    // 悬停感应层置于内容之下，不拦截右侧控件点击。
+    row-hover := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    // 三栏式布局（行本身不设 alignment，杜绝列位漂移）：
+    //   左栏·信息区：horizontal-stretch 吸收剩余宽度，文本左对齐顶格 + overflow: elide；
+    //   中栏·优先级步进器：96 × 28 固定，行内垂直居中；
+    //   右栏·置顶开关：44px 固定列宽，开关整列贴右缘、垂直居中。
+    HorizontalBox {
+        padding-left: 12px;
+        padding-right: 8px;
+        spacing: 10px;
+
+        // 左栏·信息区：进程名 + 截断标题 / HWND 简报（两行垂直居中、水平左对齐）
+        VerticalBox {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            alignment: center;
+
+            HorizontalBox {
+                spacing: 6px;
+
+                Text {
+                    text: "[" + root.window.process_name + "]";
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: root.window.pinned ? Theme.accent-strong : Theme.text-primary;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.window.title;
+                    font-size: 11px;
+                    color: Theme.text-secondary;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+            }
+            Text {
+                text: root.window.hwnd
+                    + (root.window.topmost ? " · 系统已置顶" : "");
+                font-size: 9.5px;
+                color: Theme.text-muted;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+
+        // 中栏·优先级步进器：96 × 28 固定列宽（未置顶时灰化禁用；行内垂直居中）
+        Rectangle {
+            width: 96px;
+            height: parent.height;
+
+            PriorityStepper {
+                width: 96px;
+                height: 28px;
+                y: (parent.height - self.height) / 2;
+                value: root.window.priority;
+                enabled: root.window.pinned;
+                changed(p) => { root.priority-changed(p); }
+            }
+        }
+
+        // 右栏·置顶开关：44px 固定列宽；开关贴列右缘、垂直居中。
+        Rectangle {
+            width: 44px;
+            height: parent.height;
+
+            Switch {
+                width: 40px;
+                height: 20px;
+                x: parent.width - self.width;
+                y: (parent.height - self.height) / 2;
+                checked: root.window.pinned;
+                toggled => {
+                    root.pin-toggled(self.checked);
+                }
+            }
+        }
+    }
+}
+
+// —— 全局窗口置顶 · 管理弹窗（根层级 Overlay 5） ——
+// 顶栏：标题 + 刷新按钮 + 关闭按钮；下方实时搜索过滤框；中部纯文本窗口列表
+//（每行 = 优先级步进器 + 置顶开关）；操作即时联动（底层立即应用 / 解除置顶）。
+// 输入 / 动画架构与其余弹窗一致：遮罩常驻渐变 + 卡片仅展示期挂载。
+component TopmostModal inherits Rectangle {
+    in property <bool> show;
+    in property <[TopmostWindowItem]> windows;
+    in-out property <string> search: "";
+    callback close-requested;
+    callback refresh-requested;
+    callback search-changed(string);
+    callback pin-toggled(string, bool);
+    callback priority-changed(string, int);
+
+    background: Theme.overlay-scrim;
+    opacity: root.show ? 1.0 : 0.0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    backdrop := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.show;
+        clicked => { root.close-requested(); }
+        scroll-event(event) => { return accept; }
+    }
+
+    if root.show : dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(470px, parent.width - 32px);
+        height: min(540px, parent.height - 24px);
+        border-radius: 14px;
+        background: Theme.dialog-bg;
+        border-width: 1px;
+        border-color: Theme.dialog-border;
+        clip: true;
+
+        body-catcher := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+            scroll-event(event) => { return accept; }
+        }
+
+        VerticalBox {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 12px;
+
+            // —— 顶栏：标题 + 刷新 + 关闭 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                Text {
+                    text: "全局窗口置顶 - 管理窗口";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                GhostButton {
+                    text: "刷新";
+                    button-width: 64px;
+                    height: 24px;
+                    clicked => { root.refresh-requested(); }
+                }
+                GhostIconButton {
+                    icon: @image-url("icons/close.svg");
+                    icon-size: 13px;
+                    icon-color: Theme.text-muted;
+                    clicked => { root.close-requested(); }
+                }
+            }
+
+            // —— 实时搜索过滤 ——
+            LineEdit {
+                placeholder-text: "搜索进程名 / 标题 / HWND…";
+                font-size: 12px;
+                text: root.search;
+                edited(text) => {
+                    root.search = text;
+                    root.search-changed(text);
+                }
+            }
+
+            // —— 语义提示 ——
+            Text {
+                text: "1 级最顶层 · 9 级最低；点击开关即时置顶 / 解除，优先级步进器即时调整链序。列表为纯文本渲染，不加载窗口图标。";
+                font-size: 10.5px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            // —— 窗口列表 ——
+            win-scroll := ScrollView {
+                vertical-stretch: 1;
+
+                VerticalBox {
+                    padding-right: 8px; // 预留纵向滚动条悬浮带
+                    padding-top: 2px;
+                    padding-bottom: 2px;
+                    spacing: 4px;
+                    width: win-scroll.visible-width;
+
+                    if root.windows.length == 0 : Rectangle {
+                        height: 130px;
+
+                        Text {
+                            text: "没有匹配的窗口\n点击「刷新」重新枚举桌面顶层窗口";
+                            font-size: 11px;
+                            color: Theme.text-muted;
+                            width: parent.width;
+                            height: parent.height;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    for win in root.windows : TopmostWindowRow {
+                        window: win;
+                        pin-toggled(checked) => {
+                            root.pin-toggled(win.hwnd, checked);
+                        }
+                        priority-changed(p) => {
+                            root.priority-changed(win.hwnd, p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // —— 全局设置：日志与截图目录自定义（根层级 Overlay 3，v0.3.2） ——
 //
 // 展示三类目录（应用日志 / 终端交互日志 / 弹窗截图）的当前生效绝对路径，
 // 每行提供「更改…」（Win32 原生文件夹选择，Rust 侧 SHBrowseForFolderW）、
 // 「打开」（资源管理器）、「恢复默认」（配置置 None → 回退 exe 同级默认布局）。
+// 三张路径卡片整体置于 ScrollView 内（v0.4.0 滚动截断修复）：弹窗默认高度
+// 480px 完整展开；小屏幕 / 低分辨率下高度随窗口收缩，卡片总高超限时以
+// 鼠标滚轮上下滑动浏览，第三张卡片不再被截断。
 // 输入 / 动画架构与其余弹窗一致（遮罩常驻渐变 + 卡片仅展示期挂载）。
 component SettingsModal inherits Rectangle {
     in property <bool> show;
@@ -1182,7 +1594,11 @@ component SettingsModal inherits Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         width: min(464px, parent.width - 32px);
-        height: min(464px, parent.height - 48px);
+        // 高度自适应：默认 480px（三张路径卡片完整展开）；小屏幕 / 低分辨率下
+        // 随窗口收缩（max-height 保留 40px 遮罩余量），配合下方 ScrollView 以
+        // 鼠标滚轮滚动浏览全部卡片（v0.4.0 滚动截断修复）。
+        preferred-height: 480px;
+        max-height: parent.height - 40px;
         border-radius: 14px;
         background: Theme.dialog-bg;
         border-width: 1px;
@@ -1204,8 +1620,8 @@ component SettingsModal inherits Rectangle {
             padding-top: 16px;
             padding-bottom: 16px;
             spacing: 12px;
-            // 三张路径卡片按内容自然撑高后，剩余空间上下均分，保证弹窗内边距匀称。
-            alignment: center;
+            // 标题 / 提示固定在上部，剩余纵向空间由 ScrollView 吸收（stretch），
+            // 卡片内容超高时滚动浏览、不高时自然撑满。
 
             // —— 标题行 ——
             HorizontalBox {
@@ -1236,33 +1652,49 @@ component SettingsModal inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            // —— 三类目录行 ——
-            PathSettingRow {
-                title: "应用日志目录";
-                tip: "程序运行日志 + 用户操作审计";
-                path: root.app-log-dir;
-                key: "app_log";
-                browse-key(key) => { root.browse-key(key); }
-                open-key(key) => { root.open-key(key); }
-                reset-key(key) => { root.reset-key(key); }
-            }
-            PathSettingRow {
-                title: "终端交互日志目录";
-                tip: "PowerShell / bash / cmd 会话记录";
-                path: root.terminal-log-dir;
-                key: "terminal_log";
-                browse-key(key) => { root.browse-key(key); }
-                open-key(key) => { root.open-key(key); }
-                reset-key(key) => { root.reset-key(key); }
-            }
-            PathSettingRow {
-                title: "弹窗截图目录";
-                tip: "拦截留痕截图（PNG）";
-                path: root.screenshot-dir;
-                key: "popup_screenshot";
-                browse-key(key) => { root.browse-key(key); }
-                open-key(key) => { root.open-key(key); }
-                reset-key(key) => { root.reset-key(key); }
+            // —— 三类目录行：ScrollView 纵向滚动（v0.4.0 修复：三张卡片总高
+            //    超出弹窗约束时不再被截断，可滚轮上下滑动浏览全部） ——
+            // 与 RulesModal 的 rules-scroll 同一滚动架构：ScrollView 自身
+            // vertical-stretch: 1 吸收剩余高度；内层 VerticalBox 按
+            // visible-width 取视口宽度、右侧预留滚动条悬浮带、卡片间距 10px。
+            settings-scroll := ScrollView {
+                vertical-stretch: 1;
+
+                VerticalBox {
+                    padding-right: 8px; // 预留纵向滚动条悬浮带
+                    padding-top: 2px;
+                    padding-bottom: 2px;
+                    spacing: 10px;
+                    width: settings-scroll.visible-width;
+
+                    PathSettingRow {
+                        title: "应用日志目录";
+                        tip: "程序运行日志 + 用户操作审计";
+                        path: root.app-log-dir;
+                        key: "app_log";
+                        browse-key(key) => { root.browse-key(key); }
+                        open-key(key) => { root.open-key(key); }
+                        reset-key(key) => { root.reset-key(key); }
+                    }
+                    PathSettingRow {
+                        title: "终端交互日志目录";
+                        tip: "PowerShell / bash / cmd 会话记录";
+                        path: root.terminal-log-dir;
+                        key: "terminal_log";
+                        browse-key(key) => { root.browse-key(key); }
+                        open-key(key) => { root.open-key(key); }
+                        reset-key(key) => { root.reset-key(key); }
+                    }
+                    PathSettingRow {
+                        title: "弹窗截图目录";
+                        tip: "拦截留痕截图（PNG）";
+                        path: root.screenshot-dir;
+                        key: "popup_screenshot";
+                        browse-key(key) => { root.browse-key(key); }
+                        open-key(key) => { root.open-key(key); }
+                        reset-key(key) => { root.reset-key(key); }
+                    }
+                }
             }
         }
     }
@@ -1385,7 +1817,7 @@ component AboutModal inherits Rectangle {
             }
 
             Text {
-                text: "专注桌面常驻与开关控制的轻量级原生 Windows 工具箱：弹窗拦截 / 系统防休眠 / 剪贴板净化 / 终端交互日志。";
+                text: "专注桌面常驻与开关控制的轻量级原生 Windows 工具箱：弹窗拦截 / 系统防休眠 / 剪贴板净化 / 终端交互日志 / 全局窗口置顶守护。";
                 font-size: 11px;
                 color: Theme.text-muted;
                 wrap: word-wrap;
@@ -1567,6 +1999,10 @@ export component MainWindow inherits Window {
     in property <bool> show_settings_modal: false;
     in property <string> app_log_dir_display: "";
     in property <string> screenshot_dir_display: "";
+    // 全局窗口置顶管理弹窗（v0.4.0）：显隐开关 + 候选窗口列表 + 实时搜索文本。
+    in property <bool> show_topmost_modal: false;
+    in property <[TopmostWindowItem]> topmost_windows;
+    in-out property <string> topmost_search: "";
     // 关于弹窗（v0.3.2）：显隐开关、更新状态文本 / 下载入口。
     in property <bool> show_about_modal: false;
     in property <string> update_status: "";
@@ -1610,6 +2046,13 @@ export component MainWindow inherits Window {
     callback browse_setting_dir(string);
     callback open_setting_dir(string);
     callback reset_setting_dir(string);
+    // 全局窗口置顶（v0.4.0）。
+    callback open_topmost_modal();
+    callback close_topmost_modal();
+    callback refresh_topmost();
+    callback topmost_search_changed(string);
+    callback topmost_toggle_pin(string, bool);
+    callback topmost_set_priority(string, int);
 
     // ============================================================
     //  顶部系统与全局控制栏 + 单栏模块卡片流
@@ -1801,6 +2244,23 @@ export component MainWindow inherits Window {
         browse-key(key) => { root.browse_setting_dir(key); }
         open-key(key) => { root.open_setting_dir(key); }
         reset-key(key) => { root.reset_setting_dir(key); }
+    }
+
+    // ============================================================
+    //  根层级「全局窗口置顶 - 管理窗口」遮罩层（v0.4.0）
+    // ============================================================
+    topmost-modal := TopmostModal {
+        width: root.width;
+        height: root.height;
+        show: root.show_topmost_modal;
+        windows: root.topmost_windows;
+        search: root.topmost_search;
+
+        close-requested => { root.close_topmost_modal(); }
+        refresh-requested => { root.refresh_topmost(); }
+        search-changed(text) => { root.topmost_search_changed(text); }
+        pin-toggled(hwnd, checked) => { root.topmost_toggle_pin(hwnd, checked); }
+        priority-changed(hwnd, priority) => { root.topmost_set_priority(hwnd, priority); }
     }
 
     // ============================================================

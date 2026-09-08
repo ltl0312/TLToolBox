@@ -118,16 +118,17 @@ slint::include_modules!();
 use slint::{CloseRequestResponse, ComponentHandle, Image as SlintImage, Model, ModelRc, SharedString, VecModel};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tltoolbox::autostart;
 use tltoolbox::bus::{AppEvent, EventBus, TrayAction};
-use tltoolbox::config::{AppConfig, ConfigManager};
+use tltoolbox::config::{AppConfig, ConfigManager, PinnedRule};
 use tltoolbox::logging::{self, AuditSink};
 use tltoolbox::manager::{ModuleManager, SharedManager};
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::{CaptureRecord, PopupBlockerModule};
 use tltoolbox::modules::terminal_logger::TerminalLoggerModule;
+use tltoolbox::modules::topmost_manager::TopmostManagerModule;
 use tltoolbox::modules::ToolModule;
 use tltoolbox::platform;
 use tltoolbox::single_instance;
@@ -146,11 +147,13 @@ use tokio::sync::Mutex;
 /// - `popup_blocker`（弹窗拦截）：齿轮点击打开「黑名单规则管理」弹窗；
 /// - `terminal_logger`（终端交互日志）：齿轮点击打开「终端日志记录 - 存储管理」
 ///   弹窗（展示当前生效的日志存储目录，可一键在文件资源管理器中打开，见函数体
-///   8.4.1 / 8.4.5 的按模块 ID 分派与回调接线）。
+///   8.4.1 / 8.4.5 的按模块 ID 分派与回调接线）；
+/// - `topmost_manager`（全局窗口置顶，v0.4.0）：齿轮点击打开「管理窗口」弹窗
+///   （候选窗口列表 + 优先级步进器 + 置顶开关，见函数体 8.8 的分派与回调接线）。
 ///   其余模块（如 keep_awake）不渲染齿轮。
 ///   未来新增带设置面板的模块时在此扩展。
 fn module_has_settings(id: &str) -> bool {
-    matches!(id, "popup_blocker" | "terminal_logger")
+    matches!(id, "popup_blocker" | "terminal_logger" | "topmost_manager")
 }
 
 /// 把调度层元数据快照转换为 UI 模块列表条目。
@@ -286,6 +289,238 @@ fn load_capture_preview(ui: &MainWindow, index: usize) {
         "{} · {}",
         item.file_name, item.title
     )));
+}
+
+// ---------------------------------------------------------------------------
+// 全局窗口置顶 · 管理弹窗（v0.4.0：候选窗口枚举 + 置顶状态合并 + 操作回调）
+// ---------------------------------------------------------------------------
+
+/// 最近一次枚举的**全量**候选窗口行（供搜索过滤复用；UI 模型只展示过滤子集）。
+///
+/// Slint 的 `TopmostWindowItem` 各字段（`SharedString` / `bool` / `int`）均
+/// `Send + Sync`，可安全驻留本静态量；跨线程载荷遵守既有铁律——模型写入只发生在
+/// UI 线程闭包内，本静态仅作为“全量快照缓存”被读取。
+static TOPMOST_FULL_ROWS: OnceLock<std::sync::Mutex<Vec<TopmostWindowItem>>> = OnceLock::new();
+
+/// 全量快照缓存访问器。
+fn topmost_full_rows() -> &'static std::sync::Mutex<Vec<TopmostWindowItem>> {
+    TOPMOST_FULL_ROWS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 由枚举窗口 + 模块受管条目合并出弹窗行。
+///
+/// `pinned` 为模块当前受管条目；命中受管的窗口行带优先级 / 置顶态，未受管的
+/// 用默认优先级 [`DEFAULT_PRIORITY`](tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY)
+/// 并保持 `pinned = false`（系统 `WS_EX_TOPMOST` 仅是展示指示，不与受管挂钩）。
+fn topmost_row_from(window: &tltoolbox::modules::topmost_manager::enum_windows::WindowInfo, pinned: &[tltoolbox::modules::topmost_manager::ActivePinnedWindow]) -> TopmostWindowItem {
+    let entry = pinned.iter().find(|p| p.hwnd == window.hwnd);
+    TopmostWindowItem {
+        hwnd: SharedString::from(format!("0x{:X}", window.hwnd)),
+        process_name: SharedString::from(window.process_name.clone()),
+        title: SharedString::from(window.title.clone()),
+        topmost: window.topmost,
+        priority: entry.map(|e| e.priority as i32).unwrap_or_else(|| tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY as i32),
+        pinned: entry.is_some(),
+    }
+}
+
+/// 按搜索词过滤全量候选行（进程名 / 标题 / HWND 文本三路子串，忽略大小写）。
+fn filter_topmost_rows(rows: &[TopmostWindowItem], search: &str) -> Vec<TopmostWindowItem> {
+    let needle = search.trim().to_lowercase();
+    if needle.is_empty() {
+        return rows.to_vec();
+    }
+    rows.iter()
+        .filter(|row| {
+            row.process_name.to_lowercase().contains(&needle)
+                || row.title.to_lowercase().contains(&needle)
+                || row.hwnd.to_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+/// 【任意线程可调用】重建全量候选行快照并刷新弹窗模型（枚举在阻塞线程执行）。
+fn refresh_topmost_rows(
+    ui_weak: &slint::Weak<MainWindow>,
+    module: Arc<TopmostManagerModule>,
+) {
+    let weak = ui_weak.clone();
+    tokio::spawn(async move {
+        // 枚举（EnumWindows + 逐窗口元数据查询）为同步 Win32 调用，移出运行时。
+        let windows = tokio::task::spawn_blocking(TopmostManagerModule::enumerate_candidates)
+            .await
+            .unwrap_or_default();
+        let pinned = module.pinned();
+        let rows: Vec<TopmostWindowItem> = windows
+            .iter()
+            .map(|window| topmost_row_from(window, &pinned))
+            .collect();
+        *topmost_full_rows().lock().unwrap_or_else(|e| e.into_inner()) = rows.clone();
+
+        // 在 UI 线程读取当前搜索词并交付过滤结果（跨线程载荷仅 Weak + Vec）。
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                let search = ui.get_topmost_search().to_string();
+                ui.set_topmost_windows(ModelRc::new(VecModel::from(
+                    filter_topmost_rows(&rows, &search),
+                )));
+            }
+        });
+    });
+}
+
+/// 【UI 线程内】按当前搜索词从全量快照重刷弹窗模型（搜索框输入即时过滤）。
+fn apply_topmost_search(ui: &MainWindow) {
+    let search = ui.get_topmost_search().to_string();
+    let rows = topmost_full_rows()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    ui.set_topmost_windows(ModelRc::new(VecModel::from(filter_topmost_rows(
+        &rows, &search,
+    ))));
+}
+
+/// 解析弹窗行回传的 HWND 文本（`0x1A2B3C` → 句柄值；失败返回 `None`）。
+fn parse_hwnd_text(text: &str) -> Option<isize> {
+    let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))?;
+    isize::from_str_radix(hex, 16).ok()
+}
+
+/// 置顶 / 解除置顶 / 改级操作的回调载体：执行模块操作 → 审计 → Toast → 刷新列表。
+fn handle_topmost_pin(
+    ui_weak: &slint::Weak<MainWindow>,
+    module: Arc<TopmostManagerModule>,
+    audit: AuditSink,
+    hwnd_text: String,
+    priority: i32,
+    pinned: bool,
+) {
+    let Some(hwnd) = parse_hwnd_text(&hwnd_text) else {
+        show_toast(ui_weak, "无效的窗口句柄");
+        return;
+    };
+    let result = if pinned {
+        module.apply_pin(hwnd, priority as u8)
+    } else {
+        module.apply_unpin(hwnd)
+    };
+    match result {
+        Ok(()) => {
+            // 审计细节（进程名 / 生效优先级）从模块受管条目回读，保证与事实一致。
+            let process = module
+                .pinned()
+                .iter()
+                .find(|p| p.hwnd == hwnd)
+                .map(|p| p.process_name.clone())
+                .unwrap_or_else(|| "<unknown.exe>".to_string());
+            if pinned {
+                let effective = module
+                    .pinned()
+                    .iter()
+                    .find(|p| p.hwnd == hwnd)
+                    .map(|p| p.priority)
+                    .unwrap_or(priority as u8);
+                audit.record(
+                    "TOPMOST",
+                    format!("开启窗口置顶 HWND: 0x{hwnd:X} 进程: {process} 优先级: {effective}"),
+                    "成功",
+                );
+                show_toast(ui_weak, &format!("已置顶：{process}（优先级 {effective}）"));
+            } else {
+                audit.record(
+                    "TOPMOST",
+                    format!("解除窗口置顶 HWND: 0x{hwnd:X} 进程: {process}"),
+                    "成功",
+                );
+                show_toast(ui_weak, &format!("已解除置顶：{process}"));
+            }
+        }
+        Err(engine_err) => {
+            let (audit_result, toast_msg) = match &engine_err {
+                tltoolbox::modules::topmost_manager::engine::Win32Error::AccessDenied => (
+                    "失败: UIPI 拦截（目标窗口特权更高）".to_string(),
+                    "目标窗口具备高特权，请提权运行 TLToolBox".to_string(),
+                ),
+                tltoolbox::modules::topmost_manager::engine::Win32Error::InvalidWindow => (
+                    "失败: 窗口已关闭".to_string(),
+                    "窗口已关闭或句柄失效".to_string(),
+                ),
+                other => (
+                    format!("失败: {other}"),
+                    format!("置顶操作失败：{other}"),
+                ),
+            };
+            audit.record(
+                "TOPMOST",
+                format!(
+                    "{} HWND: 0x{hwnd:X}",
+                    if pinned { "开启窗口置顶" } else { "解除窗口置顶" }
+                ),
+                audit_result,
+            );
+            show_toast(ui_weak, &toast_msg);
+        }
+    }
+    // 操作已落定：重拉全量快照收敛弹窗（开关 / 优先级与底层事实对齐）。
+    refresh_topmost_rows(ui_weak, module);
+}
+
+/// 优先级步进器回调：仅对受管（已置顶）窗口生效。
+fn handle_topmost_priority(
+    ui_weak: &slint::Weak<MainWindow>,
+    module: Arc<TopmostManagerModule>,
+    audit: AuditSink,
+    hwnd_text: String,
+    priority: i32,
+) {
+    let Some(hwnd) = parse_hwnd_text(&hwnd_text) else {
+        show_toast(ui_weak, "无效的窗口句柄");
+        return;
+    };
+    match module.set_priority(hwnd, priority as u8) {
+        Ok(()) => {
+            let process = module
+                .pinned()
+                .iter()
+                .find(|p| p.hwnd == hwnd)
+                .map(|p| p.process_name.clone())
+                .unwrap_or_else(|| "<unknown.exe>".to_string());
+            audit.record(
+                "TOPMOST",
+                format!("调整窗口置顶优先级 HWND: 0x{hwnd:X} 进程: {process} 优先级: {priority}"),
+                "成功",
+            );
+            show_toast(
+                ui_weak,
+                &format!("已调整 {process} 置顶优先级为 {priority}"),
+            );
+        }
+        Err(engine_err) => {
+            let (audit_result, toast_msg) = match &engine_err {
+                tltoolbox::modules::topmost_manager::engine::Win32Error::AccessDenied => (
+                    "失败: UIPI 拦截（目标窗口特权更高）".to_string(),
+                    "目标窗口具备高特权，请提权运行 TLToolBox".to_string(),
+                ),
+                tltoolbox::modules::topmost_manager::engine::Win32Error::InvalidWindow => (
+                    "失败: 窗口已关闭".to_string(),
+                    "窗口已关闭或句柄失效".to_string(),
+                ),
+                other => (
+                    format!("失败: {other}"),
+                    format!("调整优先级失败：{other}"),
+                ),
+            };
+            audit.record(
+                "TOPMOST",
+                format!("调整窗口置顶优先级 HWND: 0x{hwnd:X} -> {priority}"),
+                audit_result,
+            );
+            show_toast(ui_weak, &toast_msg);
+        }
+    }
+    refresh_topmost_rows(ui_weak, module);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,8 +793,11 @@ fn open_terminal_settings(
 /// 窗口；请求置位后闭锁，直到本次打开落定（成功或失败）再复位。
 static EXPLORER_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// 【任意线程可调用】确保目录存在（不存在自动 `create_dir_all`）后，调用
-/// `std::process::Command::new("explorer").arg(&dir).spawn()` 打开该目录；
+/// 【任意线程可调用】在文件资源管理器中打开指定目录（目录不存在自动创建）。
+///
+/// 实际打开动作委托给 [`platform::open_folder`]（v0.4.0 缺陷修复：`explorer`
+/// 收到磁盘上不存在的目录路径会**静默回退打开「文档」文件夹**——由该函数先做
+/// 路径绝对化 / 分隔符归一化 / `create_dir_all` 落盘创建后再 spawn）；
 /// 成功经 `show_toast` 反馈「已在资源管理器中打开目录」。
 ///
 /// 线程模型（杜绝界面卡死）：目录创建与进程 spawn 均为同步 IO / 进程操作，
@@ -574,12 +812,7 @@ fn open_dir_in_explorer(ui_weak: &slint::Weak<MainWindow>, dir: PathBuf) {
     let weak = ui_weak.clone();
     let dir_text = dir.to_string_lossy().into_owned();
     tokio::spawn(async move {
-        let outcome = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            std::fs::create_dir_all(&dir)?; // 目录不存在则自动创建
-            std::process::Command::new("explorer").arg(&dir).spawn()?;
-            Ok(())
-        })
-        .await;
+        let outcome = tokio::task::spawn_blocking(move || platform::open_folder(&dir)).await;
         // 落定后复位单飞守卫：成功 / 失败都允许用户再次发起新一轮打开。
         EXPLORER_OPEN_IN_FLIGHT.store(false, Ordering::SeqCst);
         match outcome {
@@ -773,6 +1006,36 @@ fn spawn_blacklist_persister(
     tx
 }
 
+/// 窗口置顶规则持久化通道的发送端句柄：投递一份「最新置顶规则列表」即触发
+/// 一次异步落盘（v0.4.0，与黑名单持久化同构的单写者模式）。
+///
+/// 由 [`TopmostManagerModule`] 在每次置顶 / 解除 / 改级后投递最新快照；常驻任务
+/// 串行消费，保证最后一次操作的规则必然最后写盘。
+type TopmostRulesSender = tokio::sync::mpsc::UnboundedSender<Vec<PinnedRule>>;
+
+/// 派生窗口置顶规则持久化任务：接收「最新规则列表」→ 更新配置节 → 原子落盘。
+fn spawn_topmost_rules_persister(
+    config_mgr: Arc<ConfigManager>,
+    runtime_config: Arc<Mutex<AppConfig>>,
+) -> TopmostRulesSender {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PinnedRule>>();
+    tokio::spawn(async move {
+        while let Some(rules) = rx.recv().await {
+            let snapshot = {
+                let mut cfg = runtime_config.lock().await;
+                cfg.topmost_manager.pinned_rules = rules;
+                cfg.clone()
+            };
+            if let Err(err) = config_mgr.save(&snapshot).await {
+                tracing::error!(target: "main", "窗口置顶规则写入配置失败: {err}");
+            } else {
+                tracing::debug!(target: "main", "窗口置顶规则已持久化到 tltoolbox.toml");
+            }
+        }
+    });
+    tx
+}
+
 // ---------------------------------------------------------------------------
 // 总线 → UI 投递（跨线程边界；模型改写严格发生在 UI 线程闭包内）
 // ---------------------------------------------------------------------------
@@ -815,6 +1078,11 @@ async fn forward_module_events(
                 if !deliver_module_sync(&ui_weak, Arc::clone(&manager)) {
                     break;
                 }
+            }
+            Ok(AppEvent::ToastRequested(message)) => {
+                // 后台守护线程（如窗口置顶模块的泵线程遭遇 UIPI 拦截）请求的
+                // Toast：转发到统一 Toast 入口（show_toast 在 UI 线程展示）。
+                show_toast(&ui_weak, &message);
             }
             Ok(_) => {
                 // 托盘指令（TrayAction）与日志（AppLogAppended）不属本任务职责。
@@ -922,8 +1190,7 @@ async fn lifecycle_controller(
                             "完成",
                         );
                     });
-                }
-                TrayAction::ExitApp => {
+                }                TrayAction::ExitApp => {
                     tracing::info!(target: "main", "托盘「退出程序」触发，调度应用平滑收尾");
                     quit_scheduled = true;
                     let _ = slint::invoke_from_event_loop(|| {
@@ -939,6 +1206,10 @@ async fn lifecycle_controller(
             },
             Ok(AppEvent::AppLogAppended { .. }) => {
                 // 双栏日志控制台已退役：运行日志由 tracing 承载，此处忽略。
+            }
+            Ok(AppEvent::ToastRequested(_)) => {
+                // 后台守护线程请求的 Toast 由总线 → UI 转发任务处置
+                // （forward_module_events），生命周期控制器不重复处理。
             }
         }
         if quit_scheduled {
@@ -1130,6 +1401,20 @@ async fn main() -> Result<(), AppError> {
     module_mgr.register(Arc::new(TerminalLoggerModule::new(Arc::clone(
         &runtime_config,
     ))));
+    //      全局窗口置顶守护模块（v0.4.0）：以配置节装配——置顶规则记忆
+    //      （`pinned_rules`，启动恢复）+ 事件总线（守护线程 UIPI 失败 →
+    //      ToastRequested 提示提权）。同样**不**进入默认自动启动列表；但
+    //      `topmost_manager.enabled = true` 会在自动启动段被视作启动请求
+    //      （与 auto_start_modules 等价，见下方 5. 自动启动段）。
+    let topmost_manager = Arc::new(
+        TopmostManagerModule::with_rules(app_config.topmost_manager.pinned_rules.clone())
+            .with_bus(Some(event_bus.clone())),
+    );
+    topmost_manager.attach_rule_persister(spawn_topmost_rules_persister(
+        Arc::clone(&config_mgr),
+        Arc::clone(&runtime_config),
+    ));
+    module_mgr.register(topmost_manager.clone());
     let shared_mgr: SharedManager = Arc::new(module_mgr);
     let registered_modules: Vec<&str> = shared_mgr
         .get_metadata_list()
@@ -1146,7 +1431,15 @@ async fn main() -> Result<(), AppError> {
     // ---- 5. 自动启动模块：先于 UI 装配执行，保证初始 UI 快照即真实状态。 ----
     //      此时总线尚无订阅者，启动期事件按 bus 模块的设计语义被丢弃——真实状态随后
     //      经 get_metadata_list() 快照注入 UI，无需依赖事件回放。
-    for module_id in &app_config.auto_start_modules {
+    //      v0.4.0：`topmost_manager.enabled = true`（配置节）视作自动启动请求，
+    //      与 auto_start_modules 等价（窗口置顶守护 = 显式开启才合理，不写入
+    //      auto_start_modules 默认列表；但用户一旦开启，重启后应保持守护）。
+    let mut auto_start_ids: Vec<String> = app_config.auto_start_modules.clone();
+    if app_config.topmost_manager.enabled && !auto_start_ids.iter().any(|id| id == "topmost_manager")
+    {
+        auto_start_ids.push("topmost_manager".to_string());
+    }
+    for module_id in &auto_start_ids {
         if shared_mgr.get_module(module_id).is_none() {
             tracing::warn!(target: "main", "自动启动列表含未注册模块: {module_id}，已跳过");
             continue;
@@ -1212,16 +1505,38 @@ async fn main() -> Result<(), AppError> {
     ui.on_request_elevate(move || trigger_admin_restart(&elevate_ui, &elevate_audit));
 
     // 8.1 模块开关拨动 → 异步调度模块启停（成功 / 失败均写入审计日志）。
+    //     v0.4.0 特例：`topmost_manager` 模块的启停镜像到配置节
+    //     `topmost_manager.enabled`（配置为准：下次启动据此自动拉起守护）。
     let manager_for_toggle = Arc::clone(&shared_mgr);
     let toggle_audit = audit.clone();
+    let toggle_cfg = Arc::clone(&config_mgr);
+    let toggle_runtime = Arc::clone(&runtime_config);
     ui.on_toggle_module(move |id, enable| {
         let manager = Arc::clone(&manager_for_toggle);
         let audit = toggle_audit.clone();
+        let cfg_mgr = Arc::clone(&toggle_cfg);
+        let cfg_lock = Arc::clone(&toggle_runtime);
         let id_text = id.to_string();
         let action_text = format!("{id_text} -> {}", if enable { "开启" } else { "关闭" });
         tokio::spawn(async move {
             match manager.toggle(&id_text, enable).await {
-                Ok(_) => audit.record("模块开关", action_text, "成功"),
+                Ok(_) => {
+                    audit.record("模块开关", action_text, "成功");
+                    if id_text == "topmost_manager" {
+                        // 配置镜像持久化（失败仅告警：模块运行态不受影响）。
+                        let snapshot = {
+                            let mut cfg = cfg_lock.lock().await;
+                            cfg.topmost_manager.enabled = enable;
+                            cfg.clone()
+                        };
+                        if let Err(err) = cfg_mgr.save(&snapshot).await {
+                            tracing::warn!(
+                                target: "main",
+                                "窗口置顶启停状态写入配置失败（下次启动将按配置收敛）: {err}"
+                            );
+                        }
+                    }
+                }
                 Err(err) => {
                     audit.record("模块开关", action_text, format!("失败: {err}"));
                     tracing::error!(target: "main", "切换模块 {id_text} -> {enable} 失败: {err}");
@@ -1329,10 +1644,13 @@ async fn main() -> Result<(), AppError> {
     //        「规则管理 + 留痕」弹窗（留痕列表随版本号订阅实时刷新，见 8.4.6）；
     //      - terminal_logger：读取当前生效的日志根目录绝对路径写入
     //        terminal_log_dir_display，并展示「终端日志记录 - 存储管理」弹窗
-    //        （与 on_open_terminal_modal 共用 open_terminal_settings 入口，见 8.4.5）。
+    //        （与 on_open_terminal_modal 共用 open_terminal_settings 入口，见 8.4.5）；
+    //      - topmost_manager（v0.4.0）：重置搜索词 → 全量枚举 + 合并置顶状态刷入
+    //        topmost_windows 模型 → 展示「管理窗口」弹窗（见 8.8）。
     let open_blocker = Arc::clone(&popup_blocker);
     let open_cfg = Arc::clone(&runtime_config);
     let open_ui = ui.as_weak();
+    let open_topmost_module = Arc::clone(&topmost_manager);
     ui.on_open_module_settings(move |module_id| {
         let weak = open_ui.clone();
         match module_id.as_str() {
@@ -1346,6 +1664,16 @@ async fn main() -> Result<(), AppError> {
             }
             "terminal_logger" => {
                 open_terminal_settings(&weak, Arc::clone(&open_cfg));
+            }
+            "topmost_manager" => {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_topmost_search(SharedString::from(""));
+                }
+                // 全量枚举 + 置顶状态合并（阻塞线程枚举 → UI 线程交付模型）。
+                refresh_topmost_rows(&weak, Arc::clone(&open_topmost_module));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_show_topmost_modal(true);
+                }
             }
             other => {
                 tracing::warn!(target: "main", "模块 {other} 尚无设置面板实现（齿轮点击忽略）");
@@ -1619,6 +1947,71 @@ async fn main() -> Result<(), AppError> {
             let records = capture_blocker.captures();
             deliver_captures_refresh(&capture_ui, records);
         }
+    });
+
+    // 8.8 全局窗口置顶 · 管理弹窗回调接线（v0.4.0）：
+    //     - close_topmost_modal：弹窗右上角「×」/ 点击遮罩空白 → 复位显隐；
+    //     - refresh_topmost：顶栏「⟳ 刷新」→ 重新全量枚举 + 合并置顶状态；
+    //     - topmost_search_changed：搜索框实时输入 → 按当前搜索词重刷模型；
+    //     - topmost_toggle_pin(hwnd, pinned)：行开关 → 立即应用 / 解除置顶
+    //       （审计 + Toast + 刷新列表）；
+    //     - topmost_set_priority(hwnd, priority)：优先级步进器 → 改级（含非受管
+    //       行上步进器未启用的防御：仅对已置顶窗口生效）。
+    let close_tm_ui = ui.as_weak();
+    ui.on_close_topmost_modal(move || {
+        if let Some(ui) = close_tm_ui.upgrade() {
+            ui.set_show_topmost_modal(false);
+        }
+    });
+
+    let refresh_tm_ui = ui.as_weak();
+    let refresh_tm_module = Arc::clone(&topmost_manager);
+    ui.on_refresh_topmost(move || {
+        refresh_topmost_rows(&refresh_tm_ui, Arc::clone(&refresh_tm_module));
+    });
+
+    let search_tm_ui = ui.as_weak();
+    ui.on_topmost_search_changed(move |_text| {
+        if let Some(ui) = search_tm_ui.upgrade() {
+            apply_topmost_search(&ui);
+        }
+    });
+
+    let pin_tm_ui = ui.as_weak();
+    let pin_tm_module = Arc::clone(&topmost_manager);
+    let pin_tm_audit = audit.clone();
+    ui.on_topmost_toggle_pin(move |hwnd, pinned| {
+        // 置顶时优先级取行内当前值（未置顶行用默认优先级，见 topmost_row_from）。
+        let priority = pin_tm_ui
+            .upgrade()
+            .and_then(|ui| {
+                ui.get_topmost_windows()
+                    .iter()
+                    .find(|row| row.hwnd.as_str() == hwnd.as_str())
+                    .map(|row| row.priority)
+            })
+            .unwrap_or(tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY as i32);
+        handle_topmost_pin(
+            &pin_tm_ui,
+            Arc::clone(&pin_tm_module),
+            pin_tm_audit.clone(),
+            hwnd.to_string(),
+            priority,
+            pinned,
+        );
+    });
+
+    let prio_tm_ui = ui.as_weak();
+    let prio_tm_module = Arc::clone(&topmost_manager);
+    let prio_tm_audit = audit.clone();
+    ui.on_topmost_set_priority(move |hwnd, priority| {
+        handle_topmost_priority(
+            &prio_tm_ui,
+            Arc::clone(&prio_tm_module),
+            prio_tm_audit.clone(),
+            hwnd.to_string(),
+            priority,
+        );
     });
 
     // ---- 9. 托盘装配与生命周期控制（桌面常驻核心机制）。 ----
