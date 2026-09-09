@@ -459,81 +459,78 @@ component ModuleCard inherits Rectangle {
             }
         }
 
-        // 右侧操作区：固定总宽 152px（72 + 8 + 24 + 8 + 40）的硬核容器，元素
-        // 物理坐标绝对钉死，**不依赖任何 Flex 占位矩形**——Flex 塌陷会使占位
-        // 失效、齿轮漂移。三块坐标恒定：状态区 x:0（72px）→ 齿轮 x:80（24px）
-        // → 开关 x:112（40px）。第 4 张卡片（端口占用管理，toggleable = false）
-        // 缺少开关时 x:112 处自然留白，齿轮恒在 x:80，绝不可能漂移。
-        Rectangle {
-            width: 152px;
+        // 右侧操作区：固定总宽 156px（76 + 8 + 24 + 8 + 40）的硬核容器，元素
+        // 物理坐标绝对钉死，**不依赖任何 Flex / 占位矩形**。四块坐标恒定：
+        // 状态区 x:0（76px）→ 齿轮 x:84（24px）→ 开关 x:116（40px）；
+        // 每块 Y 轴各自 (parent.height - self.height) / 2 严格居中。圆点钉死
+        // 在 x:4、文本钉死在 x:16 左对齐——状态文本（「运行中 / 已停止 /
+        // 即开即用」）长短变化**绝不**再推移圆点。第 4 张卡片（端口占用管理，
+        // toggleable = false）缺少开关时 x:116 处自然留白，齿轮恒在 x:84。
+        // 注：规格中的 status-text / status-color 为伪属性；ModuleItem 无此字段，
+        // 文本与配色沿用下方 toggleable / enabled 三元表达式，仅几何布局按绝对标准。
+        action-box := Rectangle {
+            width: 156px;
             height: parent.height;
 
-            action-box := Rectangle {
+            // 1. 状态区（固定 76px 宽，容器垂直居中）
+            status-container := Rectangle {
                 x: 0px;
-                y: (parent.height - self.height) / 2;
-                width: 152px;
-                height: 32px;
+                width: 76px;
+                height: parent.height;
 
-                // 1. 状态指示区（x:0，72px 固定）：圆点 + 状态文本贴齐右缘、
-                //    垂直居中。v0.5.0：toggleable = false 以中性点 + 「即开即用」
-                //    标签呈现（不区分运行 / 停止语义）。
-                Rectangle {
-                    x: 0px;
-                    width: 72px;
+                // 圆点位置绝对钉死在 x: 4px，Y 轴严格居中，严禁随文字长度移动
+                status-dot := Rectangle {
+                    x: 4px;
+                    y: (parent.height - self.height) / 2;
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: root.module.toggleable
+                        ? (root.module.enabled ? Theme.running-dot : Theme.stopped-dot)
+                        : Theme.tool-dot;
+                }
+
+                // 文本起始点绝对钉死在 x: 16px，左对齐，Y 轴严格居中
+                status-txt := Text {
+                    x: 16px;
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width - 16px;
                     height: parent.height;
-
-                    HorizontalBox {
-                        width: parent.width;
-                        spacing: 6px;
-                        alignment: end;
-                        y: (parent.height - self.height) / 2;
-
-                        Rectangle {
-                            width: 8px;
-                            height: 8px;
-                            y: (parent.height - self.height) / 2;
-                            border-radius: 4px;
-                            background: root.module.toggleable
-                                ? (root.module.enabled ? Theme.running-dot : Theme.stopped-dot)
-                                : Theme.tool-dot;
-                        }
-                        Text {
-                            text: root.module.toggleable
-                                ? (root.module.enabled ? "运行中" : "已停止")
-                                : "即开即用";
-                            font-size: 10px;
-                            color: root.module.toggleable
-                                ? (root.module.enabled ? Theme.accent-strong : Theme.text-muted)
-                                : Theme.text-secondary;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                    }
+                    vertical-alignment: center;
+                    horizontal-alignment: left;
+                    text: root.module.toggleable
+                        ? (root.module.enabled ? "运行中" : "已停止")
+                        : "即开即用";
+                    font-size: 12px;
+                    color: root.module.toggleable
+                        ? (root.module.enabled ? Theme.accent-strong : Theme.text-muted)
+                        : Theme.text-secondary;
+                    overflow: elide;
                 }
+            }
 
-                // 2. 齿轮按钮（仅 has_settings 渲染；位置恒定 x:80、24 × 24）。
-                if root.module.has_settings : GhostIconButton {
-                    x: 80px;
-                    width: 24px;
-                    height: 24px;
-                    y: (parent.height - self.height) / 2;
-                    icon: @image-url("icons/settings.svg");
-                    icon-size: 14px;
-                    icon-color: Theme.text-secondary;
-                    clicked => { root.settings-clicked(); }
-                }
+            // 2. 齿轮按钮（仅 has_settings 渲染；位置恒定 x:84、24 × 24）。
+            if root.module.has_settings : GhostIconButton {
+                x: 84px;
+                y: (parent.height - self.height) / 2;
+                width: 24px;
+                height: 24px;
+                icon: @image-url("icons/settings.svg");
+                icon-size: 14px;
+                icon-color: Theme.text-secondary;
+                clicked => { root.settings-clicked(); }
+            }
 
-                // 3. Switch 开关（仅 toggleable 渲染；位置恒定 x:112、40 × 20）。
-                //    第 4 张卡片无开关时此处自然留白——齿轮绝不向右漂移。
-                if root.module.toggleable : Switch {
-                    x: 112px;
-                    width: 40px;
-                    height: 20px;
-                    y: (parent.height - self.height) / 2;
-                    checked: root.module.enabled;
-                    toggled => {
-                        root.toggled(self.checked);
-                    }
+            // 3. Switch 开关（仅 toggleable 渲染；位置恒定 x:116、40 × 20）。
+            //    第 4 张卡片无开关时此处自然留白——齿轮绝不向右漂移。
+            if root.module.toggleable : Switch {
+                x: 116px;
+                y: (parent.height - self.height) / 2;
+                width: 40px;
+                height: 20px;
+                checked: root.module.enabled;
+                toggled => {
+                    root.toggled(self.checked);
                 }
             }
         }
