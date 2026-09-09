@@ -82,3 +82,13 @@ pub mod terminal_logger;
 /// Toast 总线提示用户提权运行；置顶规则经 [`ToolModule`] 生命周期与
 /// `AppConfig::topmost_manager` 持久化记忆、启动恢复。
 pub mod topmost_manager;
+
+/// 本地开发端口猎手（v0.5.0 · 第六个模块卡片：即开即用工具）。
+///
+/// 基于 Win32 原生网络 API（iphlpapi：`GetExtendedTcpTable` /
+/// `GetExtendedUdpTable`）实现毫秒级本地监听端口枚举（[`port_hunter::scanner`]）、
+/// 四重降噪纯函数过滤（状态 / 动态端口 / 会话隔离 / 系统服务黑名单）、进程安全
+/// 终止与 UIPI 防御（[`port_hunter::killer`]）以及模块专属明细日志
+/// （[`port_hunter::logger`]，与全局审计日志构成双轨日志体系）；UI 侧为「即开即用」
+/// 卡片 + 管理弹窗，无常驻后台开关。
+pub mod port_hunter;

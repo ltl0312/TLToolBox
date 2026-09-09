@@ -21,7 +21,7 @@ TLToolBox 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：�
 
 ## ✨ 功能特性
 
-四个常驻守护模块共享同一套「卡片开关」交互：打开主窗口，拨动开关即启用，点击卡片上的 ⚙ 齿轮图标可进入对应模块的设置弹窗（弹窗拦截规则管理、终端日志存储管理等）。
+五个模块卡片共享同一套「卡片 + 齿轮」交互：四个常驻守护模块拨动卡片开关即启用；**端口占用管理**为即开即用工具（无常驻后台开关，卡片显示「即开即用」），点击卡片上的 ⚙ 齿轮图标可进入对应模块的设置弹窗（弹窗拦截规则管理、终端日志存储管理、端口占用管理等）。
 
 | 模块                                         | 它做什么                                                     | 底层原理                                                     | 推荐开启场景                                                 |
 | :------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- |
@@ -29,6 +29,7 @@ TLToolBox 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：�
 | **系统防休眠**<br>`keep_awake`               | 阻止系统自动睡眠与屏幕空闲熄灭，让下载 / 渲染 / 编译 / 值守任务彻夜稳定运行 | 调用 `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED \| ES_DISPLAY_REQUIRED)` 注入粘性执行状态；纯内核状态标记，无常驻循环，CPU 开销绝对为零；关闭时以 `ES_CONTINUOUS` 还原默认策略 | **默认关闭**。长时间下载 / 视频渲染 / 外接投影演示 / 隔夜挂机任务时开启；日常保持关闭以尊重系统节能策略 |
 | **剪贴板纯文本净化**<br>`clipboard_purifier` | 剪贴板内容同时携带纯文本与富文本（网页 HTML、Office RTF、聊天工具内嵌样式）时，自动剔除格式残留，粘贴始终为纯文本 | 基于 `AddClipboardFormatListener` 注册监听，专用原生纯消息窗口（STATIC + `HWND_MESSAGE`）处理 `WM_CLIPBOARDUPDATE`；原子清空并重写，内置自循环回声防护（EchoGuard）彻底避免自我触发 | **默认关闭**。常将网页 / 文档内容复制进 Markdown、代码编辑器、终端等纯文本环境的用户；需要富文本粘贴时关闭 |
 | **终端交互日志**<br>`terminal_logger`        | 自动记录 CMD、PowerShell (5.1/7+)、Bash 终端的全部输入指令、交互会话与命令退出状态码（Exit Code） | **PowerShell**：挂载静默转录流并代理 `prompt` 捕获 `$LASTEXITCODE`；<br>**Bash**：基于 `PROMPT_COMMAND` 与历史行解析记录用户指令与 `$?`；<br>**CMD**：注册表 AutoRun 挂载原生非侵入式脚本，doskey 捕获用户键入与退出码，内置 `/c` 护栏严禁挂起构建子进程 | **默认关闭**。开发调试、命令行操作审计、运维排错及终端历史持久化留痕场景 |
+| **端口占用管理**<br>`port_hunter` | 毫秒级定位本地监听端口（8080 / 3000 / 5173 等）的占用进程，支持搜索过滤与一键释放；释放前可按配置二次确认 | 基于 iphlpapi 原生 API（`GetExtendedTcpTable` / `GetExtendedUdpTable`）；四重降噪纯函数过滤（仅 LISTEN / 剔除 IANA 动态高位端口 / 会话隔离剔除 Session 0 服务 / 系统服务黑名单）；终止走 `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`，UIPI 拦截提示提权；「全局审计 + 模块明细」双轨日志 | 即开即用工具（⚙ 弹窗进入）。本地开发端口冲突时使用；代码 / 构建服务器等 Vagrant、Node、Java 进程乱占端口时一键清除 |
 
 > **默认值说明**：弹窗拦截属于“装上即用”的核心能力，默认随应用启动；防休眠、剪贴板净化与终端日志涉及系统电源策略、剪贴板行为与外部 Shell 挂接，属于操作敏感型功能，默认保持关闭，由用户显式开启。
 
@@ -163,11 +164,17 @@ TLToolBox/
 │       ├── popup_blocker.rs # 桌面弹窗拦截模块
 │       ├── keep_awake.rs    # 系统防休眠模块
 │       ├── clipboard_purifier.rs # 剪贴板格式净化模块
-│       └── terminal_logger/ # 终端交互日志记录子系统
-│           ├── mod.rs       # 终端调度器与 HookManager
-│           ├── anchor.rs    # Shell 配置文件文本锚点注入引擎
-│           ├── ps_bash.rs   # PowerShell 与 Bash 挂载实现
-│           └── cmd.rs       # CMD AutoRun 批处理与 doskey 状态捕获
+│       ├── terminal_logger/ # 终端交互日志记录子系统
+│       │   ├── mod.rs       # 终端调度器与 HookManager
+│       │   ├── anchor.rs    # Shell 配置文件文本锚点注入引擎
+│       │   ├── ps_bash.rs   # PowerShell 与 Bash 挂载实现
+│       │   └── cmd.rs       # CMD AutoRun 批处理与 doskey 状态捕获
+│       ├── topmost_manager/ # 全局窗口置顶守护（enum_windows / engine）
+│       └── port_hunter/     # 端口占用管理（即开即用工具）
+│           ├── mod.rs       # 模块编排与展示缓存
+│           ├── scanner.rs   # iphlpapi 监听枚举 + 四重降噪纯函数
+│           ├── killer.rs    # 进程安全终止 + UIPI 防御 + Toast
+│           └── logger.rs    # 模块专属明细日志（{log_dir}/port_hunter.log）
 ├── tests/                   # 模块生命周期无头集成测试
 └── .github/workflows/       # GitHub Actions Windows 自动化发版流水线 (release.yml)
 ```

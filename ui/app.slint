@@ -66,7 +66,7 @@
 //
 // 注：随双栏日志控制台退役，LogEntry 已从本文件移除；运行日志改由 tracing 承载。
 
-import { Switch, ScrollView, VerticalBox, HorizontalBox, LineEdit } from "std-widgets.slint";
+import { Switch, ScrollView, VerticalBox, HorizontalBox, LineEdit, CheckBox } from "std-widgets.slint";
 
 // —— 模块列表条目：与调度层 ModuleMeta 一一对应 ——
 export struct ModuleItem {
@@ -75,8 +75,12 @@ export struct ModuleItem {
     desc: string,
     enabled: bool,
     // 是否有「设置面板」：为真时卡片在 Switch 左侧渲染齿轮按钮
-    // （当前为弹窗拦截：规则管理 + 留痕弹窗；终端交互日志：存储管理弹窗，见 Rust 侧分派）。
+    // （当前为弹窗拦截：规则管理 + 留痕弹窗；终端交互日志：存储管理弹窗；端口
+    //   占用管理：PortHunterModal，见 Rust 侧分派）。
     has_settings: bool,
+    // 是否有「常驻后台开关」：v0.5.0 起「端口占用管理」为即开即用工具，
+    // toggleable = false → 卡片不渲染物理开关、状态列显示「即开即用」。
+    toggleable: bool,
 }
 
 // —— 弹窗拦截留痕列表条目（与 popup_blocker::CaptureRecord 对应） ——
@@ -111,6 +115,22 @@ export struct TopmostWindowItem {
     pinned: bool,
 }
 
+// —— 端口占用管理条目（与 port_hunter::scanner::PortEntry 对应） ——
+export struct PortEntryItem {
+    // 协议（TCP / UDP）
+    protocol: string,
+    // 本地监听端口号
+    local_port: int,
+    // 本地绑定地址（0.0.0.0 / 127.0.0.1）
+    local_addr: string,
+    // 占用进程 PID
+    pid: int,
+    // 可执行文件名（node.exe；查询失败为 <unknown>）
+    process_name: string,
+    // 可执行文件绝对路径（悬停提示展示；失败为空串）
+    process_path: string,
+}
+
 // —— 全局设置目录行的键（与 Rust 侧 browse/reset/open 分派一致） ——
 export enum PathKind {
     app-log,
@@ -133,6 +153,7 @@ export global Theme {
     in-out property <color> accent-strong: #34d399;   // 强调（运行态文字）
     in-out property <color> running-dot: #4ade80;     // 运行中绿点
     in-out property <color> stopped-dot: #52525b;     // 已停止灰点
+    in-out property <color> tool-dot: #71717a;        // 即开即用工具中性点（v0.5.0）
     in-out property <color> pill-bg: #10b9811a;       // 版本徽标底
     in-out property <color> pill-border: #10b98140;
     in-out property <color> pill-text: #6ee7b7;
@@ -380,7 +401,7 @@ component PrimaryButton inherits Rectangle {
     }
 }
 
-// —— 模块卡片：名称 / 描述 / 状态徽标 / 设置齿轮（可选）/ 物理开关 ——
+// —— 模块卡片：名称 / 描述 / 状态徽标 / 设置齿轮（可选）/ 物理开关（可选） ——
 component ModuleCard inherits Rectangle {
     in property <ModuleItem> module;
     callback toggled(bool);
@@ -438,78 +459,76 @@ component ModuleCard inherits Rectangle {
             }
         }
 
-        // 右侧控件组（固定列宽规范，保证 5 张卡片右侧横平竖直严格对齐）：
-        //   状态指示区 72px → 设置齿轮插槽 28px → 物理开关（40 × 20 固定）。
-        // 行本身不设 alignment；三列宽度恒定为显式值，无论卡片有无设置弹窗，
-        // 状态文本 / 开关的横纵位置都绝对一致——无齿轮的卡片渲染等宽透明占位。
-        HorizontalBox {
-            spacing: 8px;
+        // 右侧操作区：固定总宽 152px（72 + 8 + 24 + 8 + 40）的硬核容器，元素
+        // 物理坐标绝对钉死，**不依赖任何 Flex 占位矩形**——Flex 塌陷会使占位
+        // 失效、齿轮漂移。三块坐标恒定：状态区 x:0（72px）→ 齿轮 x:80（24px）
+        // → 开关 x:112（40px）。第 4 张卡片（端口占用管理，toggleable = false）
+        // 缺少开关时 x:112 处自然留白，齿轮恒在 x:80，绝不可能漂移。
+        Rectangle {
+            width: 152px;
+            height: parent.height;
 
-            // 状态指示区：72px 固定列宽；圆点 + 状态文本贴齐列右缘、垂直居中
-            Rectangle {
-                width: 72px;
-                height: parent.height;
+            action-box := Rectangle {
+                x: 0px;
+                y: (parent.height - self.height) / 2;
+                width: 152px;
+                height: 32px;
 
-                HorizontalBox {
-                    width: parent.width;
-                    spacing: 6px;
-                    alignment: end;
-                    y: (parent.height - self.height) / 2;
+                // 1. 状态指示区（x:0，72px 固定）：圆点 + 状态文本贴齐右缘、
+                //    垂直居中。v0.5.0：toggleable = false 以中性点 + 「即开即用」
+                //    标签呈现（不区分运行 / 停止语义）。
+                Rectangle {
+                    x: 0px;
+                    width: 72px;
+                    height: parent.height;
 
-                    Rectangle {
-                        width: 8px;
-                        height: 8px;
+                    HorizontalBox {
+                        width: parent.width;
+                        spacing: 6px;
+                        alignment: end;
                         y: (parent.height - self.height) / 2;
-                        border-radius: 4px;
-                        background: root.module.enabled ? Theme.running-dot : Theme.stopped-dot;
-                    }
-                    Text {
-                        text: root.module.enabled ? "运行中" : "已停止";
-                        font-size: 10px;
-                        color: root.module.enabled ? Theme.accent-strong : Theme.text-muted;
-                        vertical-alignment: center;
-                        overflow: elide;
+
+                        Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 4px;
+                            background: root.module.toggleable
+                                ? (root.module.enabled ? Theme.running-dot : Theme.stopped-dot)
+                                : Theme.tool-dot;
+                        }
+                        Text {
+                            text: root.module.toggleable
+                                ? (root.module.enabled ? "运行中" : "已停止")
+                                : "即开即用";
+                            font-size: 10px;
+                            color: root.module.toggleable
+                                ? (root.module.enabled ? Theme.accent-strong : Theme.text-muted)
+                                : Theme.text-secondary;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
                     }
                 }
-            }
 
-            // 设置齿轮插槽：28px 固定列宽。有设置弹窗的卡片渲染齿轮按钮（24 × 24
-            // 于列内居中）；无设置弹窗的卡片渲染同尺寸透明占位，状态指示区与
-            // 开关列因此绝不左右漂移。
-            Rectangle {
-                width: 28px;
-                height: parent.height;
-
+                // 2. 齿轮按钮（仅 has_settings 渲染；位置恒定 x:80、24 × 24）。
                 if root.module.has_settings : GhostIconButton {
+                    x: 80px;
+                    width: 24px;
+                    height: 24px;
+                    y: (parent.height - self.height) / 2;
                     icon: @image-url("icons/settings.svg");
                     icon-size: 14px;
                     icon-color: Theme.text-secondary;
-                    width: 24px;
-                    height: 24px;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
                     clicked => { root.settings-clicked(); }
                 }
-                if !root.module.has_settings : Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                    background: transparent;
-                }
-            }
 
-            // 开关区：40 × 20 固定宽高（列内垂直居中，与状态 / 齿轮两列同位对齐）
-            Rectangle {
-                width: 40px;
-                height: parent.height;
-
-                // 硬开关：状态以 modules 模型为唯一真源；点击即上报回调，底层落定
-                // 后的权威状态（含失败回滚）由 Rust 经事件总线刷新模型驱动绑定收敛。
-                Switch {
+                // 3. Switch 开关（仅 toggleable 渲染；位置恒定 x:112、40 × 20）。
+                //    第 4 张卡片无开关时此处自然留白——齿轮绝不向右漂移。
+                if root.module.toggleable : Switch {
+                    x: 112px;
                     width: 40px;
                     height: 20px;
-                    x: (parent.width - self.width) / 2;
                     y: (parent.height - self.height) / 2;
                     checked: root.module.enabled;
                     toggled => {
@@ -1606,6 +1625,419 @@ component TopmostModal inherits Rectangle {
     }
 }
 
+// —— 端口占用管理 · 端口条目行（v0.5.0） ——
+// 行内左侧：[协议 TCP/UDP]（小标签背景）+ 端口号（绿色加粗）+ [进程名.exe] +
+// (PID: 12345)，悬停提示完整物理路径（Tooltip）；行内右侧「一键释放」危险色按钮。
+// 二次确认机制（confirm-enabled 开启时）：点击「一键释放」呼出行内确认态——展示
+// 确认文案 + 「确认释放 / 取消」两键，确认后执行终止；关闭时点击即直接释放。
+// 行内确认态为纯 UI 局部状态（confirming），不写入数据模型。
+component PortHunterRow inherits Rectangle {
+    in property <PortEntryItem> entry;
+    in property <bool> confirm-enabled: true;
+    in-out property <bool> confirming: false;
+    callback kill-requested(int, int, string);
+
+    height: root.confirming ? 72px : 46px;
+    border-radius: 9px;
+    background: transparent;
+
+    states [
+        hover when row-hover.has-hover : {
+            background: Theme.row-bg-hover;
+        }
+    ]
+    animate background, height { duration: 90ms; }
+
+    // 悬停感应层置于内容之下，不拦截右侧按钮点击。
+    row-hover := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    // 悬停提示：完整物理路径（Tooltip 内置延迟弹出；空路径时提示无法获取）。
+    // 采用自定义内容形态（Tooltip.text 为 styled-text，不能绑定动态表达式）。
+    Tooltip {
+        Text {
+            text: root.entry.process_path == "" ? "（无法获取进程路径）" : root.entry.process_path;
+            font-size: 10.5px;
+            color: Theme.text-primary;
+        }
+    }
+
+    VerticalBox {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 4px;
+
+        // —— 主行：信息区（stretch）+ 释放按钮 ——
+        HorizontalBox {
+            spacing: 8px;
+            alignment: center;
+
+            // 信息区：协议标签 + 端口 + 进程名 + PID
+            HorizontalBox {
+                spacing: 7px;
+                horizontal-stretch: 1;
+
+                // [协议 TCP/UDP]：小标签背景
+                Rectangle {
+                    height: 18px;
+                    border-radius: 5px;
+                    background: Theme.pill-bg;
+                    border-width: 1px;
+                    border-color: Theme.pill-border;
+
+                    Text {
+                        text: root.entry.protocol;
+                        font-size: 9px;
+                        font-weight: 700;
+                        color: Theme.pill-text;
+                        x: 6px;
+                        y: 0;
+                        width: parent.width - 12px;
+                        height: parent.height;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 端口号（绿色加粗）
+                Text {
+                    text: root.entry.local_port;
+                    font-size: 13px;
+                    font-weight: 800;
+                    color: Theme.accent-strong;
+                    vertical-alignment: center;
+                }
+
+                // [进程名.exe]
+                Text {
+                    text: "[" + root.entry.process_name + "]";
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+
+                // (PID: 12345)
+                Text {
+                    text: "(PID: " + root.entry.pid + ")";
+                    font-size: 9.5px;
+                    color: Theme.text-muted;
+                    vertical-alignment: center;
+                }
+            }
+
+            // —— 右侧：一键释放 / 确认操作 ——
+            if !root.confirming : kill-button := Rectangle {
+                width: 68px;
+                height: 26px;
+                border-radius: 7px;
+                background: Theme.danger-hover-bg;
+                border-width: 1px;
+                border-color: Theme.danger;
+
+                states [
+                    hover when kill-touch.has-hover && !kill-touch.pressed : {
+                        background: Theme.danger-pressed-bg;
+                    }
+                    pressed when kill-touch.pressed : {
+                        background: Theme.danger-pressed-bg;
+                    }
+                ]
+                animate background { duration: 90ms; }
+
+                Text {
+                    text: "一键释放";
+                    font-size: 10.5px;
+                    font-weight: 700;
+                    color: Theme.danger;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                kill-touch := TouchArea {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => {
+                        if (root.confirm-enabled) {
+                            root.confirming = true;   // 二次确认开启：呼出行内确认态
+                        } else {
+                            root.kill-requested(root.entry.pid, root.entry.local_port, root.entry.protocol);
+                        }
+                    }
+                }
+            }
+        }
+
+        // —— 确认条（二次确认开启且本行确认态激活时展示） ——
+        if root.confirming : confirm-bar := Rectangle {
+            height: 26px;
+            border-radius: 7px;
+            background: Theme.warn-bar-bg;
+            border-width: 1px;
+            border-color: Theme.warn-bar-border;
+
+            HorizontalBox {
+                spacing: 8px;
+                padding-left: 10px;
+                padding-right: 8px;
+                alignment: center;
+
+                Text {
+                    text: "确定结束 " + root.entry.process_name + " (PID: " + root.entry.pid
+                        + ") 并释放端口 " + root.entry.local_port + " 吗？";
+                    font-size: 9.5px;
+                    font-weight: 600;
+                    color: Theme.warn-bar-text;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                // 确认释放（危险实底）
+                Rectangle {
+                    width: 60px;
+                    height: 20px;
+                    border-radius: 5px;
+                    background: Theme.danger;
+
+                    Text {
+                        text: "确认释放";
+                        font-size: 9.5px;
+                        font-weight: 700;
+                        color: #ffffff;
+                        width: parent.width;
+                        height: parent.height;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    confirm-touch := TouchArea {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => {
+                            root.confirming = false;
+                            root.kill-requested(root.entry.pid, root.entry.local_port, root.entry.protocol);
+                        }
+                    }
+                }
+                // 取消（幽灵）
+                Rectangle {
+                    width: 44px;
+                    height: 20px;
+                    border-radius: 5px;
+                    background: Theme.btn-bg;
+
+                    Text {
+                        text: "取消";
+                        font-size: 9.5px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        width: parent.width;
+                        height: parent.height;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    cancel-touch := TouchArea {
+                        x: 0;
+                        y: 0;
+                        width: parent.width;
+                        height: parent.height;
+                        clicked => {
+                            root.confirming = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// —— 端口占用管理 · 管理弹窗（根层级 Overlay 6，v0.5.0） ——
+// 顶栏：标题「端口占用管理」+ 纯文本「刷新」+ 搜索过滤框（端口号 / 进程名即时
+// 过滤）+ 关闭 ×；选项栏：「二次确认」「显示系统服务与高位端口」两个复选开关
+// （切换即保存配置 / 立即重新过滤）；中部 ScrollView 监听端口列表；空列表引导态。
+// 输入 / 动画架构与其余弹窗一致（遮罩常驻渐变 + 卡片仅展示期挂载）。
+component PortHunterModal inherits Rectangle {
+    in property <bool> show;
+    in property <[PortEntryItem]> entries;
+    // v0.5.1：两个选项属性升级为 in-out——CheckBox 以 `checked <=> root.…`
+    // 双向绑定，复选框视觉与属性实时同步（勾选即改属性，绝无状态脱节）；
+    // MainWindow 装配点同样以 `<=>` 双向绑定到主窗口 in-out 属性。
+    in-out property <bool> confirm-before-kill: true;
+    in-out property <bool> show-system-ports: false;
+    in-out property <string> search: "";
+    in property <string> status-text: "";
+    callback close-requested;
+    callback refresh-requested;
+    callback search-changed(string);
+    callback confirm-toggled(bool);
+    callback system-toggled(bool);
+    callback kill-requested(int, int, string);
+
+    background: Theme.overlay-scrim;
+    opacity: root.show ? 1.0 : 0.0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    backdrop := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.show;
+        clicked => { root.close-requested(); }
+        scroll-event(event) => { return accept; }
+    }
+
+    if root.show : dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(470px, parent.width - 32px);
+        height: min(540px, parent.height - 24px);
+        border-radius: 14px;
+        background: Theme.dialog-bg;
+        border-width: 1px;
+        border-color: Theme.dialog-border;
+        clip: true;
+
+        body-catcher := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+            scroll-event(event) => { return accept; }
+        }
+
+        VerticalBox {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 12px;
+
+            // —— 顶栏：标题 + 刷新 + 搜索框 + 关闭 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                Text {
+                    text: "端口占用管理";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                GhostButton {
+                    text: "刷新";
+                    button-width: 64px;
+                    height: 24px;
+                    clicked => { root.refresh-requested(); }
+                }
+                GhostIconButton {
+                    icon: @image-url("icons/close.svg");
+                    icon-size: 13px;
+                    icon-color: Theme.text-muted;
+                    clicked => { root.close-requested(); }
+                }
+            }
+
+            // —— 搜索过滤框（端口号 / 进程名即时过滤） ——
+            LineEdit {
+                placeholder-text: "搜索端口号或进程名…（如 5173 / node）";
+                font-size: 12px;
+                text: root.search;
+                edited(text) => {
+                    root.search = text;
+                    root.search-changed(text);
+                }
+            }
+
+            // —— 选项栏：二次确认 / 显示系统服务与高位端口 ——
+            HorizontalBox {
+                spacing: 18px;
+                alignment: start;
+
+                CheckBox {
+                    text: "二次确认";
+                    font-size: 11px;
+                    // v0.5.1：双向绑定——勾选状态实时写回 root.confirm-before-kill
+                    // （再经 MainWindow 装配点的 `<=>` 同步到 Rust 侧 UI 属性，
+                    // 弹窗重开 / 重渲染都不会把开关拉回旧值）。
+                    checked <=> root.confirm-before-kill;
+                    toggled => { root.confirm-toggled(self.checked); }
+                }
+                // 「显示系统服务与高位端口」：CheckBox 以 `checked <=> root.
+                // show-system-ports` 双向绑定（v0.5.1）——用户勾选瞬间属性即更新，
+                // 与此同时 toggled 回调把新状态显式发送给 Rust
+                // （port_system_toggled → persist_option("system", …)）：
+                // Rust 侧保存配置 → 立即重扫（物理阻断在 scanner 循环内重新执行）
+                // → 按最新布尔值刷新列表与展示计数，三方严格收敛。
+                CheckBox {
+                    text: "显示系统服务与高位端口";
+                    font-size: 11px;
+                    checked <=> root.show-system-ports;
+                    toggled => { root.system-toggled(self.checked); }
+                }
+            }
+
+            // —— 状态条：当前展示计数 ——
+            Text {
+                text: root.status-text;
+                font-size: 10.5px;
+                color: Theme.text-muted;
+                overflow: elide;
+            }
+
+            // —— 监听端口列表 ——
+            port-scroll := ScrollView {
+                vertical-stretch: 1;
+
+                VerticalBox {
+                    padding-right: 8px; // 预留纵向滚动条悬浮带
+                    padding-top: 2px;
+                    padding-bottom: 2px;
+                    spacing: 4px;
+                    width: port-scroll.visible-width;
+
+                    if root.entries.length == 0 : Rectangle {
+                        height: 150px;
+
+                        Text {
+                            text: "没有匹配的监听端口\n点击「刷新」重新枚举；或放宽「显示系统服务与高位端口」";
+                            font-size: 11px;
+                            color: Theme.text-muted;
+                            width: parent.width;
+                            height: parent.height;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    for entry in root.entries : PortHunterRow {
+                        entry: entry;
+                        confirm-enabled: root.confirm-before-kill;
+                        kill-requested(pid, port, protocol) => {
+                            root.kill-requested(pid, port, protocol);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // —— 全局设置：日志与截图目录自定义（根层级 Overlay 3，v0.3.2） ——
 //
 // 展示三类目录（应用日志 / 终端交互日志 / 弹窗截图）的当前生效绝对路径，
@@ -2025,7 +2457,12 @@ component Toast inherits Rectangle {
 }
 
 export component MainWindow inherits Window {
-    title: "TLToolBox - 桌面实用工具箱";
+    // v0.5.1：窗口标题收敛为产品名；窗口 / 任务栏图标由 Slint 框架原生绑定
+    // res/app.png（@image-url 相对本文件所在 ui/ 目录解析），框架在 Win32
+    // CreateWindow 时自动为窗口设置图标（ICON_BIG/SMALL 由 winit 内核处理），
+    // 不再依赖任何 FindWindowW / WM_SETICON 手写逻辑。
+    title: "TLToolBox";
+    icon: @image-url("../res/app.png");
     width: 480px;
     height: 560px;
     background: Theme.window-bg;
@@ -2055,6 +2492,15 @@ export component MainWindow inherits Window {
     in property <[TopmostWindowItem]> topmost_windows;
     in-out property <string> topmost_search: "";
     in property <bool> topmost_module_enabled: true;
+    // 端口占用管理弹窗（v0.5.0）：显隐开关 + 监听条目列表 + 搜索文本 + 选项状态。
+    // v0.5.1：两个选项属性升级为 in-out，装配点与 PortHunterModal 之间经
+    // `<=>` 双向绑定——CheckBox 勾选即同步到本属性，Rust 侧读取 / 写回同源。
+    in property <bool> show_port_hunter_modal: false;
+    in property <[PortEntryItem]> port_hunter_entries;
+    in-out property <string> port_hunter_search: "";
+    in-out property <bool> port_confirm_before_kill: true;
+    in-out property <bool> port_show_system_ports: false;
+    in property <string> port_hunter_status: "";
     // 关于弹窗（v0.3.2）：显隐开关、更新状态文本 / 下载入口。
     in property <bool> show_about_modal: false;
     in property <string> update_status: "";
@@ -2105,6 +2551,14 @@ export component MainWindow inherits Window {
     callback topmost_search_changed(string);
     callback topmost_toggle_pin(int, bool);
     callback topmost_set_priority(int, int);
+    // 端口占用管理（v0.5.0）：弹窗开关 / 刷新 / 搜索 / 选项切换 / 一键释放。
+    callback open_port_hunter_modal();
+    callback close_port_hunter_modal();
+    callback refresh_port_hunter();
+    callback port_hunter_search_changed(string);
+    callback port_confirm_toggled(bool);
+    callback port_system_toggled(bool);
+    callback port_kill_requested(int, int, string);
 
     // ============================================================
     //  顶部系统与全局控制栏 + 单栏模块卡片流
@@ -2314,6 +2768,29 @@ export component MainWindow inherits Window {
         search-changed(text) => { root.topmost_search_changed(text); }
         pin-toggled(hwnd_value, checked) => { root.topmost_toggle_pin(hwnd_value, checked); }
         priority-changed(hwnd_value, priority) => { root.topmost_set_priority(hwnd_value, priority); }
+    }
+
+    // ============================================================
+    //  根层级「端口占用管理」遮罩层（v0.5.0）
+    // ============================================================
+    port-hunter-modal := PortHunterModal {
+        width: root.width;
+        height: root.height;
+        show: root.show_port_hunter_modal;
+        entries: root.port_hunter_entries;
+        // v0.5.1：`<=>` 双向绑定——CheckBox 勾选即写回 root.port_* 属性，
+        // Rust 侧 setter 写回也同步弹窗视觉，双向零脱节。
+        confirm-before-kill <=> root.port_confirm_before_kill;
+        show-system-ports <=> root.port_show_system_ports;
+        search: root.port_hunter_search;
+        status-text: root.port_hunter_status;
+
+        close-requested => { root.close_port_hunter_modal(); }
+        refresh-requested => { root.refresh_port_hunter(); }
+        search-changed(text) => { root.port_hunter_search_changed(text); }
+        confirm-toggled(checked) => { root.port_confirm_toggled(checked); }
+        system-toggled(checked) => { root.port_system_toggled(checked); }
+        kill-requested(pid, port, protocol) => { root.port_kill_requested(pid, port, protocol); }
     }
 
     // ============================================================

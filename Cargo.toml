@@ -1,6 +1,6 @@
 [package]
 name = "tltoolbox"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 build = "build.rs"
 
@@ -115,6 +115,14 @@ features = [
     # Win32_Graphics_Dwm：DwmGetWindowAttribute / DWMWA_CLOAKED（v0.4.0 窗口置顶
     # 守护的枚举过滤——排除 DWM 挂起 / 虚拟桌面隐藏的窗口，见 topmost_manager）
     "Win32_Graphics_Dwm",
+    # Win32_NetworkManagement_IpHelper：GetExtendedTcpTable / GetExtendedUdpTable
+    # 与 MIB_TCPTABLE_OWNER_PID / MIB_UDPTABLE_OWNER_PID（v0.5.0 本地开发端口猎手
+    # 模块的原生监听端口枚举 API，见 port_hunter/scanner）
+    "Win32_NetworkManagement_IpHelper",
+    # Win32_System_RemoteDesktop：ProcessIdToSessionId（v0.5.0 端口猎手的会话隔离
+    # 降噪——剔除 Session 0 系统服务进程，仅保留与当前 GUI 用户同会话的监听者；
+    # 该符号位于 RemoteDesktop 模块而非 ProcessStatus，见 port_hunter/scanner）
+    "Win32_System_RemoteDesktop",
 ]
 
 [build-dependencies]

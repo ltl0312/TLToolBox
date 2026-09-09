@@ -127,6 +127,7 @@ use tltoolbox::manager::{ModuleManager, SharedManager};
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::{CaptureRecord, PopupBlockerModule};
+use tltoolbox::modules::port_hunter::{PortEntry, PortHunterModule};
 use tltoolbox::modules::terminal_logger::TerminalLoggerModule;
 use tltoolbox::modules::topmost_manager::TopmostManagerModule;
 use tltoolbox::modules::ToolModule;
@@ -149,11 +150,25 @@ use tokio::sync::Mutex;
 ///   弹窗（展示当前生效的日志存储目录，可一键在文件资源管理器中打开，见函数体
 ///   8.4.1 / 8.4.5 的按模块 ID 分派与回调接线）；
 /// - `topmost_manager`（全局窗口置顶，v0.4.0）：齿轮点击打开「管理窗口」弹窗
-///   （候选窗口列表 + 优先级步进器 + 置顶开关，见函数体 8.8 的分派与回调接线）。
+///   （候选窗口列表 + 优先级步进器 + 置顶开关，见函数体 8.8 的分派与回调接线）；
+/// - `port_hunter`（端口占用管理，v0.5.0）：齿轮点击打开「端口占用管理」弹窗
+///   （监听端口列表 + 搜索过滤 + 一键释放 + 两个选项开关，见函数体 8.9）。
 ///   其余模块（如 keep_awake）不渲染齿轮。
 ///   未来新增带设置面板的模块时在此扩展。
 fn module_has_settings(id: &str) -> bool {
-    matches!(id, "popup_blocker" | "terminal_logger" | "topmost_manager")
+    matches!(
+        id,
+        "popup_blocker" | "terminal_logger" | "topmost_manager" | "port_hunter"
+    )
+}
+
+/// 模块卡片是否提供「常驻后台开关」（v0.5.0）。
+///
+/// 端口占用管理为**即开即用工具**（无常驻后台语义）：卡片不渲染物理开关、
+/// 状态列显示「即开即用」，全部功能经齿轮弹窗进入；「全部启用 / 全部停用」与
+/// 卡片拨动对其一律跳过（`start` / `stop` 本为空操作，双保险）。
+fn module_is_toggleable(id: &str) -> bool {
+    id != "port_hunter"
 }
 
 /// 把调度层元数据快照转换为 UI 模块列表条目。
@@ -167,6 +182,7 @@ fn module_items_from_manager(manager: &ModuleManager) -> Vec<ModuleItem> {
             desc: SharedString::from(meta.description),
             enabled: meta.running,
             has_settings: module_has_settings(meta.id),
+            toggleable: module_is_toggleable(meta.id),
         })
         .collect()
 }
@@ -532,6 +548,292 @@ fn handle_topmost_priority(
         }
     }
     refresh_topmost_rows(ui_weak, module);
+}
+
+// ---------------------------------------------------------------------------
+// 端口占用管理 · UI 桥接（v0.5.0：扫描 / 过滤 / 释放 / 选项持久化）
+// ---------------------------------------------------------------------------
+
+/// 把模块侧 [`PortEntry`] 转换为 UI 列表行（`PortEntryItem`）。
+fn port_entry_to_item(entry: &PortEntry) -> PortEntryItem {
+    PortEntryItem {
+        protocol: SharedString::from(entry.protocol.clone()),
+        local_port: entry.local_port as i32,
+        local_addr: SharedString::from(entry.local_addr.clone()),
+        pid: entry.pid as i32,
+        process_name: SharedString::from(entry.process_name.clone()),
+        process_path: SharedString::from(entry.process_path.clone()),
+    }
+}
+
+/// 【UI 线程内】按当前搜索词 / 显示选项重刷弹窗列表与状态条。
+///
+/// v0.5.1 语义：`show_system_ports` 在扫描期已物理阻断系统端口 / PID ≤ 4 /
+/// 多 IP 重复行（`scanner` 原生表项遍历循环内完成，缓存是干净形态）；此处
+/// 只做**搜索词即时收敛**（纯客户端过滤，零重扫）。
+fn refresh_port_hunter_display(ui: &MainWindow, module: &PortHunterModule) {
+    let search = ui.get_port_hunter_search().to_string();
+    let show_system = ui.get_port_show_system_ports();
+    let rows = module.cached_rows();
+    // 扫描缓存已是物理阻断后的干净形态，搜索过滤直接套用（无需系统端口 /
+    // 内核态二次剔除——它们从未进入缓存）。
+    let filtered =
+        tltoolbox::modules::port_hunter::scanner::filter_port_rows(&rows, &search, show_system);
+    let items: Vec<PortEntryItem> = filtered.iter().map(port_entry_to_item).collect();
+    ui.set_port_hunter_entries(ModelRc::new(VecModel::from(items)));
+    // v0.5.1 副标题：仅在复选框**真实勾选**（bool == true）时追加「（显示系统
+    // 服务与高位端口）」；未勾选时展示有效过滤后条数（如「共 12 个监听端口 ·
+    // 当前展示 12 个」）。复选框驱动 scan 重扫：勾选前缓存不含系统端口，勾选后
+    // 扫描把系统端口纳入——展示数量随 bool 真实联动，绝不出现「未勾选仍 106」。
+    let suffix = if show_system {
+        "（显示系统服务与高位端口）"
+    } else {
+        ""
+    };
+    let status = format!(
+        "共 {} 个监听端口 · 当前展示 {} 个{}",
+        rows.len(),
+        filtered.len(),
+        suffix
+    );
+    ui.set_port_hunter_status(SharedString::from(status));
+}
+
+/// 【任意线程可调用】执行一次端口猎手扫描并交付 UI（阻塞枚举移出运行时）。
+///
+/// 流程：读取运行期配置的显示选项 → `spawn_blocking` 执行同步 Win32 枚举
+/// （[`PortHunterModule::scan`]，结果写入模块缓存）→ UI 线程按缓存重刷列表与
+/// 状态条（搜索词即时套用）。失败路径写审计 + Toast，列表保持上次缓存不变。
+fn scan_port_hunter(
+    ui_weak: &slint::Weak<MainWindow>,
+    module: Arc<PortHunterModule>,
+    runtime_config: Arc<Mutex<AppConfig>>,
+    audit: AuditSink,
+) {
+    let weak = ui_weak.clone();
+    let module_scan = Arc::clone(&module);
+    let module_ui = Arc::clone(&module);
+    tokio::spawn(async move {
+        let show_system = {
+            let cfg = runtime_config.lock().await;
+            cfg.port_hunter.show_system_ports
+        };
+        // 同步 Win32 调用整体移出 Tokio 工作线程（毫秒级，但保持纪律）。
+        let result = tokio::task::spawn_blocking(move || module_scan.scan(show_system)).await;
+
+        match result {
+            Ok(Ok(_outcome)) => {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        // 扫描成功：缓存已在阻塞线程更新，按缓存重刷展示。
+                        refresh_port_hunter_display(&ui, &module_ui);
+                    }
+                });
+            }
+            Ok(Err(err)) => {
+                audit.record("PORT_HUNTER", "扫描监听端口", format!("失败: {err}"));
+                show_toast(&weak, &format!("端口扫描失败：{err}"));
+            }
+            Err(err) => {
+                audit.record("PORT_HUNTER", "扫描监听端口", format!("任务异常: {err}"));
+                show_toast(&weak, "端口扫描任务异常，请重试");
+            }
+        }
+    });
+}
+
+/// 打开「端口占用管理」弹窗：读取运行期配置的两个选项开关 → 注入 UI →
+/// 展示弹窗 → 立即扫描一次（打开即是最新数据）。
+fn open_port_hunter_modal(
+    ui_weak: &slint::Weak<MainWindow>,
+    module: Arc<PortHunterModule>,
+    runtime_config: Arc<Mutex<AppConfig>>,
+    audit: AuditSink,
+) {
+    let weak = ui_weak.clone();
+    tokio::spawn(async move {
+        let (confirm, show_system) = {
+            let cfg = runtime_config.lock().await;
+            (cfg.port_hunter.confirm_before_kill, cfg.port_hunter.show_system_ports)
+        };
+        let weak_ui = weak.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak_ui.upgrade() {
+                ui.set_port_confirm_before_kill(confirm);
+                ui.set_port_show_system_ports(show_system);
+                ui.set_port_hunter_search(SharedString::from(""));
+                ui.set_show_port_hunter_modal(true);
+            }
+        });
+        scan_port_hunter(&weak, module, runtime_config, audit);
+    });
+}
+
+/// 端口猎手弹窗回调的共享上下文（汇聚配置句柄 / 模块 / 审计 / UI 弱引用，
+/// 避免回调与持久化函数出现超长参数列表）。
+struct PortHunterCtx {
+    /// UI 弱引用（事件循环投递入口）。
+    ui: slint::Weak<MainWindow>,
+    /// 端口猎手模块句柄（扫描 / 终止 / 缓存）。
+    module: Arc<PortHunterModule>,
+    /// 配置管理器（原子落盘）。
+    config_mgr: Arc<ConfigManager>,
+    /// 运行期配置锁（选项读写）。
+    runtime_config: Arc<Mutex<AppConfig>>,
+    /// 全局审计日志。
+    audit: AuditSink,
+}
+
+impl PortHunterCtx {
+    /// 触发一次扫描并刷新弹窗列表（打开 / 刷新 / 选项重过滤共用）。
+    fn scan(&self) {
+        scan_port_hunter(
+            &self.ui,
+            Arc::clone(&self.module),
+            Arc::clone(&self.runtime_config),
+            self.audit.clone(),
+        );
+    }
+
+    /// 持久化端口猎手的一个布尔选项（`confirm` / `system`）到配置节并落盘。
+    ///
+    /// `rescan` 为 `true` 时落盘成功后立即重新扫描刷新列表（「显示系统服务与
+    /// 高位端口」切换的即时重过滤语义）；失败仅告警——内存态已改，下次启动按
+    /// 配置收敛。
+    fn persist_option(&self, field: &'static str, value: bool, rescan: bool) {
+        let weak = self.ui.clone();
+        let config_mgr = Arc::clone(&self.config_mgr);
+        let runtime_config = Arc::clone(&self.runtime_config);
+        let audit = self.audit.clone();
+        let module = Arc::clone(&self.module);
+        tokio::spawn(async move {
+            let snapshot = {
+                let mut cfg = runtime_config.lock().await;
+                match field {
+                    "confirm" => cfg.port_hunter.confirm_before_kill = value,
+                    "system" => cfg.port_hunter.show_system_ports = value,
+                    other => {
+                        tracing::warn!(target: "main", "未知的端口猎手选项字段: {other}");
+                        return;
+                    }
+                }
+                cfg.clone()
+            };
+            // v0.5.1 状态写回 UI：此前只写配置不写回 UI 属性，CheckBox 的
+            // `checked: root.show-system-ports` 单向绑定会在弹窗重开时把视觉
+            // 拉回旧值——「显示系统服务与高位端口」复选框失效 + 状态脱节。
+            // 写回后，复选框视觉 / 配置 / 过滤结果（refresh_port_hunter_display
+            // 读取的正是本属性）三方收敛；排队的顺序保证本写回先于下方 rescan
+            // 的展示刷新执行。
+            let sync_weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = sync_weak.upgrade() {
+                    match field {
+                        "confirm" => ui.set_port_confirm_before_kill(value),
+                        "system" => ui.set_port_show_system_ports(value),
+                        _ => {}
+                    }
+                }
+            });
+            let label = if field == "confirm" {
+                "二次确认"
+            } else {
+                "显示系统服务与高位端口"
+            };
+            match config_mgr.save(&snapshot).await {
+                Ok(()) => {
+                    audit.record(
+                        "PORT_HUNTER",
+                        format!(
+                            "配置选项: {label} -> {}",
+                            if value { "开启" } else { "关闭" }
+                        ),
+                        "成功",
+                    );
+                    show_toast(&weak, &format!("{}已{}", label, if value { "开启" } else { "关闭" }));
+                }
+                Err(err) => {
+                    audit.record(
+                        "PORT_HUNTER",
+                        format!(
+                            "配置选项: {label} -> {}",
+                            if value { "开启" } else { "关闭" }
+                        ),
+                        format!("保存失败: {err}"),
+                    );
+                    tracing::error!(target: "main", "端口猎手选项落盘失败（{field}={value}）: {err}");
+                    show_toast(&weak, "配置保存失败，请重试");
+                }
+            }
+            if rescan {
+                scan_port_hunter(&weak, module, runtime_config, audit);
+            }
+        });
+    }
+}
+
+/// 【任意线程可调用】执行一次「一键释放」（终止占用进程）。
+///
+/// 线程模型：Win32 终止动作经 `spawn_blocking` 移出运行时（毫秒级）；成败均写
+/// 全局审计日志（`[PORT_HUNTER]` 类别，含端口 / 协议 / 进程 / PID / 结果）与
+/// 模块明细日志（在 [`PortHunterModule::kill`] 内部）；成功 / UIPI 拦截的 Toast
+/// 由 killer 经事件总线发布；其他失败在此补一条通用失败 Toast；随后立即重扫
+/// 列表收敛（进程可能已被外部终止）。
+fn handle_port_kill(
+    ui_weak: &slint::Weak<MainWindow>,
+    module: Arc<PortHunterModule>,
+    runtime_config: Arc<Mutex<AppConfig>>,
+    audit: AuditSink,
+    pid: i32,
+    port: i32,
+    protocol: String,
+) {
+    let weak = ui_weak.clone();
+    let module_kill = Arc::clone(&module);
+    let module_after = Arc::clone(&module);
+    tokio::spawn(async move {
+        let pid_u = pid as u32;
+        let port_u = port as u16;
+        let protocol_text = protocol.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            module_kill.kill(pid_u, port_u, &protocol_text)
+        })
+        .await;
+
+        match report {
+            Ok(report) => {
+                let detail = format!(
+                    "释放端口: {port_u} ({}), 终止进程: {} (PID: {pid_u})",
+                    protocol, report.process_name
+                );
+                if report.is_success() {
+                    audit.record("PORT_HUNTER", detail, "成功");
+                } else {
+                    let err = report.outcome.as_ref().expect_err("失败路径必有错误");
+                    let result_text = if err.is_access_denied() {
+                        "失败: 需要管理员权限（UIPI 拦截）".to_string()
+                    } else {
+                        format!("失败: {err}")
+                    };
+                    audit.record("PORT_HUNTER", detail, result_text);
+                    // UIPI 拦截的 Toast 已由 killer 经总线发布；此处只补其他失败。
+                    if !err.is_access_denied() {
+                        show_toast(&weak, &format!("释放端口 {port_u} 失败：{err}"));
+                    }
+                }
+            }
+            Err(err) => {
+                audit.record(
+                    "PORT_HUNTER",
+                    format!("释放端口: {port_u} ({protocol})"),
+                    format!("任务异常: {err}"),
+                );
+                show_toast(&weak, "释放端口任务异常，请重试");
+            }
+        }
+        // 操作落定：重扫列表收敛（含进程已被外部终止的残留行清理）。
+        scan_port_hunter(&weak, module_after, runtime_config, audit);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,8 +1438,13 @@ fn request_show_main_window(ui_weak: &slint::Weak<MainWindow>) {
 ///
 /// 顺序逐模块 toggle：调度器在每次落定后广播真实状态（驱动 UI 开关与托盘
 /// 菜单文案回流）；单模块失败仅告警并继续，不中断整体操作。
+/// v0.5.0：跳过无常驻后台开关的模块（`port_hunter` 即开即用工具——全部切换
+/// 不应对其产生任何副作用）。
 async fn set_all_modules(manager: &SharedManager, enable: bool) {
     for meta in manager.get_metadata_list() {
+        if !module_is_toggleable(meta.id) {
+            continue; // 即开即用工具：不参与全量启停
+        }
         if meta.running == enable {
             continue; // 已处于目标状态，幂等跳过
         }
@@ -1426,6 +1733,15 @@ async fn main() -> Result<(), AppError> {
         Arc::clone(&runtime_config),
     ));
     module_mgr.register(topmost_manager.clone());
+    //      本地开发端口猎手（v0.5.0）：即开即用工具——不注册后台常驻轮询，以
+    //      有效日志目录（缺省 exe 同级 logs/port_hunter）装配模块专属明细日志器，
+    //      事件总线供「一键释放」的成功 / UIPI 拦截 Toast 出口。**不**进入
+    //      auto_start_modules 默认列表（无后台运行态，见 module_is_toggleable）。
+    let port_hunter = Arc::new(PortHunterModule::new(
+        app_config.effective_port_hunter_log_dir(),
+    ));
+    port_hunter.attach_bus(Some(event_bus.clone()));
+    module_mgr.register(port_hunter.clone());
     let shared_mgr: SharedManager = Arc::new(module_mgr);
     let registered_modules: Vec<&str> = shared_mgr
         .get_metadata_list()
@@ -1485,6 +1801,12 @@ async fn main() -> Result<(), AppError> {
     set_captures_model(&ui, popup_blocker.captures());
     ui.set_update_status(SharedString::from(""));
     ui.set_update_available(false);
+    // v0.5.0 端口猎手初始选项状态（弹窗打开前保持与配置一致；打开时再重读）。
+    ui.set_port_confirm_before_kill(app_config.port_hunter.confirm_before_kill);
+    ui.set_port_show_system_ports(app_config.port_hunter.show_system_ports);
+    ui.set_port_hunter_search(SharedString::from(""));
+    ui.set_port_hunter_entries(ModelRc::new(VecModel::from(Vec::<PortEntryItem>::new())));
+    ui.set_port_hunter_status(SharedString::from("打开弹窗后自动扫描本地监听端口"));
     tracing::info!(
         target: "main",
         "UI 已实例化，初始注入 {} 个模块（提权展示形态: {}）",
@@ -1526,6 +1848,11 @@ async fn main() -> Result<(), AppError> {
     let toggle_cfg = Arc::clone(&config_mgr);
     let toggle_runtime = Arc::clone(&runtime_config);
     ui.on_toggle_module(move |id, enable| {
+        // v0.5.0：即开即用工具（port_hunter）无常驻开关，卡片不渲染物理开关；
+        // 此处防御性拦截（全量切换等路径的兜底），避免产生无意义的状态广播。
+        if !module_is_toggleable(id.as_str()) {
+            return;
+        }
         let manager = Arc::clone(&manager_for_toggle);
         let audit = toggle_audit.clone();
         let cfg_mgr = Arc::clone(&toggle_cfg);
@@ -1665,6 +1992,8 @@ async fn main() -> Result<(), AppError> {
     let open_cfg = Arc::clone(&runtime_config);
     let open_ui = ui.as_weak();
     let open_topmost_module = Arc::clone(&topmost_manager);
+    let open_port_module = Arc::clone(&port_hunter);
+    let open_port_audit = audit.clone();
     ui.on_open_module_settings(move |module_id| {
         let weak = open_ui.clone();
         match module_id.as_str() {
@@ -1691,6 +2020,15 @@ async fn main() -> Result<(), AppError> {
                 if let Some(ui) = weak.upgrade() {
                     ui.set_show_topmost_modal(true);
                 }
+            }
+            "port_hunter" => {
+                // 读取配置选项 → 展示弹窗 → 立即扫描（v0.5.0，见 8.9 的接线）。
+                open_port_hunter_modal(
+                    &weak,
+                    Arc::clone(&open_port_module),
+                    Arc::clone(&open_cfg),
+                    open_port_audit.clone(),
+                );
             }
             other => {
                 tracing::warn!(target: "main", "模块 {other} 尚无设置面板实现（齿轮点击忽略）");
@@ -2030,6 +2368,87 @@ async fn main() -> Result<(), AppError> {
             prio_tm_audit.clone(),
             hwnd_value as isize,
             priority,
+        );
+    });
+
+    // 8.9 端口占用管理（v0.5.0）弹窗回调接线：
+    //     - close_port_hunter_modal：弹窗右上角「×」/ 点击遮罩空白 → 复位显隐；
+    //     - refresh_port_hunter：顶栏「刷新」→ 重新扫描监听端口并重刷列表；
+    //     - port_hunter_search_changed：搜索框实时输入 → 客户端即时过滤（阶段
+    //       2/4 + 搜索匹配全部走纯函数，零重新枚举）+ 关键词写入模块明细日志
+    //       （含显式端口豁免提示）；
+    //     - port_confirm_toggled：复选「二次确认」→ 即时保存配置（不重扫）；
+    //     - port_system_toggled：复选「显示系统服务与高位端口」→ 即时保存配置
+    //       并**立即重新扫描**使显隐选项生效；
+    //     - port_kill_requested(pid, port, protocol)：「一键释放」/ 行内确认 →
+    //       终止进程（审计 + Toast + 重扫收敛，见 handle_port_kill）。
+    let close_ph_ui = ui.as_weak();
+    ui.on_close_port_hunter_modal(move || {
+        if let Some(ui) = close_ph_ui.upgrade() {
+            ui.set_show_port_hunter_modal(false);
+        }
+    });
+
+    // 端口猎手弹窗共享上下文：供刷新（scan）与选项切换（即时保存 + 可选重扫）复用。
+    let ph_ctx = Arc::new(PortHunterCtx {
+        ui: ui.as_weak(),
+        module: Arc::clone(&port_hunter),
+        config_mgr: Arc::clone(&config_mgr),
+        runtime_config: Arc::clone(&runtime_config),
+        audit: audit.clone(),
+    });
+
+    let refresh_ph_ctx = Arc::clone(&ph_ctx);
+    ui.on_refresh_port_hunter(move || {
+        refresh_ph_ctx.scan();
+    });
+
+    let search_ph_ui = ui.as_weak();
+    let search_ph_module = Arc::clone(&port_hunter);
+    ui.on_port_hunter_search_changed(move |text| {
+        // 关键词留痕（含显式端口豁免提示）：仅记录非空输入。
+        if !text.trim().is_empty() {
+            search_ph_module.log_search(text.as_str());
+        }
+        if let Some(ui) = search_ph_ui.upgrade() {
+            refresh_port_hunter_display(&ui, &search_ph_module);
+        }
+    });
+
+    let confirm_ph_ctx = Arc::clone(&ph_ctx);
+    ui.on_port_confirm_toggled(move |checked| {
+        // v0.5.1 调试输出：验证 CheckBox 状态变更到达 Rust 侧（真机排查复选框
+        // 失效用；debug 构建打印到终端，release 走下方 tracing 落盘日志）。
+        println!("[PORT] Checkbox toggled, new state: {}", checked);
+        tracing::info!(target: "main", "[PORT] 二次确认 CheckBox -> {checked}");
+        confirm_ph_ctx.persist_option("confirm", checked, false);
+    });
+
+    let system_ph_ctx = Arc::clone(&ph_ctx);
+    ui.on_port_system_toggled(move |checked| {
+        // v0.5.1 调试输出（用户要求）：复选框每次切换都必须能在启动日志中看到
+        // 新状态；该值经双向绑定同步回 UI 属性并驱动下方 rescan 的物理重扫。
+        println!("[PORT] Checkbox toggled, new state: {}", checked);
+        tracing::info!(
+            target: "main",
+            "[PORT] 显示系统服务与高位端口 CheckBox -> {checked}"
+        );
+        system_ph_ctx.persist_option("system", checked, true);
+    });
+
+    let kill_ph_ui = ui.as_weak();
+    let kill_ph_module = Arc::clone(&port_hunter);
+    let kill_ph_runtime = Arc::clone(&runtime_config);
+    let kill_ph_audit = audit.clone();
+    ui.on_port_kill_requested(move |pid, port, protocol| {
+        handle_port_kill(
+            &kill_ph_ui,
+            Arc::clone(&kill_ph_module),
+            Arc::clone(&kill_ph_runtime),
+            kill_ph_audit.clone(),
+            pid,
+            port,
+            protocol.to_string(),
         );
     });
 

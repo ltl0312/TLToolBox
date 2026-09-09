@@ -38,6 +38,10 @@ pub const DEFAULT_APP_LOG_DIR: &str = "logs";
 /// `popup_screenshot_dir` 缺省时使用）。
 pub const DEFAULT_POPUP_SCREENSHOT_DIR: &str = "logs/popup_screenshots";
 
+/// 本地开发端口猎手模块专属日志目录的默认相对路径（相对 exe 同级目录；
+/// `port_hunter.log_dir` 缺省时使用）。
+pub const DEFAULT_PORT_HUNTER_LOG_DIR: &str = "logs/port_hunter";
+
 /// 终端日志保留期限的默认值（天）：超过该期限的 `.log` / `.state.log`
 /// 会话日志由终端日志模块的过期清理守护自动删除，防止日志碎文件无限积压。
 ///
@@ -174,6 +178,9 @@ pub struct AppConfig {
     ///   1~9，1 最顶层），模块启动时按规则枚举窗口自动恢复上次会话的置顶。
     #[serde(default)]
     pub topmost_manager: TopmostManagerConfig,
+    /// 本地开发端口猎手（v0.5.0，见 [`PortHunterConfig`]）。
+    #[serde(default)]
+    pub port_hunter: PortHunterConfig,
 }
 
 /// 全局窗口置顶守护（v0.4.0）的配置节。
@@ -201,6 +208,53 @@ pub struct PinnedRule {
     pub priority: u8,
     /// 规则是否启用（`false` 的规则在启动恢复时跳过）。
     pub enabled: bool,
+}
+
+/// 本地开发端口猎手（v0.5.0）的配置节。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortHunterConfig {
+    /// 释放端口（终止进程）前是否要求用户二次确认（默认 `true`）。
+    ///
+    /// UI「端口占用管理」弹窗的「二次确认」复选开关绑定本字段，切换即保存。
+    #[serde(default = "PortHunterConfig::default_confirm_before_kill")]
+    pub confirm_before_kill: bool,
+    /// 是否默认显示系统服务与动态高位端口（默认 `false`）。
+    ///
+    /// 为 `false` 时四重降噪过滤的「动态端口」与「系统服务黑名单」两阶段生效
+    /// （见 [`crate::modules::port_hunter::scanner`]）；为 `true` 时全部展示。
+    #[serde(default)]
+    pub show_system_ports: bool,
+    /// 模块专属日志（`port_hunter.log`）的落盘目录。
+    ///
+    /// `None`（缺省 / 旧配置无此键）→ 消费方回退为 exe 同级
+    /// `logs/port_hunter`（见 [`DEFAULT_PORT_HUNTER_LOG_DIR`]）；显式给出时按
+    /// [`resolve_app_path`] 语义锚定。消费方必须经
+    /// [`AppConfig::effective_port_hunter_log_dir`] 取最终目录。
+    #[serde(
+        default = "PortHunterConfig::default_log_dir",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub log_dir: Option<PathBuf>,
+}
+
+impl PortHunterConfig {
+    fn default_confirm_before_kill() -> bool {
+        true
+    }
+
+    fn default_log_dir() -> Option<PathBuf> {
+        None
+    }
+}
+
+impl Default for PortHunterConfig {
+    fn default() -> Self {
+        Self {
+            confirm_before_kill: Self::default_confirm_before_kill(),
+            show_system_ports: false,
+            log_dir: Self::default_log_dir(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -295,6 +349,18 @@ impl AppConfig {
             None => resolve_app_path(Path::new(DEFAULT_POPUP_SCREENSHOT_DIR)),
         }
     }
+
+    /// 端口猎手专属日志目录的**有效路径**（消费方唯一入口）。
+    ///
+    /// `port_hunter.log_dir` 为 `None`（缺省 / 旧配置）时回退到可执行文件同级目录
+    /// 下的 `logs/port_hunter`（见 [`DEFAULT_PORT_HUNTER_LOG_DIR`] 与
+    /// [`resolve_app_path`]）；显式给出时按绝对 / exe 锚定语义处理相对路径。
+    pub fn effective_port_hunter_log_dir(&self) -> PathBuf {
+        match &self.port_hunter.log_dir {
+            Some(dir) => resolve_app_path(dir),
+            None => resolve_app_path(Path::new(DEFAULT_PORT_HUNTER_LOG_DIR)),
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -311,6 +377,7 @@ impl Default for AppConfig {
             enabled_shells: Self::default_enabled_shells(),
             module_custom_params: HashMap::new(),
             topmost_manager: TopmostManagerConfig::default(),
+            port_hunter: PortHunterConfig::default(),
         }
     }
 }
@@ -1441,6 +1508,139 @@ mod tests {
         assert!(memory_rule.title_pattern.is_empty(), "记忆规则标题模式应为空串");
         assert_eq!(memory_rule.priority, 7);
         assert!(!memory_rule.enabled, "记忆规则必须保持 enabled = false");
+
+        remove_if_exists(&path).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 本地开发端口猎手配置节（v0.5.0）
+    // -----------------------------------------------------------------------
+
+    /// 端口猎手默认值：释放前二次确认开启、不显示系统服务与高位端口、日志目录
+    /// 缺省（None → 回退 exe 同级 logs/port_hunter）；旧配置缺省该节时同样回退。
+    #[test]
+    fn port_hunter_defaults_are_safe_and_legacy_configs_fall_back() {
+        let cfg = AppConfig::default();
+        assert!(
+            cfg.port_hunter.confirm_before_kill,
+            "释放端口前默认必须二次确认（危险操作默认加护）"
+        );
+        assert!(
+            !cfg.port_hunter.show_system_ports,
+            "系统服务与高位端口默认应隐藏（降噪过滤生效）"
+        );
+        assert_eq!(
+            cfg.port_hunter.log_dir, None,
+            "日志目录默认不应显式指定（None → 回退 exe 同级 logs/port_hunter）"
+        );
+
+        // 旧配置缺省 [port_hunter] 节时应回退同等的默认值（serde(default) 语义）。
+        let toml_text = "auto_start_modules = [\"popup_blocker\"]\n";
+        let parsed: AppConfig = toml::from_str(toml_text).expect("旧配置应可解析");
+        assert_eq!(
+            parsed.port_hunter,
+            PortHunterConfig::default(),
+            "旧配置缺省 port_hunter 节应回退默认值"
+        );
+    }
+
+    /// 端口猎手日志目录：None 时 effective 必须落在 exe 同级 logs/port_hunter；
+    /// 显式绝对 / 相对路径按 resolve_app_path 语义解析。
+    #[test]
+    fn port_hunter_log_dir_resolves_default_and_explicit_paths() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.port_hunter.log_dir, None, "前置条件：默认无显式目录");
+        let effective = cfg.effective_port_hunter_log_dir();
+        assert!(
+            effective.is_absolute(),
+            "回退目录应为绝对路径（exe 锚定），实际: {}",
+            effective.display()
+        );
+        assert!(
+            effective.ends_with(Path::new(DEFAULT_PORT_HUNTER_LOG_DIR)),
+            "回退目录应以 logs/port_hunter 收尾，实际: {}",
+            effective.display()
+        );
+
+        // 显式绝对路径：原样返回。
+        let abs = std::env::temp_dir().join("tltoolbox-port-hunter-logs");
+        let mut cfg = AppConfig::default();
+        cfg.port_hunter.log_dir = Some(abs.clone());
+        assert_eq!(cfg.effective_port_hunter_log_dir(), abs, "显式绝对路径应原样返回");
+
+        // 显式相对路径：锚定 exe 目录（与 CWD 解耦）。
+        cfg.port_hunter.log_dir = Some(PathBuf::from("data/port-hunter-logs"));
+        let effective = cfg.effective_port_hunter_log_dir();
+        assert!(effective.is_absolute(), "相对路径应被锚定为绝对路径");
+        assert!(
+            effective.ends_with(Path::new("data").join("port-hunter-logs")),
+            "锚定结果应以 data/port-hunter-logs 收尾"
+        );
+    }
+
+    /// [port_hunter] 配置节的 TOML 往返：二次确认 / 显示系统端口 / 日志目录
+    /// 三字段逐字保真；None 的 log_dir 键不序列化落盘。
+    #[tokio::test]
+    async fn port_hunter_section_roundtrips_through_toml() {
+        let path = temp_cfg_path("port-hunter");
+        remove_if_exists(&path).await;
+
+        let cfg = AppConfig {
+            port_hunter: PortHunterConfig {
+                confirm_before_kill: false,
+                show_system_ports: true,
+                log_dir: Some(PathBuf::from("custom/port-hunter-logs")),
+            },
+            ..AppConfig::default()
+        };
+
+        let mgr = ConfigManager::new(&path);
+        mgr.save(&cfg).await.expect("保存应成功");
+        let loaded = mgr.load().await.expect("加载应成功");
+        assert_eq!(loaded, cfg, "端口猎手配置节应逐字段往返一致");
+        assert!(!loaded.port_hunter.confirm_before_kill);
+        assert!(loaded.port_hunter.show_system_ports);
+        assert_eq!(
+            loaded.port_hunter.log_dir,
+            Some(PathBuf::from("custom/port-hunter-logs"))
+        );
+
+        remove_if_exists(&path).await;
+    }
+
+    /// 显式声明 [port_hunter] 配置节时应原样解析；None 的 log_dir 键不得落盘。
+    #[tokio::test]
+    async fn port_hunter_section_parses_when_present() {
+        let path = temp_cfg_path("port-hunter-section");
+        remove_if_exists(&path).await;
+        fs::write(
+            &path,
+            "[port_hunter]\n\
+             confirm_before_kill = false\n\
+             show_system_ports = true\n\
+             log_dir = \"data/port-hunter\"\n",
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let cfg = mgr.load().await.expect("含端口猎手配置节的 TOML 应正常解析");
+        assert!(!cfg.port_hunter.confirm_before_kill);
+        assert!(cfg.port_hunter.show_system_ports);
+        assert_eq!(
+            cfg.port_hunter.log_dir,
+            Some(PathBuf::from("data/port-hunter")),
+            "显式目录应原样读入（相对路径由 effective 访问器消费时再锚定）"
+        );
+        // 其余键缺省仍回退默认值，互不影响。
+        assert_eq!(cfg.auto_start_modules, AppConfig::default().auto_start_modules);
+
+        // None 的 log_dir 键不应序列化落盘（与 terminal_log_dir 等既有约定一致）。
+        let serialized = toml::to_string_pretty(&AppConfig::default()).expect("序列化应成功");
+        assert!(
+            !serialized.contains("log_dir"),
+            "None 的 log_dir 键不应落盘: {serialized}"
+        );
 
         remove_if_exists(&path).await;
     }

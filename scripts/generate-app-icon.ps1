@@ -14,6 +14,10 @@
        + 白色系 "TL" 字母组合（Segoe UI Bold，白→淡蓝渐变，
        经 GraphicsPath 统一缩放，各尺寸几何一致）
        + 品牌蓝圆头短横线（工具箱“抽屉/底座”点缀）。
+       + Safe Padding（v0.5.1）：字形包络盒四周 ≥10% 安全边距（顶部尤甚）——
+         Windows 11 任务栏对图标缩放居中时会裁切顶缘，字形贴近画布顶/边时
+         "T" 顶横会被直接削掉。生成末尾自动校验 16×16 帧字形边距，
+         任一方向 < 10% 即抛错终止（见 Assert-SafePadding）。
 
   依赖：Windows PowerShell 5.1（System.Drawing / GDI+）。
        PowerShell 7+（pwsh core）不内置 System.Drawing，请用
@@ -65,8 +69,10 @@ function New-RoundedRectPath([float]$x, [float]$y, [float]$w, [float]$h, [float]
 # ---------------------------------------------------------------------------
 #   bg ：圆角方块铺满画布（全出血），圆角半径 ~ 21.5%
 #   rim：S>=32 时 1px 细描边，压住暗底在浅色/深色托盘的边界
-#   glyph "TL"：字母包络盒约占边长 62%（宽）× 42%（高），光学中心略偏上
-#   accent：品牌蓝圆头短横线，位于字母下方 ~ 8.5% 边距处，呼应“工具箱底座”
+#   glyph "TL"：字母包络盒约占边长 56%（宽）× 38%（高），光学中心略偏下
+#       （Safe Padding：四周 ≥10% 边距，顶部最充裕——任务栏缩放居中不削 "T" 顶横）
+#   accent：品牌蓝圆头短横线，位于字母下方 ~25% 边距处（v0.5.1 自 8.5% 上移，
+#       底线内容同样须落在 ≥20% 安全呼吸边距内），呼应“工具箱底座”
 
 $BgTop   = From-Hex '#262C3B'   # 背景渐变上（略亮的深蓝灰）
 $BgBot   = From-Hex '#10131B'   # 背景渐变下（近黑）
@@ -75,7 +81,7 @@ $GlyphTop = From-Hex '#F7FAFF'  # 字母渐变上（近白）
 $GlyphBot = From-Hex '#93B0F2'  # 字母渐变下（淡蓝，呼应品牌 #2D74E8）
 $Accent   = From-Hex '#4D9BFF'  # 品牌蓝点缀横线
 
-function New-AppFrame([int]$S) {
+function New-AppFrame([int]$S, [ValidateSet('ico', 'png')][string]$Target = 'ico') {
     $bmp = New-Object System.Drawing.Bitmap($S, $S, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
@@ -91,7 +97,9 @@ function New-AppFrame([int]$S) {
         $bgRect, $BgTop, $BgBot,
         [System.Drawing.Drawing2D.LinearGradientMode]::Vertical)
     $g.FillPath($bgBrush, $bgPath)
-    if ($S -ge 32) {
+    # PNG 目标（窗口图标）不画 rim：避免 256 帧外圈半透明描边干扰边距校验，
+    # 且大图标下 rim 本来就不可见。
+    if ($S -ge 32 -and $Target -eq 'ico') {
         $rimPen = New-Object System.Drawing.Pen($Rim, 1.0)
         $g.DrawPath($rimPen, $bgPath)
         $rimPen.Dispose()
@@ -109,11 +117,20 @@ function New-AppFrame([int]$S) {
         (New-Object System.Drawing.PointF(0.0, 0.0)),
         [System.Drawing.StringFormat]::GenericTypographic)
 
-    # 字母包络盒：占边长 62% 宽 × 42% 高，中心在 (0.50S, 0.525S)
-    $boxW = $S * 0.62
-    $boxH = $S * 0.42
+    # 字形包络盒（Safe Padding 参数化）：
+    #   - ico 目标（exe 资源 / 托盘）：56% 宽 × 38% 高，四周边距 ≥ 10%；
+    #   - png 目标（Slint 窗口图标，Windows 任务栏原生取用）：44% 宽 × 30% 高，
+    #     四周留足 ≥ 20% 安全呼吸边距——任务栏缩放居中绝不削 "TL" 顶缘。
+    # 两种目标光学中心一致（0.50S, 0.545S，略偏下让顶部边距最充裕）。
+    if ($Target -eq 'png') {
+        $boxW = $S * 0.44
+        $boxH = $S * 0.30
+    } else {
+        $boxW = $S * 0.56
+        $boxH = $S * 0.38
+    }
     $cx = $S * 0.50
-    $cy = $S * 0.525
+    $cy = $S * 0.545
     $bb = $glyphPath.GetBounds()
     $scale = [Math]::Min($boxW / $bb.Width, $boxH / $bb.Height)
     if ($scale -le 0) { $scale = 0.8 }
@@ -131,8 +148,11 @@ function New-AppFrame([int]$S) {
     $g.FillPath($glyphBrush, $glyphPath)
 
     # ---- 3) 品牌蓝圆头短横线（工具箱底座点缀；S=16 时退化为 1px） ----
+    # v0.5.1：基线由 0.845S 上移至 0.75S——底线内容（点缀横线）同样必须落在
+    # ≥20% 安全呼吸边距内（0.75S 距底边 25%）。20% 边距约束对**一切可见内容**
+    # 生效，而不只针对字形（否则 256px 校验会把横线判为越界）。
     if ($S -ge 16) {
-        $lineY = [float]($S * 0.845)
+        $lineY = [float]($S * 0.75)
         $lineX0 = [float]($S * 0.235)
         $lineX1 = [float]($S * 0.765)
         $penW = [Math]::Max(1.0, $S * 0.055)
@@ -223,6 +243,107 @@ foreach ($S in $sizes) {
     $bmp.Dispose()
 }
 
+<#
+  校验 16×16 帧字形安全边距（Safe Padding）：任何方向 < 10% 即抛错终止。
+
+  读取容器首帧（DIB：40 字节 BITMAPINFOHEADER + 自底向上 BGRA XOR + AND 掩码），
+  按亮度阈值（R+G+B > 420）圈定 "TL" 字形墨迹 bbox，四个方向边距均须
+  >= 10% 画布边长——Windows 11 任务栏缩放居中时会裁切图标顶缘，字形贴近
+  画布顶/边即被削掉。亮阈值高于背景（#262C3B → #10131B 均 < 200）且低于
+  字形渐变（#F7FAFF → #93B0F2 均 > 420），无 rim 干扰（16×16 不画描边）。
+#>
+function Assert-SafePadding([byte[]]$IcoBytes) {
+    $base = 6
+    $S = $IcoBytes[$base]
+    if ($S -ne 16) { throw "Safe Padding 校验仅支持首帧 16×16（实际 ${S}×${S}）" }
+    $len = [BitConverter]::ToUInt32($IcoBytes, $base + 8)
+    $off = [BitConverter]::ToUInt32($IcoBytes, $base + 12)
+    $data = New-Object byte[] ($len)
+    [Array]::Copy($IcoBytes, $off, $data, 0, $len)
+
+    $minX = $S; $minY = $S; $maxX = -1; $maxY = -1
+    for ($row = 0; $row -lt $S; $row++) {
+        $srcRow = 40 + ($S - 1 - $row) * ($S * 4)   # DIB 自底向上
+        for ($x = 0; $x -lt $S; $x++) {
+            $o = $srcRow + $x * 4
+            $sum = [int]$data[$o] + [int]$data[$o + 1] + [int]$data[$o + 2]
+            if (($data[$o + 3] -gt 0) -and ($sum -gt 420)) {
+                if ($x -lt $minX) { $minX = $x }
+                if ($x -gt $maxX) { $maxX = $x }
+                if ($row -lt $minY) { $minY = $row }
+                if ($row -gt $maxY) { $maxY = $row }
+            }
+        }
+    }
+    if ($maxX -lt 0) { throw 'Safe Padding 校验失败：16×16 帧未检测到字形墨迹' }
+
+    $margins = @{
+        Left   = [double]$minX / $S
+        Top    = [double]$minY / $S
+        Right  = [double]($S - 1 - $maxX) / $S
+        Bottom = [double]($S - 1 - $maxY) / $S
+    }
+    $fail = @()
+    foreach ($k in 'Left', 'Top', 'Right', 'Bottom') {
+        $pct = [math]::Round($margins[$k] * 100.0, 1)
+        $ok = $margins[$k] -ge 0.10
+        Write-Host ("  字形 {0} 边距: {1}%{2}" -f $k, $pct, $(if ($ok) { '' } else { '  < 10% —— FAIL' }))
+        if (-not $ok) { $fail += $k }
+    }
+    if ($fail.Count -gt 0) {
+        throw ("Safe Padding 校验失败：字形 {0} 边距不足 10% —— 请回调字形包络盒参数后重新生成。" -f ($fail -join ' / '))
+    }
+    Write-Host '  Safe Padding 校验通过：字形四周边距均 ≥ 10%'
+}
+
+<#
+  校验 res/app.png 的字形安全呼吸边距：任何方向 < 20% 即抛错终止。
+
+  读取 256×256 PNG（png 目标不画 rim，亮像素即字形墨迹，无描边干扰），
+  按亮度阈值（R+G+B > 420）圈定 "TL" 字形墨迹 bbox，四个方向边距均须
+  >= 20% 画布边长——Slint 窗口图标经 winit 交给任务栏缩放居中渲染，
+  边距不足时 "T" 顶横会被直接削掉。
+#>
+function Assert-PngSafePadding([string]$PngPath) {
+    $bmp = New-Object System.Drawing.Bitmap($PngPath)
+    try {
+        $S = [Math]::Min($bmp.Width, $bmp.Height)
+        if ($S -ne 256) { throw "PNG Safe Padding 校验仅支持 256×256（实际 $($bmp.Width)x$($bmp.Height)）" }
+        $minX = $S; $minY = $S; $maxX = -1; $maxY = -1
+        for ($y = 0; $y -lt $S; $y++) {
+            for ($x = 0; $x -lt $S; $x++) {
+                $c = $bmp.GetPixel($x, $y)
+                if (($c.A -gt 0) -and (($c.R + $c.G + $c.B) -gt 420)) {
+                    if ($x -lt $minX) { $minX = $x }
+                    if ($x -gt $maxX) { $maxX = $x }
+                    if ($y -lt $minY) { $minY = $y }
+                    if ($y -gt $maxY) { $maxY = $y }
+                }
+            }
+        }
+        if ($maxX -lt 0) { throw 'PNG Safe Padding 校验失败：未检测到字形墨迹' }
+        $margins = @{
+            Left   = [double]$minX / $S
+            Top    = [double]$minY / $S
+            Right  = [double]($S - 1 - $maxX) / $S
+            Bottom = [double]($S - 1 - $maxY) / $S
+        }
+        $fail = @()
+        foreach ($k in 'Left', 'Top', 'Right', 'Bottom') {
+            $pct = [math]::Round($margins[$k] * 100.0, 1)
+            $ok = $margins[$k] -ge 0.20
+            Write-Host ("  字形 {0} 呼吸边距: {1}%{2}" -f $k, $pct, $(if ($ok) { '' } else { '  < 20% —— FAIL' }))
+            if (-not $ok) { $fail += $k }
+        }
+        if ($fail.Count -gt 0) {
+            throw ("PNG Safe Padding 校验失败：字形 {0} 呼吸边距不足 20% —— 请回调字形包络盒参数后重新生成。" -f ($fail -join ' / '))
+        }
+        Write-Host '  PNG Safe Padding 校验通过：字形四周边距均 ≥ 20%'
+    } finally {
+        $bmp.Dispose()
+    }
+}
+
 if (-not $PreviewOnly) {
     $outDir = Split-Path -Parent $OutIco
     if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
@@ -268,6 +389,23 @@ if (-not $PreviewOnly) {
         $kind = if ($read[$off] -eq 0x89) { 'PNG' } else { 'DIB(BMP)' }
         Write-Host ("  帧 {0}x{1}  {2}bpp  {3}  ({4} 字节)" -f $w, $h, $bpp, $kind, $len)
     }
+
+    # v0.5.1 Safe Padding 校验：字形四周边距（顶/底/左/右）均须 ≥ 10%。
+    # 16×16 帧无描边（S>=32 才画 rim），亮像素即字形墨迹，边距测量无干扰；
+    # 几何比例各帧一致，故单帧校验即代表全部尺寸。
+    Assert-SafePadding $read
+
+    # ---- v0.5.1：Slint 窗口图标 res/app.png（256×256 高清，≥20% 安全呼吸边距） ----
+    # ui/app.slint 的 MainWindow 以 `icon: @image-url("../res/app.png")` 声明，
+    # Slint/winit 在 Win32 CreateWindow 时原生绑定该图——四周留足 20% 边距，
+    # Windows 11 任务栏缩放居中绝不削 "TL" 顶缘（详见 New-AppFrame 的 png 目标）。
+    $pngPath = Join-Path (Split-Path -Parent $OutIco) 'app.png'
+    $pngFull = [System.IO.Path]::GetFullPath($pngPath)
+    $pngBmp = New-AppFrame 256 'png'
+    $pngBmp.Save($pngFull, [System.Drawing.Imaging.ImageFormat]::Png)
+    $pngBmp.Dispose()
+    Write-Host "已生成 $pngFull（256×256 PNG，窗口 / 任务栏图标）"
+    Assert-PngSafePadding $pngFull
 }
 
 # ---------------------------------------------------------------------------

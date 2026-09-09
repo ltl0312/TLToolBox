@@ -27,3 +27,13 @@ minimize_to_tray = true
 [topmost_manager]
 enabled = false
 pinned_rules = []
+
+# 本地开发端口猎手（v0.5.0）：
+#   confirm_before_kill：释放端口（终止进程）前是否二次确认（默认 true）；
+#   show_system_ports：是否默认显示系统服务与动态高位端口（默认 false，四重
+#            降噪过滤生效——状态 / 动态端口 / 会话隔离 / 系统服务黑名单）；
+#   log_dir：模块专属明细日志（port_hunter.log）落盘目录，缺省回退 exe 同级
+#            logs/port_hunter。
+[port_hunter]
+confirm_before_kill = true
+show_system_ports = false
