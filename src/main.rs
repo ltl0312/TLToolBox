@@ -1109,8 +1109,8 @@ fn check_for_updates(ui_weak: &slint::Weak<MainWindow>, audit: &AuditSink) {
 // 终端交互日志 · 存储管理设置弹窗（UI 回调 → 异步读取配置 → 回 UI 线程展示）
 // ---------------------------------------------------------------------------
 
-/// 打开「终端日志记录 - 存储管理」设置弹窗（卡片齿轮 `terminal_logger` 分派与
-/// `open_terminal_modal` 预留回调的共用入口）。
+/// 打开「终端日志记录 - 存储管理」设置弹窗（卡片齿轮 `terminal_logger` 分派的
+/// 唯一入口）。
 ///
 /// 线程模型：回调运行于 UI 线程，而读取配置需跨 `tokio::sync::Mutex`（异步锁），
 /// 同步阻塞加锁会卡住事件循环，故整体经 [`tokio::spawn`] 移出 UI 线程；解析出
@@ -1474,16 +1474,18 @@ fn deliver_module_sync(ui_weak: &slint::Weak<MainWindow>, manager: SharedManager
     queued.is_ok()
 }
 
-/// 常驻总线 → UI 转发任务：订阅 [`EventBus`]，把模块状态落定事件转发到 UI 主线程。
+/// 常驻总线 → UI 转发任务：订阅 [`EventBus`]，把模块状态落定事件转发到 UI 主线程，
+/// 并消费后台守护线程的审计 / Toast 事件。
 ///
 /// 跨线程载荷仅含 `Weak<MainWindow>`（Slint 保证 `Send`）与调度器 `Arc`（`Send`）；
 /// 真正的模型改写（`refresh_modules_model`）只会在事件循环闭包——即 UI 线程——内执行，
-/// 杜绝把 `VecModel` / `ModelRc` 移出 UI 线程。托盘指令与日志事件不属本任务职责，
-/// 分别由生命周期控制器 / tracing 承载。
+/// 杜绝把 `VecModel` / `ModelRc` 移出 UI 线程。托盘指令不属本任务职责（由生命周期
+/// 控制器承载），tracing 日志事件由 [`tracing`] 自身承载。
 async fn forward_module_events(
     mut rx: broadcast::Receiver<AppEvent>,
     manager: SharedManager,
     ui_weak: slint::Weak<MainWindow>,
+    audit: AuditSink,
 ) {
     loop {
         match rx.recv().await {
@@ -1500,13 +1502,21 @@ async fn forward_module_events(
                     break;
                 }
             }
+            Ok(AppEvent::PopupClosed { title, class_name }) => {
+                // 弹窗拦截的关键动作审计：命中黑名单 → WM_CLOSE → 本事件。
+                audit.record(
+                    "弹窗拦截",
+                    format!("已关闭目标弹窗 \"{title}\"（类名: {class_name}）"),
+                    "成功",
+                );
+            }
             Ok(AppEvent::ToastRequested(message)) => {
                 // 后台守护线程（如窗口置顶模块的泵线程遭遇 UIPI 拦截）请求的
                 // Toast：转发到统一 Toast 入口（show_toast 在 UI 线程展示）。
                 show_toast(&ui_weak, &message);
             }
             Ok(_) => {
-                // 托盘指令（TrayAction）与日志（AppLogAppended）不属本任务职责。
+                // 托盘指令（TrayAction）不属本任务职责。
             }
         }
     }
@@ -1639,8 +1649,9 @@ async fn lifecycle_controller(
                     trigger_admin_restart(&ui_weak, &audit);
                 }
             },
-            Ok(AppEvent::AppLogAppended { .. }) => {
-                // 双栏日志控制台已退役：运行日志由 tracing 承载，此处忽略。
+            Ok(AppEvent::PopupClosed { .. }) => {
+                // 弹窗关闭的审计由总线 → UI 转发任务（forward_module_events）
+                // 处置，生命周期控制器不重复处理。
             }
             Ok(AppEvent::ToastRequested(_)) => {
                 // 后台守护线程请求的 Toast 由总线 → UI 转发任务处置
@@ -1812,10 +1823,15 @@ async fn main() -> Result<(), AppError> {
     // 弹窗拦截模块：注入黑名单（配置为准）+ 截图留痕目录（v0.3.2，缺省回退
     // exe 同级 logs/popup_screenshots）。目录由配置解析为绝对路径后固化在模块内，
     // 运行期经「主设置」更改后于模块**下次启动**时生效。
-    let popup_blocker = Arc::new(PopupBlockerModule::with_rules_and_screenshot_dir(
-        app_config.popup_blacklist.clone(),
-        Some(app_config.effective_popup_screenshot_dir()),
-    ));
+    let popup_blocker = Arc::new(
+        PopupBlockerModule::with_rules_and_screenshot_dir(
+            app_config.popup_blacklist.clone(),
+            Some(app_config.effective_popup_screenshot_dir()),
+        )
+        // 事件总线：命中黑名单关闭弹窗后发布 PopupClosed 事件 → 审计留痕
+        // （forward_module_events 消费，见任务 2 的双轨日志链路）。
+        .with_bus(Some(event_bus.clone())),
+    );
     let popup_rules_count = app_config.popup_blacklist.len();
     // 显式升级为 trait 对象：先克隆具体类型再经 unsize 强转，避免推理歧义。
     let popup_module: Arc<dyn ToolModule> = popup_blocker.clone();
@@ -1904,8 +1920,20 @@ async fn main() -> Result<(), AppError> {
             continue;
         }
         match shared_mgr.toggle(module_id, true).await {
-            Ok(_) => tracing::info!(target: "main", "自动启动模块: {module_id}"),
-            Err(err) => tracing::error!(target: "main", "自动启动模块 {module_id} 失败: {err}"),
+            Ok(_) => {
+                tracing::info!(target: "main", "自动启动模块: {module_id}");
+                // 双轨日志：开机自启路径的模块启动同样经 AuditSink 规范上报
+                //（与 UI 拨动开关的「模块开关」类别同源，保证 7 模块启停全量留痕）。
+                audit.record("模块开关", format!("{module_id} -> 开启"), "成功");
+            }
+            Err(err) => {
+                tracing::error!(target: "main", "自动启动模块 {module_id} 失败: {err}");
+                audit.record(
+                    "模块开关",
+                    format!("{module_id} -> 开启"),
+                    format!("失败: {err}"),
+                );
+            }
         }
     }
 
@@ -1954,24 +1982,20 @@ async fn main() -> Result<(), AppError> {
         if elevated { "管理员徽标" } else { "提权按钮" }
     );
 
-    // ---- 7. 总线 → UI 桥：订阅总线并启动常驻转发任务（模块状态 → UI 刷新）。 ----
+    // ---- 7. 总线 → UI 桥：订阅总线并启动常驻转发任务（模块状态 → UI 刷新；
+    //          弹窗关闭审计事件 → app_audit.log）。 ----
     let bus_rx = event_bus.subscribe();
     let forwarder_ui = ui.as_weak();
     let forwarder_mgr = Arc::clone(&shared_mgr);
+    let forwarder_audit = audit.clone();
     tokio::spawn(async move {
-        forward_module_events(bus_rx, forwarder_mgr, forwarder_ui).await;
+        forward_module_events(bus_rx, forwarder_mgr, forwarder_ui, forwarder_audit).await;
     });
     tracing::info!(target: "main", "总线 → UI 转发任务已启动");
 
     // ---- 8. 回调绑定：UI 控件 → 异步动作；落定后的真实状态回流刷新（含失败回滚）。 ----
     //      回调在 UI 线程触发；实际动作派发到 Tokio 任务执行，形成
     //      “请求 → 事实 → 视图”闭环。
-
-    // 8.0 Toast 触发回调：Slint 侧 `trigger_toast(string)` 与统一 `show_toast` 同入口。
-    //     Rust 内部动作落定后直接调用 show_toast（见下述 8.2 / 8.3 / 8.4.x）；本绑定
-    //     仅为把 UI 声明的回调面接通，供未来 UI 内任意元素请求一条 Toast。
-    let toast_ui = ui.as_weak();
-    ui.on_trigger_toast(move |msg| show_toast(&toast_ui, msg.as_str()));
 
     // 8.0.1 盾牌提权按钮（仅未提权形态渲染）→ 与托盘菜单共用提权重启入口。
     //       点击后进入 UAC 确认；成功则旧进程平滑收尾退出、提权副本接管。
@@ -2142,7 +2166,7 @@ async fn main() -> Result<(), AppError> {
     //        「规则管理 + 留痕」弹窗（留痕列表随版本号订阅实时刷新，见 8.4.6）；
     //      - terminal_logger：读取当前生效的日志根目录绝对路径写入
     //        terminal_log_dir_display，并展示「终端日志记录 - 存储管理」弹窗
-    //        （与 on_open_terminal_modal 共用 open_terminal_settings 入口，见 8.4.5）；
+    //        （open_terminal_settings 入口，见 8.4.5）；
     //      - topmost_manager（v0.4.0）：重置搜索词 → 全量枚举 + 合并置顶状态刷入
     //        topmost_windows 模型 → 展示「管理窗口」弹窗（见 8.8）。
     let open_blocker = Arc::clone(&popup_blocker);
@@ -2472,18 +2496,9 @@ async fn main() -> Result<(), AppError> {
     });
 
     // 8.4.5 终端交互日志 · 存储管理弹窗回调接线：
-    //      a) open_terminal_modal：Slint 声明面的预留打开入口（与 8.4.1 的
-    //         terminal_logger 齿轮分派共用 open_terminal_settings，供未来 UI 内
-    //         任意元素直接请求打开该弹窗）；
-    //      b) close_terminal_modal：弹窗右上角「×」/ 点击遮罩空白 → 复位显隐；
-    //      c) open_log_dir_in_explorer：「在文件资源管理器中打开日志目录」主按钮
+    //      a) close_terminal_modal：弹窗右上角「×」/ 点击遮罩空白 → 复位显隐；
+    //      b) open_log_dir_in_explorer：「在文件资源管理器中打开日志目录」主按钮
     //         → 保证目录存在后以 explorer 打开并 Toast 反馈（见 helper 文档）。
-    let open_term_cfg = Arc::clone(&runtime_config);
-    let open_term_ui = ui.as_weak();
-    ui.on_open_terminal_modal(move || {
-        open_terminal_settings(&open_term_ui, Arc::clone(&open_term_cfg));
-    });
-
     let close_term_ui = ui.as_weak();
     ui.on_close_terminal_modal(move || {
         if let Some(ui) = close_term_ui.upgrade() {
@@ -2788,21 +2803,18 @@ async fn main() -> Result<(), AppError> {
 
     let confirm_ph_ctx = Arc::clone(&ph_ctx);
     ui.on_port_confirm_toggled(move |checked| {
-        // v0.5.1 调试输出：验证 CheckBox 状态变更到达 Rust 侧（真机排查复选框
-        // 失效用；debug 构建打印到终端，release 走下方 tracing 落盘日志）。
-        println!("[PORT] Checkbox toggled, new state: {}", checked);
-        tracing::info!(target: "main", "[PORT] 二次确认 CheckBox -> {checked}");
+        // 选项状态经双向绑定实时同步到 UI 属性（persist_option 内写回收敛）。
+        tracing::info!(target: "main", "端口猎手「二次确认」CheckBox -> {checked}");
         confirm_ph_ctx.persist_option("confirm", checked, false);
     });
 
     let system_ph_ctx = Arc::clone(&ph_ctx);
     ui.on_port_system_toggled(move |checked| {
-        // v0.5.1 调试输出（用户要求）：复选框每次切换都必须能在启动日志中看到
-        // 新状态；该值经双向绑定同步回 UI 属性并驱动下方 rescan 的物理重扫。
-        println!("[PORT] Checkbox toggled, new state: {}", checked);
+        // 该值经双向绑定同步回 UI 属性并驱动下方 rescan 的物理重扫；每次切换
+        // 都可在启动日志中看到新状态（tracing 落盘）。
         tracing::info!(
             target: "main",
-            "[PORT] 显示系统服务与高位端口 CheckBox -> {checked}"
+            "端口猎手「显示系统服务与高位端口」CheckBox -> {checked}"
         );
         system_ph_ctx.persist_option("system", checked, true);
     });
@@ -2924,13 +2936,22 @@ async fn main() -> Result<(), AppError> {
     tracing::info!(target: "main", "UI 事件循环已退出，开始平滑收尾");
 
     // ---- 11. 收尾：先逆序停止全部仍在运行的模块（平滑卸载 Win32 钩子等
-    //           资源），再关闭托盘线程释放图标。 ----
+    //           资源），再关闭托盘线程释放图标。每个停止动作均写审计日志
+    //           （双轨日志：与启动路径的「模块开关」留痕闭环）。 ----
     for meta in shared_mgr.get_metadata_list() {
         if meta.running {
             match shared_mgr.toggle(meta.id, false).await {
-                Ok(_) => tracing::info!(target: "main", "收尾：模块 {0} 已停止", meta.id),
+                Ok(_) => {
+                    tracing::info!(target: "main", "收尾：模块 {0} 已停止", meta.id);
+                    audit.record("模块开关", format!("{} -> 关闭", meta.id), "成功");
+                }
                 Err(err) => {
-                    tracing::error!(target: "main", "收尾：停止模块 {0} 失败: {err}", meta.id)
+                    tracing::error!(target: "main", "收尾：停止模块 {0} 失败: {err}", meta.id);
+                    audit.record(
+                        "模块开关",
+                        format!("{} -> 关闭", meta.id),
+                        format!("失败: {err}"),
+                    );
                 }
             }
         }

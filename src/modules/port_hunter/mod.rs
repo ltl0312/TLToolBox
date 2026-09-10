@@ -40,7 +40,6 @@ use crate::bus::EventBus;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
-use tokio::sync::Mutex as AsyncMutex;
 
 /// 一次扫描的可观测量（供 UI 状态条与模块日志消费）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,8 +77,6 @@ pub struct PortHunterModule {
 
 /// 模块内部状态。
 struct PortHunterInner {
-    /// 串行化生命周期变迁（本模块为空操作，保留契约形状）。
-    lifecycle: AsyncMutex<()>,
     /// 运行标志（本模块恒为 `false`——即开即用工具无常驻后台态）。
     running: AtomicBool,
     /// 最近一次扫描的展示缓存（状态 + 会话降噪后；渲染期再经阶段 2/4 + 搜索过滤）。
@@ -98,7 +95,6 @@ impl PortHunterModule {
     pub fn new(log_dir: std::path::PathBuf) -> Self {
         Self {
             inner: Arc::new(PortHunterInner {
-                lifecycle: AsyncMutex::new(()),
                 running: AtomicBool::new(false),
                 cached_rows: StdMutex::new(Vec::new()),
                 logger: logger::PortHunterLogger::new(log_dir),
@@ -249,10 +245,6 @@ impl super::ToolModule for PortHunterModule {
 
     /// 即开即用工具：启动为空操作（不派生任何后台资源）。
     async fn start(&self) -> Result<(), super::ModuleError> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
-        if self.inner.running.load(Ordering::Acquire) {
-            return Ok(());
-        }
         // 本模块无后台运行态：不置 running（保持 false），仅记录启动意图。
         tracing::debug!(target: "port_hunter", "端口猎手为即开即用工具，start 为空操作");
         Ok(())
@@ -260,7 +252,6 @@ impl super::ToolModule for PortHunterModule {
 
     /// 即开即用工具：停止为空操作（无资源可释放）。
     async fn stop(&self) -> Result<(), super::ModuleError> {
-        let _lifecycle = self.inner.lifecycle.lock().await;
         tracing::debug!(target: "port_hunter", "端口猎手无后台资源，stop 为空操作");
         Ok(())
     }

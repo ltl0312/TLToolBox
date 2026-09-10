@@ -24,7 +24,7 @@ pub mod daemon;
 pub mod explorer;
 
 use crate::bus::{AppEvent, EventBus};
-use crate::config::{IconCoordinate, IconLayoutProfile};
+use crate::config::IconLayoutProfile;
 use crate::modules::{ModuleError, ToolModule};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,14 +58,9 @@ fn pick_auto_restore_profile(state: &ModuleState) -> Option<IconLayoutProfile> {
 
 /// 向事件总线投递一条 Toast（守护线程失败提示用；无总线时静默）。
 fn toast(state: &ModuleState, message: impl Into<String>) {
-    let can_send = {
-        let guard = lock_ok(state.bus.lock());
-        guard.is_some()
-    };
-    if can_send {
-        if let Some(bus) = lock_ok(state.bus.lock()).as_ref() {
-            bus.publish(AppEvent::ToastRequested(message.into()));
-        }
+    // 单次短临界读取总线句柄：存在即发布（publish 为同步非阻塞广播）。
+    if let Some(bus) = lock_ok(state.bus.lock()).as_ref() {
+        bus.publish(AppEvent::ToastRequested(message.into()));
     }
 }
 
@@ -191,19 +186,6 @@ impl IconLockerModule {
     pub fn set_auto_restore(&self, enabled: bool) {
         self.state.auto_restore.store(enabled, Ordering::SeqCst);
     }
-
-    /// 最近一次活动方案 ID（诊断 / 展示用途）。
-    pub fn active_profile_id(&self) -> Option<String> {
-        lock_ok(self.state.active_profile.lock()).clone()
-    }
-
-    /// 全部方案的坐标总览（调试 / 单元测试用途）。
-    pub fn coordinate_map(&self) -> Vec<(String, IconCoordinate)> {
-        self.profiles()
-            .into_iter()
-            .flat_map(|p| p.icon_positions.into_iter())
-            .collect()
-    }
 }
 
 #[async_trait]
@@ -309,6 +291,7 @@ impl ToolModule for IconLockerModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IconCoordinate;
     use std::collections::HashMap;
 
     fn sample_profile(id: &str, name: &str) -> IconLayoutProfile {

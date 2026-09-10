@@ -47,7 +47,7 @@
 //   - open_module_settings(module_id) ← 模块卡片齿轮点击（Rust 按模块 ID 分派：弹窗
 //                                       拦截=「规则管理 + 留痕」弹窗；终端交互日志=
 //                                       「存储管理」弹窗，见 TerminalSettingsModal）
-//   - open_terminal_modal() / close_terminal_modal() ← 「存储管理」弹窗开关
+//   - close_terminal_modal() ← 「存储管理」弹窗开关
 //   - open_log_dir_in_explorer()      ← 「存储管理」弹窗：资源管理器打开日志目录
 //   - browse_setting_dir(key)         ← 主设置 / 模块设置：Win32 原生文件夹选择切换路径
 //                                       （key: "app_log" | "terminal_log" | "popup_screenshot"）
@@ -62,7 +62,6 @@
 //   - close_rules_modal()             ← 弹窗「×」/ 遮罩空白点击
 //   - add_rule(keyword)               ← 弹窗底部「添加」（含输入框回车）
 //   - remove_rule(index)              ← 规则行右侧红色删除按钮
-//   - trigger_toast(string)           （预留）UI 内任意元素请求 Toast（Rust 侧与 show_toast 同入口）
 //
 // 注：随双栏日志控制台退役，LogEntry 已从本文件移除；运行日志改由 tracing 承载。
 
@@ -141,13 +140,6 @@ export struct IconLockerProfileItem {
     icon_count: int,
     // 绑定的显示器拓扑指纹（当前环境指纹与之匹配才建议直接还原）
     fingerprint: string,
-}
-
-// —— 全局设置目录行的键（与 Rust 侧 browse/reset/open 分派一致） ——
-export enum PathKind {
-    app-log,
-    terminal-log,
-    popup-screenshot,
 }
 
 // —— 全局暗色主题令牌（zinc 底 + 翡翠强调；统一取色，避免魔法数字散落） ——
@@ -2789,7 +2781,6 @@ export component MainWindow inherits Window {
     // ===== Toast 轻量操作反馈（Rust 侧经统一 show_toast 驱动；UI 点击胶囊可提前关闭） =====
     in-out property <string> toast_message: "";
     in-out property <bool> show_toast: false;
-    callback trigger_toast(string);
 
     // ===== 对外回调（由 Rust 装配层实现） =====
     callback toggle_module(string, bool);
@@ -2797,7 +2788,6 @@ export component MainWindow inherits Window {
     callback toggle_all_modules(bool);
     callback request_elevate();
     callback open_module_settings(string);
-    callback open_terminal_modal();
     callback close_terminal_modal();
     callback open_log_dir_in_explorer();
     callback close_rules_modal();
@@ -2807,7 +2797,6 @@ export component MainWindow inherits Window {
     callback open_capture_dir();
     // 关于弹窗 / 检查更新（v0.3.2）。
     callback open_about_modal();
-    callback open_icon_locker_modal();
     callback close_icon_locker_modal();
     callback icon_locker_save(string);
     callback icon_locker_restore(string);
@@ -2824,14 +2813,12 @@ export component MainWindow inherits Window {
     callback open_setting_dir(string);
     callback reset_setting_dir(string);
     // 全局窗口置顶（v0.4.0；v0.4.1 起回调首参为 HWND 整数值，废除字符串文本解析）。
-    callback open_topmost_modal();
     callback close_topmost_modal();
     callback refresh_topmost();
     callback topmost_search_changed(string);
     callback topmost_toggle_pin(int, bool);
     callback topmost_set_priority(int, int);
     // 端口占用管理（v0.5.0）：弹窗开关 / 刷新 / 搜索 / 选项切换 / 一键释放。
-    callback open_port_hunter_modal();
     callback close_port_hunter_modal();
     callback refresh_port_hunter();
     callback port_hunter_search_changed(string);

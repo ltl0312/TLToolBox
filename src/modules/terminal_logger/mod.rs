@@ -257,10 +257,46 @@ impl HookManager {
     }
 }
 
+/// 【目录安全创建】按**有效日志根目录**（[`AppConfig::effective_terminal_log_dir`]）
+/// 与已装配的 Shell 挂载器预建写入目录：
+///
+/// - 根目录（会话日志的公共父目录）恒建；
+/// - 各已装配 Shell 的子目录（`powershell/` / `bash/` / `cmd/`）按挂载器有无创建；
+/// - 无任何挂载器（`enabled_shells` 为空 / 全部剔除）时不创建任何目录——没有
+///   写入方就不产生空目录。
+///
+/// 注入脚本运行期亦会自建目录（PS: `New-Item -Force` / bash: `mkdir -p`），
+/// 此处预建使**首次写入**不依赖 Shell 侧行为；创建失败仅告警（返回的错误不
+/// 上抛），目录不可写绝不阻断模块启动。返回实际尝试创建的目标目录列表。
+fn ensure_log_dirs(log_base: &Path, hooks: &HookManager) -> Vec<PathBuf> {
+    if hooks.is_empty() {
+        return Vec::new();
+    }
+    let mut dirs = vec![log_base.to_path_buf()];
+    for (sub, active) in [
+        ("powershell", hooks.powershell.is_some()),
+        ("bash", hooks.bash.is_some()),
+        ("cmd", hooks.cmd.is_some()),
+    ] {
+        if active {
+            dirs.push(log_base.join(sub));
+        }
+    }
+    for dir in &dirs {
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            tracing::warn!(
+                target: "terminal_logger",
+                "终端日志目录创建失败（本次写入将由 Shell 侧钩子重试自建）: '{}' -> {err}",
+                dir.display()
+            );
+        }
+    }
+    dirs
+}
+
 // ---------------------------------------------------------------------------
 // TerminalLoggerModule：ToolModule 化的常驻守护模块本体
 // ---------------------------------------------------------------------------
-
 /// 终端交互日志模块（第四个常驻守护模块）。
 ///
 /// 生命周期完全由内部可变性管理（原子运行标志 + 异步锁串行化变迁 + 最近
@@ -438,8 +474,14 @@ impl ToolModule for TerminalLoggerModule {
             )
         };
 
-        // 2) 按名单装配挂载器（未启用 / 无法定位的 Shell 被剔除）并统一安装。
+        // 2) 按名单装配挂载器（未启用 / 无法定位的 Shell 被剔除）。
         let hooks = HookManager::for_enabled_shells(&enabled_shells);
+
+        // 2.5) 目录安全创建（effective_log_dir 语义）：首次写入前保证日志根目录
+        //      与各已装配 Shell 的子目录存在，见 [`ensure_log_dirs`]。
+        ensure_log_dirs(&log_base, &hooks);
+
+        // 3) 统一安装钩子（未启用任何 Shell 时为空操作）。
         if hooks.is_empty() {
             tracing::info!(
                 target: "terminal_logger",
@@ -450,7 +492,7 @@ impl ToolModule for TerminalLoggerModule {
             hooks.install_all(&log_base)?;
         }
 
-        // 3) 落定状态：快照钩子集（供 stop 精确卸载）+ 运行标志 + cmd 核验开关。
+        // 4) 落定状态：快照钩子集（供 stop 精确卸载）+ 运行标志 + cmd 核验开关。
         *self
             .inner
             .hooks
@@ -461,7 +503,7 @@ impl ToolModule for TerminalLoggerModule {
             .store(hooks.cmd_active(), Ordering::Release);
         self.inner.running.store(true, Ordering::Release);
 
-        // 4) 启动日志过期清理守护：立即扫一轮过期日志，此后按固定周期（每日）
+        // 5) 启动日志过期清理守护：立即扫一轮过期日志，此后按固定周期（每日）
         //    定时清理，防止 `logs/terminals/` 下会话日志碎文件无限积压。
         self.spawn_retention_guard(log_base.clone(), retention_days);
 
@@ -668,6 +710,47 @@ mod tests {
         // 未知 Shell（wt / fish 等）→ 全部剔除，不影响整体可用性。
         let unknown = HookManager::for_enabled_shells(&["fish".into(), "wt".into()]);
         assert!(unknown.is_empty());
+    }
+
+    // ---- 目录安全创建（effective_log_dir 语义：首次写入前保证目录存在） ----
+
+    /// 预建语义：根目录恒建、仅已装配 Shell 的子目录被创建、无挂载器时零创建。
+    /// 全程使用临时目录 + `Hook::at` 显式目标，零真实环境副作用。
+    #[test]
+    fn ensure_log_dirs_creates_root_and_active_shell_subdirs_only() {
+        let root = unique_temp("ensure-dirs");
+        let log_base = root.join("logs").join("terminals");
+        assert!(!log_base.exists(), "前置条件：日志根目录尚不存在");
+
+        // 仅装配 PowerShell + bash（无 cmd）→ 只建这两个子目录。
+        let hooks = HookManager {
+            powershell: Some(PowerShellHook::at(root.join("profile.ps1"))),
+            bash: Some(BashHook::at(root.join(".bashrc"))),
+            cmd: None,
+        };
+        let created = ensure_log_dirs(&log_base, &hooks);
+        assert!(log_base.is_dir(), "有效日志根目录应被创建");
+        assert!(
+            log_base.join("powershell").is_dir(),
+            "powershell 子目录应被创建"
+        );
+        assert!(log_base.join("bash").is_dir(), "bash 子目录应被创建");
+        assert!(
+            !log_base.join("cmd").exists(),
+            "未装配的 Shell 不应产生空子目录"
+        );
+        assert_eq!(created.len(), 3, "根目录 + 两个已装配 Shell 子目录");
+
+        // 重复调用幂等（已存在目录不报错、结果一致）。
+        assert_eq!(ensure_log_dirs(&log_base, &hooks).len(), 3);
+
+        // 无任何挂载器（enabled_shells 为空）→ 零创建，也不产生根目录。
+        let bare_root = root.join("bare");
+        let nothing = ensure_log_dirs(&bare_root, &HookManager::for_enabled_shells(&[]));
+        assert!(nothing.is_empty(), "无写入方时不应创建任何目录");
+        assert!(!bare_root.exists(), "空名单下连根目录也不应被创建");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---- 文件侧钩子的安装 / 卸载往返（显式临时路径，零真实环境副作用） ----

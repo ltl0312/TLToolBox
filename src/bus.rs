@@ -5,8 +5,8 @@
 //! - [`AppEvent::ModuleStatusChanged`]：模块调度器在生命周期操作（启动 / 停止）**结束后**
 //!   广播模块的“最终真实状态”。UI 据此刷新视图或回滚开关，从根本上消除
 //!   “界面状态与底层进程事实不一致”的虚假状态（见 `crate::manager::ModuleManager::toggle`）；
-//! - [`AppEvent::AppLogAppended`]：装配与模块启停产生的应用运行日志流（原
-//!   `AgentLogAppended` 随 agent 层退役更名而来），供 UI 日志面板消费；
+//! - [`AppEvent::PopupClosed`]：弹窗拦截模块在命中黑名单并投递 `WM_CLOSE` 后发布，
+//!   由总线 → UI 桥接层写入用户操作审计日志（`app_audit.log` 的关键动作留痕）；
 //! - [`AppEvent::TrayAction`]：系统托盘的常驻指令（[`TrayAction`]），由托盘线程
 //!   （`crate::tray`）在用户点击菜单 / 双击图标时发布，被“生命周期控制器”常驻任务
 //!   消费以驱动显示窗口、全量开关模块、退出程序。
@@ -41,16 +41,17 @@ pub enum AppEvent {
         /// 变更落定后模块的真实运行状态。
         is_running: bool,
     },
-    /// 应用运行日志：装配 / 模块启停等运行时事件追加一条控制台日志。
+    /// 弹窗拦截模块关闭了一只命中黑名单的目标弹窗（构造点：`popup_blocker` 的
+    /// WinEvent 回调，在异步投递 `WM_CLOSE` 后发布）。
     ///
-    /// 构造点位于 `crate::main` 的装配与回调层（如模块启停失败告警、开机自启
-    /// 同步结果）。该变体在转型前名为 `AgentLogAppended`、承载 Agent 推理认知
-    /// 日志流；agent 层退役后更名为通用应用日志，继续由 UI 日志面板消费。
-    AppLogAppended {
-        /// 日志级别标签（`INFO` / `SUCCESS` / `WARN` / `ERROR` 等，供 UI 着色）。
-        level: String,
-        /// 日志正文。
-        message: String,
+    /// 由总线 → UI 桥接层（`crate::main::forward_module_events`）消费，写入
+    /// 用户操作审计日志（`[弹窗拦截] … -> 成功`）——「弹窗关闭」是关键动作，
+    /// 必须具备审计级别输出。
+    PopupClosed {
+        /// 被关闭弹窗的窗口标题（回调读取时刻的快照）。
+        title: String,
+        /// 被关闭弹窗的窗口类名。
+        class_name: String,
     },
     /// 系统托盘发出的常驻指令（构造点：`crate::tray` 托盘线程的消息泵）。
     ///

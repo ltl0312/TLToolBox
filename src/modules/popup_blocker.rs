@@ -76,6 +76,7 @@
 //! 拦截动作本身（截图是拦截的附属留痕，不是前置条件）。
 
 use super::{ModuleError, ToolModule};
+use crate::bus::{AppEvent, EventBus};
 use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -241,13 +242,15 @@ impl RuleStore {
 static HOOK_ROUTING_REGISTRY: OnceLock<StdRwLock<HashMap<usize, Arc<HookRouting>>>> =
     OnceLock::new();
 
-/// 单个钩子句柄对应的实例路由信息（规则存储 + 可选截图留痕状态）。
+/// 单个钩子句柄对应的实例路由信息（规则存储 + 可选截图留痕状态 + 事件总线）。
 #[cfg(windows)]
 struct HookRouting {
     /// 所属实例的动态黑名单规则存储（回调的匹配事实源）。
     rules: Arc<RuleStore>,
     /// 所属实例的弹窗截图留痕状态（`None` = 未启用截图留痕）。
     screenshots: Option<Arc<ScreenshotState>>,
+    /// 事件总线（命中后发布 [`AppEvent::PopupClosed`] 供审计留痕；`None` = 未装配）。
+    bus: Option<EventBus>,
 }
 
 #[cfg(windows)]
@@ -456,6 +459,8 @@ struct PopupBlockerInner {
     rules: Arc<RuleStore>,
     /// 弹窗拦截截图留痕状态（`None` = 未启用，见 [`PopupBlockerModule::with_rules`]）。
     screenshots: Option<Arc<ScreenshotState>>,
+    /// 事件总线（命中后发布 [`AppEvent::PopupClosed`]；`None` = 未装配，无审计）。
+    bus: StdMutex<Option<EventBus>>,
 }
 
 /// 单次运行（泵线程 + 可选截图 worker）的运行时上下文。
@@ -518,8 +523,20 @@ impl PopupBlockerModule {
                 active: StdMutex::new(None),
                 rules: Arc::new(RuleStore::new(rules)),
                 screenshots,
+                bus: StdMutex::new(None),
             }),
         }
+    }
+
+    /// 装配期注入事件总线（命中黑名单关闭弹窗后发布 [`AppEvent::PopupClosed`]，
+    /// 供装配层写用户操作审计日志；`None` = 无总线，拦截动作照常、仅不发布）。
+    pub fn with_bus(self, bus: Option<EventBus>) -> Self {
+        *self
+            .inner
+            .bus
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = bus;
+        self
     }
 
     /// 回读当前生效的截图留痕记录（新→旧，上限 [`MAX_CAPTURE_RECORDS`] 条；
@@ -637,6 +654,13 @@ impl PopupBlockerModule {
             // 窗口同步发送会直接失败——异步投递 + 不等待是防卡死钩子消息泵的唯一
             // 正确形态（SendMessageTimeoutW 亦可用，但此处无需任何应答，Post 最优）。
             let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+
+            // 审计留痕（可选）：命中动作落定后经事件总线发布「弹窗关闭」事件，
+            // 由装配层（总线 → UI 桥）写入用户操作审计日志 `app_audit.log`。
+            // 发布为同步非阻塞广播（bus::publish 即发即弃），不增加回调耗时。
+            if let Some(bus) = &routing.bus {
+                bus.publish(AppEvent::PopupClosed { title, class_name });
+            }
         }
     }
 
@@ -733,11 +757,18 @@ impl PopupBlockerModule {
         let cancel = CancellationToken::new();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<u32, String>>();
 
-        // 所属实例的路由信息（规则存储 + 截图状态）：泵线程装钩成功后注册句柄路由，
-        // 回调据此读取动态黑名单与投递截图任务；规则热更新只写存储、不触碰泵线程。
+        // 所属实例的路由信息（规则存储 + 截图状态 + 事件总线）：泵线程装钩成功后
+        // 注册句柄路由，回调据此读取动态黑名单 / 投递截图任务 / 发布审计事件；
+        // 规则热更新只写存储、不触碰泵线程。
         let routing = Arc::new(HookRouting {
             rules: Arc::clone(&self.inner.rules),
             screenshots: self.inner.screenshots.clone(),
+            bus: self
+                .inner
+                .bus
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         });
 
         // 截图 worker 先行启动（若启用截图留痕）：回调一经派发即可投递任务。
@@ -1290,5 +1321,34 @@ mod tests {
         let disabled = PopupBlockerModule::new();
         assert_eq!(disabled.screenshot_dir(), None, "未启用时目录应为 None");
         assert!(disabled.captures().is_empty());
+    }
+
+    /// 事件总线接线契约：`with_bus` 注入的总线经路由快照可回读
+    /// （钩子回调据此发布 [`AppEvent::PopupClosed`] 供审计留痕）。
+    #[test]
+    fn with_bus_stores_handle_accessible_to_pump_routing() {
+        let module = PopupBlockerModule::with_rules_and_screenshot_dir(
+            ["广告"].into_iter().map(String::from),
+            None,
+        )
+        .with_bus(Some(EventBus::new(8)));
+        let bus = module
+            .inner
+            .bus
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert!(bus.is_some(), "with_bus 注入的总线应可经内部路由快照回读");
+
+        // 无总线的默认构造：路由快照为 None（发布为空操作）。
+        let bare = PopupBlockerModule::new();
+        assert!(
+            bare.inner
+                .bus
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "默认构造不应持有总线"
+        );
     }
 }

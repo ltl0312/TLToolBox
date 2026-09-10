@@ -57,11 +57,11 @@ where
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
-    use windows::core::{GUID, Interface, VARIANT};
+    use windows::core::{Interface, GUID, VARIANT};
     use windows::Win32::Foundation::POINT;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_LOCAL_SERVER,
-        COINIT_APARTMENTTHREADED, IDispatch, IServiceProvider,
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IDispatch,
+        IServiceProvider, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::Shell::{
         IFolderView, IShellBrowser, IShellFolder, IShellWindows, ShellWindows, SHGDNF,
@@ -70,8 +70,7 @@ mod windows_impl {
 
     /// `SID_STopLevelBrowser`（{4C96BE40-915C-11CF-99D3-00AA004AE837}）：从桌面
     /// `IServiceProvider::QueryService` 取得 `IShellBrowser` 的服务标识。
-    const SID_S_TOP_LEVEL_BROWSER: GUID =
-        GUID::from_u128(0x4C96BE40_915C_11CF_99D3_00AA004AE837);
+    const SID_S_TOP_LEVEL_BROWSER: GUID = GUID::from_u128(0x4C96BE40_915C_11CF_99D3_00AA004AE837);
 
     /// `RPC_E_CHANGED_MODE`（0x80010106）：`CoInitializeEx` 在该线程已被其它 COM
     /// 线程模型初始化时返回。按规格容错——不中断执行，复用既有公寓。
@@ -121,7 +120,10 @@ mod windows_impl {
     /// 把 `windows::core::Error` 转为 [`ExplorerError::Com`]，并在此记录**步骤级**
     /// 错误日志（含 HRESULT），便于定位具体是 `FindWindowSW` / `QueryService` /
     /// `Item` 枚举 / 定位 / 批量还原哪一步抛错。
-    fn com_step<T>(step: &'static str, result: windows::core::Result<T>) -> Result<T, ExplorerError> {
+    fn com_step<T>(
+        step: &'static str,
+        result: windows::core::Result<T>,
+    ) -> Result<T, ExplorerError> {
         result.map_err(|err| {
             let code = err.code().0;
             tracing::error!(
@@ -195,47 +197,38 @@ mod windows_impl {
     /// 不做静默跳过。
     fn find_desktop_view() -> Result<DesktopView, ExplorerError> {
         let _sta = StaCom::initialize()?;
-        let windows: IShellWindows = com_step(
-            "CoCreateInstance(CLSID_ShellWindows)",
-            unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) },
-        )?;
+        let windows: IShellWindows = com_step("CoCreateInstance(CLSID_ShellWindows)", unsafe {
+            CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)
+        })?;
 
         // FindWindowSW 直连桌面：SWC_DESKTOP = 8，SWFO_NEEDDISPATCH = 1（要求返回
         // IDispatch），pvarloc = VT_I4(0)（桌面位置的 PIDL 位置参数），pvarlocroot 空。
         let mut hwnd = 0i32;
-        let dispatch: IDispatch = com_step(
-            "FindWindowSW(SWC_DESKTOP)",
-            unsafe {
-                windows.FindWindowSW(
-                    &VARIANT::from(0i32),
-                    &VARIANT::default(),
-                    SWC_DESKTOP,
-                    &mut hwnd,
-                    SWFO_NEEDDISPATCH,
-                )
-            },
-        )?;
+        let dispatch: IDispatch = com_step("FindWindowSW(SWC_DESKTOP)", unsafe {
+            windows.FindWindowSW(
+                &VARIANT::from(0i32),
+                &VARIANT::default(),
+                SWC_DESKTOP,
+                &mut hwnd,
+                SWFO_NEEDDISPATCH,
+            )
+        })?;
         tracing::debug!(
             target: "icon_locker",
             "FindWindowSW 命中桌面窗口 hwnd=0x{:X}",
             hwnd as u32
         );
 
-        let provider: IServiceProvider =
-            com_step("IDispatch → IServiceProvider", dispatch.cast())?;
-        let browser: IShellBrowser = com_step(
-            "QueryService(SID_STopLevelBrowser)",
-            unsafe { provider.QueryService(&SID_S_TOP_LEVEL_BROWSER) },
-        )?;
-        let shell_view = com_step(
-            "IShellBrowser::QueryActiveShellView",
-            unsafe { browser.QueryActiveShellView() },
-        )?;
+        let provider: IServiceProvider = com_step("IDispatch → IServiceProvider", dispatch.cast())?;
+        let browser: IShellBrowser = com_step("QueryService(SID_STopLevelBrowser)", unsafe {
+            provider.QueryService(&SID_S_TOP_LEVEL_BROWSER)
+        })?;
+        let shell_view = com_step("IShellBrowser::QueryActiveShellView", unsafe {
+            browser.QueryActiveShellView()
+        })?;
         let folder_view: IFolderView = com_step("IShellView → IFolderView", shell_view.cast())?;
-        let folder: IShellFolder = com_step(
-            "IFolderView::GetFolder",
-            unsafe { folder_view.GetFolder() },
-        )?;
+        let folder: IShellFolder =
+            com_step("IFolderView::GetFolder", unsafe { folder_view.GetFolder() })?;
         Ok(DesktopView {
             folder_view,
             folder,
@@ -245,23 +238,22 @@ mod windows_impl {
 
     pub fn capture_layout() -> Result<DesktopLayout, ExplorerError> {
         let desktop = find_desktop_view()?;
-        let count = com_step(
-            "IFolderView::ItemCount",
-            unsafe { desktop.folder_view.ItemCount(windows::Win32::UI::Shell::_SVGIO(0)) },
-        )?;
+        let count = com_step("IFolderView::ItemCount", unsafe {
+            desktop
+                .folder_view
+                .ItemCount(windows::Win32::UI::Shell::_SVGIO(0))
+        })?;
         tracing::info!(target: "icon_locker", "抓取桌面图标布局：共 {count} 个图标");
         let mut positions = HashMap::new();
         let mut pidl_pool = PidlPool::new();
         for item in 0..count {
-            let pidl = com_step(
-                "IFolderView::Item 枚举",
-                unsafe { desktop.folder_view.Item(item) },
-            )?;
+            let pidl = com_step("IFolderView::Item 枚举", unsafe {
+                desktop.folder_view.Item(item)
+            })?;
             pidl_pool.push(pidl);
-            let point = com_step(
-                "IFolderView::GetItemPosition",
-                unsafe { desktop.folder_view.GetItemPosition(pidl) },
-            )?;
+            let point = com_step("IFolderView::GetItemPosition", unsafe {
+                desktop.folder_view.GetItemPosition(pidl)
+            })?;
             let name = display_name(&desktop.folder, pidl as *const _)?;
             positions.insert(
                 name,
@@ -281,18 +273,18 @@ mod windows_impl {
 
     pub fn restore_layout(layout: &DesktopLayout) -> Result<(), ExplorerError> {
         let desktop = find_desktop_view()?;
-        let count = com_step(
-            "IFolderView::ItemCount",
-            unsafe { desktop.folder_view.ItemCount(windows::Win32::UI::Shell::_SVGIO(0)) },
-        )?;
+        let count = com_step("IFolderView::ItemCount", unsafe {
+            desktop
+                .folder_view
+                .ItemCount(windows::Win32::UI::Shell::_SVGIO(0))
+        })?;
         let mut pidls = Vec::new();
         let mut points = Vec::new();
         let mut pidl_pool = PidlPool::new();
         for item in 0..count {
-            let pidl = com_step(
-                "IFolderView::Item 枚举",
-                unsafe { desktop.folder_view.Item(item) },
-            )?;
+            let pidl = com_step("IFolderView::Item 枚举", unsafe {
+                desktop.folder_view.Item(item)
+            })?;
             pidl_pool.push(pidl);
             let name = display_name(&desktop.folder, pidl as *const _)?;
             if let Some(position) = layout.positions.get(&name) {
@@ -312,17 +304,14 @@ mod windows_impl {
         if !pidls.is_empty() {
             let raw: Vec<*const windows::Win32::UI::Shell::Common::ITEMIDLIST> =
                 pidls.iter().map(|p| *p as *const _).collect();
-            com_step(
-                "IFolderView::SelectAndPositionItems",
-                unsafe {
-                    desktop.folder_view.SelectAndPositionItems(
-                        raw.len() as u32,
-                        raw.as_ptr(),
-                        Some(points.as_ptr()),
-                        0,
-                    )
-                },
-            )?;
+            com_step("IFolderView::SelectAndPositionItems", unsafe {
+                desktop.folder_view.SelectAndPositionItems(
+                    raw.len() as u32,
+                    raw.as_ptr(),
+                    Some(points.as_ptr()),
+                    0,
+                )
+            })?;
         }
         // 所有已取出的 PIDL（含未匹配方案、错误提前返回）随池析构统一 CoTaskMemFree。
         drop(pidl_pool);
