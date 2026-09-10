@@ -1,0 +1,200 @@
+# ==============================================================================
+# TLToolBox · 全量默认配置示例 (config/tltoolbox.example.toml)
+# ==============================================================================
+# 本文件汇集 TLToolBox v0.6.0 全部七个模块（popup_blocker / keep_awake /
+# clipboard_purifier / terminal_logger / port_hunter / topmost_manager /
+# icon_locker）的默认配置与详尽注释，供手工配置 / 排错 / 二次分发参考。
+#
+# 使用方式：
+#   1. 复制本文件为 config/tltoolbox.toml（与 tltoolbox.exe 同级的 config 目录）；
+#   2. 按需修改注释标注的字段；
+#   3. 首次启动时程序若未找到配置文件，会自动生成等价默认配置。
+#
+# 路径约定（绝对锚定）：
+#   所有相对路径均以「可执行文件所在目录」为基准解析（与 CWD 无关），
+#   注册表开机自启（CWD = C:\Windows\System32）时同样可靠。
+#
+# 写入机制：
+#   模块开关由 UI / 托盘切换后自动持久化回本文件（临时文件 + 原子 rename），
+#   一般无需手工编辑；坏配置解析失败时原样保留、绝不静默覆盖。
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 全局节（无 [xxx] 前缀的顶层键）
+# ------------------------------------------------------------------------------
+
+# 应用启动后自动拉起（toggle(id, true)）的模块 ID 列表，按序启动。
+# 弹窗拦截属「装上即用」的核心能力，默认随应用启动；
+# 其余操作敏感型模块（防休眠 / 剪贴板 / 终端日志 / 置顶 / 图标锁）默认关闭。
+auto_start_modules = ["popup_blocker"]
+
+# 弹窗拦截黑名单关键词（窗口标题 / 类名的子串匹配，忽略大小写，中文逐字生效）。
+# 规则增删即时热重载（COW 快照），自动持久化；重复输入自动去重。
+popup_blacklist = [
+    "广告",
+    "Flash Helper Service",
+    "Update Notice",
+    "推广弹窗",
+]
+
+# 是否跟随系统开机自启（写入 HKCU\...\CurrentVersion\Run，免提权）。
+# 配置为准：启动装配层会与注册表自动收敛（开而缺 → 补写；关而残留 → 删除）。
+auto_start_windows = false
+
+# 点击窗口关闭按钮（×）时仅最小化到托盘而非退出进程（桌面常驻定位）。
+minimize_to_tray = true
+
+# 启用终端会话日志的 Shell 名单（模块 ID → 仅向名单内的 Shell 注入钩子）。
+enabled_shells = ["powershell", "cmd", "bash"]
+
+# ------------------------------------------------------------------------------
+# 可选路径 / 保留期限（均为可选项：缺省（注释掉）时回退到默认值）
+# ------------------------------------------------------------------------------
+
+# 终端交互日志落盘目录（相对 exe 同级目录）。
+# 缺省回退：exe 同级 logs/terminals
+# terminal_log_dir = "logs/terminals"
+
+# 程序运行日志（tracing 按天滚动）+ 用户操作审计日志（app_audit.log）目录。
+# 缺省回退：exe 同级 logs
+# app_log_dir = "logs"
+
+# 弹窗拦截截图（拦截留痕）落盘目录。
+# 缺省回退：exe 同级 logs/popup_screenshots
+# popup_screenshot_dir = "logs/popup_screenshots"
+
+# 终端会话日志（.log / .state.log）保留期限（天），过期由守护自动清理。
+# 缺省回退：14 天；0 = 立即清理全部已过期会话日志（一般不建议）。
+# terminal_log_retention_days = 14
+
+# 各模块自定义参数（模块 ID → 值），供模块级扩展配置使用（当前默认空）。
+[module_custom_params]
+
+# ==============================================================================
+# [popup_blocker] 桌面弹窗拦截（默认随应用启动）
+# ==============================================================================
+# 系统级监听新窗口创建（SetWinEventHook / EVENT_OBJECT_CREATE），命中黑名单
+# 关键词的弹窗在出现瞬间被毫秒级 WM_CLOSE 关闭。Win32 消息泵运行在专用原生
+# 线程（win32-popup-hook-pump）；黑名单采用 COW 快照 + 热重载。
+# 注意：弹窗拦截无独立配置节——黑名单见顶层 popup_blacklist，
+# 截图留痕目录见 popup_screenshot_dir。
+
+# ==============================================================================
+# [keep_awake] 系统防休眠（默认关闭）
+# ==============================================================================
+# 调用 SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
+# ES_DISPLAY_REQUIRED) 注入粘性执行状态阻止系统自动睡眠与熄屏；
+# 关闭时以 ES_CONTINUOUS 还原默认策略。纯内核状态标记，无常驻循环，CPU 开销为零。
+# 该模块无独立配置节（开关经 UI / 托盘切换后持久化到 auto_start_modules 之外
+# 的模块镜像，见各模块卡片开关）。
+
+# ==============================================================================
+# [clipboard_purifier] 剪贴板纯文本净化（默认关闭）
+# ==============================================================================
+# 剪贴板内容同时携带纯文本与富文本时自动剔除格式残留，粘贴始终为纯文本。
+# AddClipboardFormatListener 注册监听，专用纯消息窗口处理 WM_CLIPBOARDUPDATE，
+# 原子清空并重写，内置自循环回声防护（EchoGuard）。无独立配置节。
+
+# ==============================================================================
+# [terminal_logger] 终端交互日志（默认关闭）
+# ==============================================================================
+# 自动记录 CMD / PowerShell (5.1/7+) / Bash 的全部输入指令、交互会话与退出码。
+#   PowerShell：挂载静默转录流并代理 prompt 捕获 $LASTEXITCODE；
+#   Bash：基于 PROMPT_COMMAND 与历史行解析记录指令与 $?；
+#   CMD：注册表 AutoRun 挂载原生非侵入式脚本，doskey 捕获键入与退出码，
+#        内置 /c 护栏严禁挂起构建子进程。
+# Shell 名单见顶层 enabled_shells，日志目录见 terminal_log_dir，
+# 保留期限见 terminal_log_retention_days。
+
+# ==============================================================================
+# [topmost_manager] 全局窗口置顶守护（v0.4.0，默认关闭）
+# ==============================================================================
+[topmost_manager]
+# 模块全局启停（默认 false；UI / 托盘切换后持久化）。
+enabled = false
+
+# 置顶规则记忆（进程名 + 标题子串 + 优先级 1~9 + 启用标志）。
+# 模块启动时按规则重新枚举窗口自动恢复置顶；运行期置顶变更后整体重建落盘，
+# 一般无需手工编辑。优先级 1 最顶层，越界值由引擎归一化夹紧。
+# 示例：
+# pinned_rules = [
+#     { process_name = "notepad.exe", title_pattern = "笔记", priority = 1, enabled = true },
+#     { process_name = "calc.exe",    title_pattern = "计算器", priority = 3, enabled = true },
+# ]
+pinned_rules = []
+
+# ==============================================================================
+# [port_hunter] 本地开发端口猎手（v0.5.0，即开即用工具，无常驻后台开关）
+# ==============================================================================
+# 毫秒级定位本地监听端口（8080 / 3000 / 5173 等）的占用进程，支持搜索过滤与
+# 一键释放。基于 iphlpapi 原生 API（GetExtendedTcpTable / GetExtendedUdpTable），
+# 四重降噪纯函数过滤（仅 LISTEN / 剔除 IANA 动态高位端口 / 会话隔离剔除
+# Session 0 服务 / 系统服务黑名单）；终止走 OpenProcess(PROCESS_TERMINATE) +
+# TerminateProcess，UIPI 拦截提示提权。
+[port_hunter]
+# 释放端口（终止进程）前是否要求用户二次确认（默认 true）。
+confirm_before_kill = true
+
+# 是否默认显示系统服务与动态高位端口（默认 false，四重降噪过滤生效；
+# 为 true 时全部展示）。UI 弹窗「显示系统服务与动态高位端口」开关绑定本字段。
+show_system_ports = false
+
+# 模块专属明细日志（port_hunter.log）落盘目录（相对 exe 同级目录）。
+# 缺省回退：exe 同级 logs/port_hunter
+# log_dir = "logs/port_hunter"
+
+# ==============================================================================
+# [icon_locker] 桌面图标布局锁（v0.6.0，默认关闭）
+# ==============================================================================
+# 保存当前桌面图标布局为方案，屏幕拓扑切换后自动瞬移归位。基于 EnumDisplayMonitors
+# 计算「显示器拓扑指纹」（主屏优先 + 坐标升序，如 P:0,0,2560x1440|S:-1920,0,1920x1080），
+# 不同拓扑独立保存方案；WM_DISPLAYCHANGE 以 1500ms 可重置防抖待系统重绘完成后，
+# 经纯原生 STA Shell COM（IShellWindows → FindWindowSW → IFolderView::
+# SelectAndPositionItems）批量瞬移归位。零跨进程内存注入（不调用 VirtualAllocEx /
+# ReadProcessMemory）。还原被弹回时请关闭桌面右键「自动排列图标」。
+[icon_locker]
+# 模块启停的唯一配置事实源（默认 false，UI / 托盘切换后持久化）。
+enabled = false
+
+# 显示器拓扑变化（WM_DISPLAYCHANGE）稳定后是否自动还原布局（默认开启，
+# 1500ms 可重置防抖）。可在 ⚙ 弹窗中随时关闭。
+auto_restore = true
+
+# 已保存的桌面图标布局方案（点击「保存布局」时自动写入，一般无需手工编辑）。
+# 每份方案包含：
+#   id                  方案唯一标识（如 profile-<毫秒时间戳>）
+#   name                方案名
+#   topology_fingerprint 绑定显示器拓扑指纹（如 P:0,0,2560x1440|S:-1920,0,1920x1080）
+#   icon_positions      图标 DisplayName → 桌面绝对坐标 { x, y }（虚拟桌面坐标系）
+# 示例：
+# profiles = [
+#     {
+#         id = "profile-1757500000000",
+#         name = "外接屏双显",
+#         topology_fingerprint = "P:0,0,2560x1440|S:-1920,0,1920x1080",
+#         icon_positions = {
+#             "此电脑"    = { x = 10,   y = 10 },
+#             "回收站"    = { x = 10,   y = 90 },
+#             "新建文本文档.txt" = { x = 100, y = 10 },
+#         },
+#     },
+# ]
+profiles = []
+
+# ==============================================================================
+# 附：配置完整默认值速查（v0.6.0）
+# ==============================================================================
+# 顶层键：
+#   auto_start_modules            = ["popup_blocker"]
+#   popup_blacklist               = ["广告", "Flash Helper Service", "Update Notice", "推广弹窗"]
+#   auto_start_windows            = false
+#   minimize_to_tray              = true
+#   enabled_shells                = ["powershell", "cmd", "bash"]
+#   terminal_log_dir              = 缺省 → exe 同级 logs/terminals
+#   app_log_dir                   = 缺省 → exe 同级 logs
+#   popup_screenshot_dir          = 缺省 → exe 同级 logs/popup_screenshots
+#   terminal_log_retention_days   = 缺省 → 14 天
+# [topmost_manager] enabled=false, pinned_rules=[]
+# [port_hunter]     confirm_before_kill=true, show_system_ports=false, log_dir=缺省 → logs/port_hunter
+# [icon_locker]     enabled=false, auto_restore=true, profiles=[]
+# ==============================================================================

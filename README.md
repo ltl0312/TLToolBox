@@ -2,12 +2,13 @@
 
 原生 Windows 桌面实用工具箱 —— 轻量 · 纯粹 · 常驻：单文件、免安装、无网络依赖、随开机静默自启。
 
+[![Version](https://img.shields.io/badge/Version-v0.6.0-7c3aed?style=flat-square)](https://github.com/ltl0312/TLToolBox/releases)
 [![Release](https://img.shields.io/github/v/release/ltl0312/TLToolBox?style=flat-square&color=2563eb&label=Release)](https://github.com/ltl0312/TLToolBox/releases)
 [![Rust](https://img.shields.io/badge/Rust-2021%20%7C%20MSVC-ea580c?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0284c7?style=flat-square&logo=windows)](https://www.microsoft.com/windows)
 [![License](https://img.shields.io/badge/License-MIT-16a34a?style=flat-square)](LICENSE)
 
-TLToolBox 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：把「桌面弹窗拦截、系统防休眠、剪贴板纯文本净化、终端交互与状态日志」收进一个常驻系统托盘、约 11 MB 的单文件程序里。后台常驻物理内存低至约 **1.8 MB**，开关即用、低打扰、零后台负担。它不含 Electron 外壳、不含解释器运行时、不发起任何网络请求——全部能力均通过 Win32 系统原生 API 本地完成。
+TLToolBox 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：把「桌面弹窗拦截、系统防休眠、剪贴板纯文本净化、终端交互日志、桌面图标布局锁」等七项能力收进一个常驻系统托盘、约 11 MB 的单文件程序里。后台常驻物理内存低至约 **1.8 MB**，开关即用、低打扰、零后台负担。它不含 Electron 外壳、不含解释器运行时、不发起任何网络请求——全部能力均通过 Win32 系统原生 API 本地完成。
 
 | 维度       | 说明                                                         |
 | :--------- | :----------------------------------------------------------- |
@@ -21,7 +22,7 @@ TLToolBox 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：�
 
 ## ✨ 功能特性
 
-五个模块卡片共享同一套「卡片 + 齿轮」交互：四个常驻守护模块拨动卡片开关即启用；**端口占用管理**为即开即用工具（无常驻后台开关，卡片显示「即开即用」），点击卡片上的 ⚙ 齿轮图标可进入对应模块的设置弹窗（弹窗拦截规则管理、终端日志存储管理、端口占用管理等）。
+七个模块卡片共享同一套「卡片 + 齿轮」交互：六个常驻守护模块拨动卡片开关即启用；**端口占用管理**为即开即用工具（无常驻后台开关，卡片显示「即开即用」），点击卡片上的 ⚙ 齿轮图标可进入对应模块的设置弹窗（弹窗拦截规则管理、终端日志存储管理、端口占用管理、图标布局方案管理等）。
 
 | 模块                                         | 它做什么                                                     | 底层原理                                                     | 推荐开启场景                                                 |
 | :------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- |
@@ -30,8 +31,10 @@ TLToolBox 是一个使用 Rust 编写的原生 Windows 桌面实用工具箱：�
 | **剪贴板纯文本净化**<br>`clipboard_purifier` | 剪贴板内容同时携带纯文本与富文本（网页 HTML、Office RTF、聊天工具内嵌样式）时，自动剔除格式残留，粘贴始终为纯文本 | 基于 `AddClipboardFormatListener` 注册监听，专用原生纯消息窗口（STATIC + `HWND_MESSAGE`）处理 `WM_CLIPBOARDUPDATE`；原子清空并重写，内置自循环回声防护（EchoGuard）彻底避免自我触发 | **默认关闭**。常将网页 / 文档内容复制进 Markdown、代码编辑器、终端等纯文本环境的用户；需要富文本粘贴时关闭 |
 | **终端交互日志**<br>`terminal_logger`        | 自动记录 CMD、PowerShell (5.1/7+)、Bash 终端的全部输入指令、交互会话与命令退出状态码（Exit Code） | **PowerShell**：挂载静默转录流并代理 `prompt` 捕获 `$LASTEXITCODE`；<br>**Bash**：基于 `PROMPT_COMMAND` 与历史行解析记录用户指令与 `$?`；<br>**CMD**：注册表 AutoRun 挂载原生非侵入式脚本，doskey 捕获用户键入与退出码，内置 `/c` 护栏严禁挂起构建子进程 | **默认关闭**。开发调试、命令行操作审计、运维排错及终端历史持久化留痕场景 |
 | **端口占用管理**<br>`port_hunter` | 毫秒级定位本地监听端口（8080 / 3000 / 5173 等）的占用进程，支持搜索过滤与一键释放；释放前可按配置二次确认 | 基于 iphlpapi 原生 API（`GetExtendedTcpTable` / `GetExtendedUdpTable`）；四重降噪纯函数过滤（仅 LISTEN / 剔除 IANA 动态高位端口 / 会话隔离剔除 Session 0 服务 / 系统服务黑名单）；终止走 `OpenProcess(PROCESS_TERMINATE)` + `TerminateProcess`，UIPI 拦截提示提权；「全局审计 + 模块明细」双轨日志 | 即开即用工具（⚙ 弹窗进入）。本地开发端口冲突时使用；代码 / 构建服务器等 Vagrant、Node、Java 进程乱占端口时一键清除 |
+| **全局窗口置顶守护**<br>`topmost_manager` | 需要常驻的窗口一键钉在顶层，支持 1~9 级置顶优先级（1 级最顶层）；最小化自动解置顶，后台守护绝不抢占焦点 | 专用泵线程安装 `SetWinEventHook` 监听前台切换（`EVENT_SYSTEM_FOREGROUND` ~ `EVENT_SYSTEM_MINIMIZESTART`），15ms `SetTimer` 防抖后沿 Z-Order 链以 `SetWindowPos(SWP_NOACTIVATE)` 重排纠偏；置顶规则与 1~9 级优先级记忆持久化到 `[topmost_manager]` 节，重启后按进程名 + 标题子串自动恢复 | **默认关闭**。资料窗口 / 计算器 / 监控面板需要常驻所有窗口之上的多任务用户 |
+| **桌面图标布局锁**<br>`icon_locker` | 解决插拔外接屏、修改分辨率导致桌面图标乱跑的顽疾：保存当前桌面图标布局为方案，屏幕拓扑切换后自动瞬移归位 | 基于 `EnumDisplayMonitors` 自动计算主副屏与多分辨率组合的**显示器拓扑指纹**，不同屏幕拓扑独立保存方案；独立原生消息泵监听 `WM_DISPLAYCHANGE`，**1500ms 可重置防抖**（Debounce）待系统重绘完成后，经纯原生 Shell STA COM（`IShellWindows` → `FindWindowSW` → `IFolderView::SelectAndPositionItems`）批量瞬移归位；**零跨进程内存注入**（不调用 `VirtualAllocEx` / `ReadProcessMemory`） | **默认关闭**。常插拔外接屏 / 扩展坞、切换分辨率或投影的笔记本与多屏工作站用户，保存一次布局即可无感归位 |
 
-> **默认值说明**：弹窗拦截属于“装上即用”的核心能力，默认随应用启动；防休眠、剪贴板净化与终端日志涉及系统电源策略、剪贴板行为与外部 Shell 挂接，属于操作敏感型功能，默认保持关闭，由用户显式开启。
+> **默认值说明**：弹窗拦截属于“装上即用”的核心能力，默认随应用启动；防休眠、剪贴板净化、终端日志、窗口置顶与图标布局锁涉及系统电源策略、剪贴板行为、外部 Shell 挂接与 Shell 桌面视图操作，属于操作敏感型功能，默认保持关闭，由用户显式开启。
 
 ---
 
@@ -70,6 +73,14 @@ Windows 的系统级事件通知——`SetWinEventHook`（`WINEVENT_OUTOFCONTEXT
 * **原子写盘机制**：配置持久化采用同目录临时文件 + rename 原子替换，系统崩溃不产生半截损坏文件；
 * **滚动日志落盘**：引入 `tracing-appender` 按天切分本地日志（保留 15 份），Release 模式下无控制台黑框仍可稳定记录排错日志。
 
+### 5. 桌面图标布局锁：零注入 Shell COM 与显示器拓扑守护（v0.6.0）
+* **严禁 / 无注入**：桌面图标坐标的抓取与还原只走 Shell COM 接口——`IShellWindows::FindWindowSW(SWC_DESKTOP)` 直连桌面视图，沿 `IShellBrowser → IFolderView` 链路操作，**零跨进程内存注入**（不调用 `VirtualAllocEx` / `ReadProcessMemory` 等进程内存 API），从根上杜绝杀毒软件启发式误报与系统完整性风险；
+* **纯净 STA 模型**：每次抓取 / 还原都经 `spawn_com_thread` 拉起**全新的独立 OS 线程**，线程内严格配对 `CoInitializeEx(COINIT_APARTMENTTHREADED)` / `CoUninitialize`（`RPC_E_CHANGED_MODE` 容错复用既有公寓），绝不复用 `spawn_blocking` 阻塞池线程——避免第三方残留 MTA 公寓污染 Tokio 异步运行时线程池；
+* **显示器拓扑指纹**：基于 `EnumDisplayMonitors` + `GetMonitorInfoW` 采集主副屏几何，按「主屏优先 + 坐标升序」归一化为唯一指纹（如 `P:0,0,2560x1440|S:-1920,0,1920x1080`），不同屏幕拓扑独立保存布局方案，插拔屏幕互不串扰；
+* **无感拓扑守护**：专用原生消息泵线程监听 `WM_DISPLAYCHANGE`，以 1500ms **可重置防抖**（同 ID `SetTimer` 重新武装，连续变化自动顺延）待系统重绘稳定后，经 `IFolderView::SelectAndPositionItems` 批量瞬移归位——绝不在高频显示事件风暴中重复执行。
+
+> **排查指引**：若还原后图标被 Windows 自动弹回，请确认关闭桌面右键的「自动排列图标」（启用状态下 Explorer 会强制吸附网格并吞掉 `SelectAndPositionItems` 的定位结果）。
+
 ## 🚀 快速上手
 
 ### 绿色便携版（解压即用）
@@ -102,6 +113,28 @@ Windows 的系统级事件通知——`SetWinEventHook`（`WINEVENT_OUTOFCONTEXT
 点击「终端交互日志」卡片右侧的 ⚙ 齿轮：
 * 查看当前日志绝对路径（默认 `exe 同级/logs/terminals/`）；
 * 点击「在文件资源管理器中打开日志目录」快速调取各终端生成的会话 log 文件。
+
+### 桌面图标布局锁 · 布局方案管理
+点击「桌面图标布局锁」卡片右侧的 ⚙ 齿轮：
+* **保存布局**：先调整好桌面图标，输入方案名后点击「保存布局」，即为当前显示器拓扑（主副屏 + 分辨率组合指纹）生成一份快照方案；
+* **拓扑切换无感归位**：「显示器拓扑变化后自动还原」默认开启，模块以 1500ms 可重置防抖监听 `WM_DISPLAYCHANGE`，系统重绘完成后自动瞬移归位，可在 ⚙ 弹窗中随时关闭；
+* **手动还原 / 删除**：方案列表中的任意快照均可一键「还原」或删除；还原前可与弹窗顶部展示的当前环境指纹比对；
+* **失败排查**：若还原后图标被系统弹回，请确认桌面右键的「自动排列图标」处于关闭状态。
+
+---
+
+## 📝 配置文件说明（config/tltoolbox.toml）
+
+配置文件位于 `exe 同级目录\config\tltoolbox.toml`（首次启动自动创建），路径以可执行文件所在目录绝对锚定，注册表开机自启（CWD 为 `C:\Windows\System32`）时同样可靠。各模块开关由 UI / 托盘切换后自动持久化回本文件，无需手工编辑；以下为 v0.6.0 新增的 `[icon_locker]` 配置节：
+
+```toml
+[icon_locker]
+enabled = true                           # 是否启用常驻守护（持久化镜像，默认 false，UI / 托盘切换后自动落盘）
+auto_restore = true                      # 分辨率/屏幕拓扑变化后是否自动恢复（默认开启，1500ms 防抖）
+# profiles 为按显示器拓扑指纹自动维护的各分辨率快照映射表（点击「保存布局」时自动写入，一般无需手工编辑）
+```
+
+> `profiles` 中每份快照包含 `id` / `name` / `topology_fingerprint`（如 `P:0,0,2560x1440|S:-1920,0,1920x1080`）与 `icon_positions`（图标 DisplayName → 桌面绝对坐标），由模块在保存 / 还原时自动维护：不同主副屏组合自动对应不同指纹，互不串扰。
 
 ---
 
@@ -170,6 +203,10 @@ TLToolBox/
 │       │   ├── ps_bash.rs   # PowerShell 与 Bash 挂载实现
 │       │   └── cmd.rs       # CMD AutoRun 批处理与 doskey 状态捕获
 │       ├── topmost_manager/ # 全局窗口置顶守护（enum_windows / engine）
+│       ├── icon_locker/     # 桌面图标布局锁（v0.6.0：拓扑指纹 + 防抖守护）
+│       │   ├── mod.rs       # 模块装配与布局方案生命周期管理
+│       │   ├── daemon.rs    # 显示器拓扑指纹 + WM_DISPLAYCHANGE 防抖守护线程
+│       │   └── explorer.rs  # Shell STA COM 抓取 / 还原引擎（spawn_com_thread）
 │       └── port_hunter/     # 端口占用管理（即开即用工具）
 │           ├── mod.rs       # 模块编排与展示缓存
 │           ├── scanner.rs   # iphlpapi 监听枚举 + 四重降噪纯函数
