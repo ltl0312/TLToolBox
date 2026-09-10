@@ -402,14 +402,8 @@ fn oem_encode(text: &str) -> Vec<u8> {
     // SAFETY: 探测调用（lpMultiByteStr=None → 返回所需字节数）与写入调用
     // （缓冲长度即探测值）均在调用期间持有所有权。
     unsafe {
-        let needed = WideCharToMultiByte(
-            CP_OEMCP,
-            0,
-            &wide,
-            None,
-            windows::core::PCSTR::null(),
-            None,
-        );
+        let needed =
+            WideCharToMultiByte(CP_OEMCP, 0, &wide, None, windows::core::PCSTR::null(), None);
         if needed <= 0 {
             return text.as_bytes().to_vec(); // 兜底：编码失败按 UTF-8 输出
         }
@@ -477,8 +471,11 @@ pub fn capture_script_bytes(log_base: &Path) -> CmdHookResult<Vec<u8>> {
             out.push(b);
         }
     }
-    debug_assert!(!out.windows(LOG_ROOT_PLACEHOLDER.len()).any(|w| w == LOG_ROOT_PLACEHOLDER.as_bytes()),
-        "占位符必须被替换");
+    debug_assert!(
+        !out.windows(LOG_ROOT_PLACEHOLDER.len())
+            .any(|w| w == LOG_ROOT_PLACEHOLDER.as_bytes()),
+        "占位符必须被替换"
+    );
     Ok(out)
 }
 
@@ -1095,10 +1092,7 @@ mod tests {
     /// 代码页字节，请走 [`capture_script_bytes`] + [`oem_decode_for_test`]）。
     fn embedded_log_root(content: &str) -> String {
         let marker = "set \"TLTB_CMD_LOG_DIR=";
-        let start = content
-            .find(marker)
-            .expect("脚本应含日志根路径行")
-            + marker.len();
+        let start = content.find(marker).expect("脚本应含日志根路径行") + marker.len();
         let end = content[start..]
             .find('"')
             .expect("日志根路径应以双引号收尾")
@@ -1203,14 +1197,8 @@ mod tests {
         // SAFETY: 探测调用（lpMultiByteStr=None → 返回所需字节数）与写入调用
         // （缓冲长度即探测值）均在调用期间持有所有权。
         unsafe {
-            let needed = WideCharToMultiByte(
-                codepage,
-                0,
-                &wide,
-                None,
-                windows::core::PCSTR::null(),
-                None,
-            );
+            let needed =
+                WideCharToMultiByte(codepage, 0, &wide, None, windows::core::PCSTR::null(), None);
             if needed <= 0 {
                 return text.as_bytes().to_vec(); // 与生产一致：失败按 UTF-8 兜底
             }
@@ -1231,9 +1219,7 @@ mod tests {
     /// 以**显式代码页**解码（仅测试侧模拟，不依赖系统当前代码页）。
     #[cfg(windows)]
     fn oem_decode_with_cp_for_test(bytes: &[u8], codepage: u32) -> String {
-        use windows::Win32::Globalization::{
-            MultiByteToWideChar, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
-        };
+        use windows::Win32::Globalization::{MultiByteToWideChar, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
         // SAFETY: 探测调用（lpWideCharStr=None → 返回所需宽字符数）与写入调用
         // （缓冲长度即探测值）均在调用期间持有所有权。
         unsafe {
@@ -1322,9 +1308,7 @@ mod tests {
 
         // doskey 会话记录机制：exit 宏（收尾 + 真实退出，退出码经 $* 透传）
         // + 收尾时 doskey /history 键入命令清单落盘。
-        assert!(content.contains(
-            "doskey exit=call \"%~f0\" __TLTB_CMD_FINALIZE__ $T exit $*"
-        ));
+        assert!(content.contains("doskey exit=call \"%~f0\" __TLTB_CMD_FINALIZE__ $T exit $*"));
         assert!(content.contains("doskey /history >> \"%TLTB_CMD_LOG%\""));
         assert!(content.contains("cmd session end"));
         // 用户已有同名 exit 宏时不覆盖。
@@ -1464,7 +1448,10 @@ mod tests {
 
         // 降级输出后脚本格式必须仍然合法（cmd 可正常解析）。
         let problems = find_batch_format_problems(&simulated, &cp437_segment);
-        assert!(problems.is_empty(), "437 降级输出的 .bat 格式不合法: {problems:?}");
+        assert!(
+            problems.is_empty(),
+            "437 降级输出的 .bat 格式不合法: {problems:?}"
+        );
         assert!(
             simulated.iter().all(u8::is_ascii),
             "437 下整份脚本应保持纯 ASCII（无 BOM、无其它非 ASCII 字节）"

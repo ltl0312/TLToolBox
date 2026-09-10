@@ -55,7 +55,7 @@ use std::path::Path;
 use windows::Win32::Foundation::BOOL;
 #[cfg(windows)]
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP_STATE_LISTEN, MIB_TCPROW_OWNER_PID,
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPROW_OWNER_PID, MIB_TCP_STATE_LISTEN,
     MIB_UDPROW_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
 #[cfg(windows)]
@@ -242,7 +242,10 @@ pub fn is_system_service_entry(pid: u32, process_name: &str, port: u16) -> bool 
         return true; // System(4) / Idle(0)：内核态条目
     }
     let lower_name = process_name.to_lowercase();
-    if SYSTEM_IMAGE_BLACKLIST.iter().any(|name| *name == lower_name) {
+    if SYSTEM_IMAGE_BLACKLIST
+        .iter()
+        .any(|name| *name == lower_name)
+    {
         return true;
     }
     SYSTEM_RESERVED_PORTS.contains(&port)
@@ -283,7 +286,11 @@ pub fn parse_explicit_port(search: &str) -> Option<u16> {
 /// 按顺序执行「动态端口（阶段 2，含显式端口豁免）→ 系统服务黑名单（阶段 4）
 /// → 搜索匹配」。`rows` 为模块缓存的「状态 + 会话」已降噪条目；搜索匹配为
 /// **端口号精确** + 进程名 / 协议 / 绑定地址子串（忽略大小写）。
-pub fn filter_port_rows(rows: &[PortEntry], search: &str, show_system_ports: bool) -> Vec<PortEntry> {
+pub fn filter_port_rows(
+    rows: &[PortEntry],
+    search: &str,
+    show_system_ports: bool,
+) -> Vec<PortEntry> {
     let opts = FilterOptions {
         show_system_ports,
         explicit_port: parse_explicit_port(search),
@@ -361,7 +368,9 @@ pub fn scan_and_collect(show_system_ports: bool) -> Result<ScanReport, super::Po
     let entries: Vec<PortEntry> = tcp_raw.into_iter().chain(udp_raw).map(enrich).collect();
     let mut sessions: HashMap<u32, Option<u32>> = HashMap::new();
     for entry in &entries {
-        sessions.entry(entry.pid).or_insert_with(|| session_of_pid(entry.pid));
+        sessions
+            .entry(entry.pid)
+            .or_insert_with(|| session_of_pid(entry.pid));
     }
 
     // 会话隔离（阶段 3）：当前会话查询失败时整体跳过该阶段（避免误杀全部）。
@@ -445,8 +454,9 @@ fn parse_tcp_table(buffer: &[u8], show_system_ports: bool) -> Vec<RawListener> {
     // SAFETY: 缓冲区头部为 API 写入的 u32 条目数；read_unaligned 不要求对齐。
     let count = unsafe { (buffer.as_ptr() as *const u32).read_unaligned() } as usize;
     // SAFETY: 条目数 × 行大小必须落在缓冲区内（API 契约保证），行切片满足对齐。
-    let rows =
-        unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(4) as *const MIB_TCPROW_OWNER_PID, count) };
+    let rows = unsafe {
+        std::slice::from_raw_parts(buffer.as_ptr().add(4) as *const MIB_TCPROW_OWNER_PID, count)
+    };
     // 复合主键去重集（协议码, 本地端口, PID）——循环内凡已存在的一律丢弃。
     let mut seen: std::collections::HashSet<(u8, u16, u32)> = std::collections::HashSet::new();
     rows.iter()
@@ -478,7 +488,14 @@ fn parse_tcp_table(buffer: &[u8], show_system_ports: bool) -> Vec<RawListener> {
 fn scan_udp_listeners(show_system_ports: bool) -> Result<Vec<RawListener>, super::PortError> {
     let mut size: u32 = 0;
     let mut ret = unsafe {
-        GetExtendedUdpTable(None, &mut size, BOOL::from(false), AF_INET, UDP_TABLE_OWNER_PID, 0)
+        GetExtendedUdpTable(
+            None,
+            &mut size,
+            BOOL::from(false),
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
     };
     if ret == 0 {
         return Ok(Vec::new());
@@ -520,8 +537,9 @@ fn parse_udp_table(buffer: &[u8], show_system_ports: bool) -> Vec<RawListener> {
     // SAFETY: 同 parse_tcp_table——头部 u32 条目数以 read_unaligned 读取。
     let count = unsafe { (buffer.as_ptr() as *const u32).read_unaligned() } as usize;
     // SAFETY: 行切片 = 堆指针 + 4（4 字节对齐），条目数落在缓冲区内（API 契约）。
-    let rows =
-        unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(4) as *const MIB_UDPROW_OWNER_PID, count) };
+    let rows = unsafe {
+        std::slice::from_raw_parts(buffer.as_ptr().add(4) as *const MIB_UDPROW_OWNER_PID, count)
+    };
     // 复合主键去重集（协议码, 本地端口, PID）——循环内凡已存在的一律丢弃。
     let mut seen: std::collections::HashSet<(u8, u16, u32)> = std::collections::HashSet::new();
     rows.iter()
@@ -680,8 +698,14 @@ mod tests {
             !is_iana_dynamic_port(5173),
             "5173 低于 IANA 动态区间下限（注册端口，默认保留）"
         );
-        assert!(!is_iana_dynamic_port(8080), "8080 是常用开发端口，不属于动态区间");
-        assert!(!is_iana_dynamic_port(3000), "3000 是常用开发端口，不属于动态区间");
+        assert!(
+            !is_iana_dynamic_port(8080),
+            "8080 是常用开发端口，不属于动态区间"
+        );
+        assert!(
+            !is_iana_dynamic_port(3000),
+            "3000 是常用开发端口，不属于动态区间"
+        );
     }
 
     #[test]
@@ -731,7 +755,7 @@ mod tests {
     fn session_isolation_drops_session_zero_but_keeps_unknown() {
         let rows = vec![
             entry("TCP", 8080, "0.0.0.0", 1001, "node.exe"),
-            entry("TCP", 80, "0.0.0.0", 4, "System"),   // Session 0 服务条目
+            entry("TCP", 80, "0.0.0.0", 4, "System"), // Session 0 服务条目
             entry("UDP", 5353, "0.0.0.0", 1002, "svc.exe"), // 查询失败（未知会话）
         ];
         let sessions = HashMap::from([(1001, Some(1u32)), (4, Some(0u32)), (1002, None)]);
@@ -754,17 +778,50 @@ mod tests {
     #[test]
     fn system_service_blacklist_covers_pid_images_and_reserved_ports() {
         assert!(is_system_service_entry(0, "Idle", 0), "PID 0（Idle）应命中");
-        assert!(is_system_service_entry(4, "System", 4), "PID 4（System）应命中");
-        assert!(is_system_service_entry(888, "svchost.exe", 49153), "svchost.exe 应命中");
-        assert!(is_system_service_entry(888, "SVCHOST.EXE", 49153), "镜像名应大小写不敏感");
-        assert!(is_system_service_entry(888, "lsass.exe", 49153), "lsass.exe 应命中");
-        assert!(is_system_service_entry(888, "services.exe", 49153), "services.exe 应命中");
-        assert!(is_system_service_entry(888, "spoolsv.exe", 49153), "spoolsv.exe 应命中");
-        assert!(is_system_service_entry(888, "DWM.EXE", 49153), "dwm.exe 应命中");
-        assert!(is_system_service_entry(1234, "anything.exe", 135), "保留端口 135 应命中");
-        assert!(is_system_service_entry(1234, "anything.exe", 445), "保留端口 445 应命中");
-        assert!(is_system_service_entry(1234, "anything.exe", 5357), "保留端口 5357 应命中");
-        assert!(is_system_service_entry(1234, "anything.exe", 139), "SMB 固定监听 139 应命中");
+        assert!(
+            is_system_service_entry(4, "System", 4),
+            "PID 4（System）应命中"
+        );
+        assert!(
+            is_system_service_entry(888, "svchost.exe", 49153),
+            "svchost.exe 应命中"
+        );
+        assert!(
+            is_system_service_entry(888, "SVCHOST.EXE", 49153),
+            "镜像名应大小写不敏感"
+        );
+        assert!(
+            is_system_service_entry(888, "lsass.exe", 49153),
+            "lsass.exe 应命中"
+        );
+        assert!(
+            is_system_service_entry(888, "services.exe", 49153),
+            "services.exe 应命中"
+        );
+        assert!(
+            is_system_service_entry(888, "spoolsv.exe", 49153),
+            "spoolsv.exe 应命中"
+        );
+        assert!(
+            is_system_service_entry(888, "DWM.EXE", 49153),
+            "dwm.exe 应命中"
+        );
+        assert!(
+            is_system_service_entry(1234, "anything.exe", 135),
+            "保留端口 135 应命中"
+        );
+        assert!(
+            is_system_service_entry(1234, "anything.exe", 445),
+            "保留端口 445 应命中"
+        );
+        assert!(
+            is_system_service_entry(1234, "anything.exe", 5357),
+            "保留端口 5357 应命中"
+        );
+        assert!(
+            is_system_service_entry(1234, "anything.exe", 139),
+            "SMB 固定监听 139 应命中"
+        );
         // v0.5.1 强化：广播 / 系统服务端口全部进入黑名单（show=false 时不再刷屏）。
         for broadcast_port in [137u16, 138, 1900, 5353, 5355] {
             assert!(
@@ -819,7 +876,11 @@ mod tests {
         ];
         let filtered = filter_system_services(&rows, &FilterOptions::default());
         let ports: Vec<u16> = filtered.iter().map(|e| e.local_port).collect();
-        assert_eq!(ports, vec![8080], "默认黑名单应剔除 System/svchost/保留端口");
+        assert_eq!(
+            ports,
+            vec![8080],
+            "默认黑名单应剔除 System/svchost/保留端口"
+        );
 
         // show=true：黑名单整体豁免，但 PID 4（System）内核态条目仍无条件剔除
         //（v0.5.1 语义：PID ≤ 4 永不展示，见 is_kernel_owner）。
@@ -831,7 +892,11 @@ mod tests {
             },
         );
         let ports: Vec<u16> = filtered.iter().map(|e| e.local_port).collect();
-        assert_eq!(ports, vec![135, 8080], "显示系统服务时仅剩 PID 4 被无条件剔除");
+        assert_eq!(
+            ports,
+            vec![135, 8080],
+            "显示系统服务时仅剩 PID 4 被无条件剔除"
+        );
     }
 
     // ---- 显式端口解析 ----
@@ -842,11 +907,19 @@ mod tests {
         assert_eq!(parse_explicit_port(" 8080 "), Some(8080));
         assert_eq!(parse_explicit_port("65535"), Some(65535));
         assert_eq!(parse_explicit_port("1"), Some(1));
-        assert_eq!(parse_explicit_port("0"), None, "端口 0 无意义，不视为显式输入");
+        assert_eq!(
+            parse_explicit_port("0"),
+            None,
+            "端口 0 无意义，不视为显式输入"
+        );
         assert_eq!(parse_explicit_port("node"), None);
         assert_eq!(parse_explicit_port(""), None);
         assert_eq!(parse_explicit_port("5173x"), None, "混合输入不视为端口号");
-        assert_eq!(parse_explicit_port("65536"), None, "超出 u16 上限不视为端口号");
+        assert_eq!(
+            parse_explicit_port("65536"),
+            None,
+            "超出 u16 上限不视为端口号"
+        );
     }
 
     // ---- 展示期完整过滤（阶段 2 + 4 + 搜索匹配） ----
@@ -883,19 +956,30 @@ mod tests {
 
         // 搜索系统镜像名但不打开「显示系统服务」：阶段 4 仍生效（黑名单优先）。
         let filtered = filter_port_rows(&rows, "svchost", false);
-        assert!(filtered.is_empty(), "未开启显示系统服务时黑色名单进程不可见");
+        assert!(
+            filtered.is_empty(),
+            "未开启显示系统服务时黑色名单进程不可见"
+        );
 
         // show=true：系统 / 动态全部可见；但 PID 4（System）内核态条目仍无条件
         // 剔除（v0.5.1，见 is_kernel_owner）——目录中的 System 一行不再出现。
         let filtered = filter_port_rows(&rows, "", true);
-        assert_eq!(filtered.len(), 4, "显示系统服务时展示除 PID 4 外的全部缓存行");
+        assert_eq!(
+            filtered.len(),
+            4,
+            "显示系统服务时展示除 PID 4 外的全部缓存行"
+        );
         assert!(
             filtered.iter().all(|e| e.pid > 4),
             "任何展示形态下都不得包含 PID ≤ 4 的条目"
         );
         let filtered = filter_port_rows(&rows, "node", true);
         let ports: Vec<u16> = filtered.iter().map(|e| e.local_port).collect();
-        assert_eq!(ports, vec![8080, 60000], "显示全量后按进程名搜索命中两条 node 行");
+        assert_eq!(
+            ports,
+            vec![8080, 60000],
+            "显示全量后按进程名搜索命中两条 node 行"
+        );
 
         // 协议子串搜索（TCP）。
         let filtered = filter_port_rows(&rows, "udp", false);
@@ -907,9 +991,9 @@ mod tests {
     fn denoise_all_composes_four_stages_in_order() {
         let rows = vec![
             entry("TCP", 8080, "127.0.0.1", 1001, "node.exe"),
-            entry("TCP", 60000, "127.0.0.1", 1002, "node.exe"),   // IANA 动态端口
-            entry("TCP", 49152, "0.0.0.0", 0, "Idle"),            // Session 0 + 动态
-            entry("TCP", 445, "0.0.0.0", 888, "svchost.exe"),     // 黑名单
+            entry("TCP", 60000, "127.0.0.1", 1002, "node.exe"), // IANA 动态端口
+            entry("TCP", 49152, "0.0.0.0", 0, "Idle"),          // Session 0 + 动态
+            entry("TCP", 445, "0.0.0.0", 888, "svchost.exe"),   // 黑名单
         ];
         let sessions = HashMap::from([
             (1001, Some(1u32)),
@@ -924,7 +1008,11 @@ mod tests {
 
         let kept = denoise_all(&rows, &opts, &sessions, 1);
         let ports: Vec<u16> = kept.iter().map(|e| e.local_port).collect();
-        assert_eq!(ports, vec![8080], "四阶段后仅剩同会话 + 非动态 + 非黑名单的 8080");
+        assert_eq!(
+            ports,
+            vec![8080],
+            "四阶段后仅剩同会话 + 非动态 + 非黑名单的 8080"
+        );
 
         // 显式搜索 60000：动态豁免，但会话 / 黑名单仍生效。
         let opts = FilterOptions {
@@ -942,11 +1030,23 @@ mod tests {
     fn physical_block_never_lets_kernel_owner_enter() {
         // PID ≤ 4（含 0）无论端口 / 显示选项如何，一律物理阻断。
         for pid in [0u32, 1, 2, 3, 4] {
-            assert!(is_physically_blocked(pid, 8080, true), "PID {pid} 即使显示系统端口也阻断");
-            assert!(is_physically_blocked(pid, 8080, false), "PID {pid} 默认形态阻断");
-            assert!(is_physically_blocked(pid, 0, false), "PID {pid} 任意端口阻断");
+            assert!(
+                is_physically_blocked(pid, 8080, true),
+                "PID {pid} 即使显示系统端口也阻断"
+            );
+            assert!(
+                is_physically_blocked(pid, 8080, false),
+                "PID {pid} 默认形态阻断"
+            );
+            assert!(
+                is_physically_blocked(pid, 0, false),
+                "PID {pid} 任意端口阻断"
+            );
         }
-        assert!(!is_physically_blocked(5, 8080, true), "PID 5 非内核态，显示系统端口时放行");
+        assert!(
+            !is_physically_blocked(5, 8080, true),
+            "PID 5 非内核态，显示系统端口时放行"
+        );
         assert!(!is_physically_blocked(888, 8080, true), "普通 PID 放行");
     }
 
@@ -961,7 +1061,10 @@ mod tests {
         }
         // show=true：放行（PID 正常）。
         for port in [135u16, 1900, 5353] {
-            assert!(!is_physically_blocked(888, port, true), "显示系统服务时 {port} 放行");
+            assert!(
+                !is_physically_blocked(888, port, true),
+                "显示系统服务时 {port} 放行"
+            );
         }
         // 普通开发端口两种形态均放行。
         assert!(!is_physically_blocked(888, 8080, false));
@@ -977,9 +1080,9 @@ mod tests {
         let mut seen: std::collections::HashSet<(u8, u16, u32)> = std::collections::HashSet::new();
         let rows = [
             (TCP_PROTOCOL_CODE, 8080u16, 1001u32),
-            (TCP_PROTOCOL_CODE, 8080, 1001),   // 同进程多 IP：重复
-            (TCP_PROTOCOL_CODE, 8080, 1002),   // 不同 PID：不重复
-            (UDP_PROTOCOL_CODE, 8080, 1001),   // 不同协议：不重复
+            (TCP_PROTOCOL_CODE, 8080, 1001), // 同进程多 IP：重复
+            (TCP_PROTOCOL_CODE, 8080, 1002), // 不同 PID：不重复
+            (UDP_PROTOCOL_CODE, 8080, 1001), // 不同协议：不重复
         ];
         let kept: Vec<_> = rows
             .into_iter()
@@ -1013,7 +1116,11 @@ mod tests {
         // 网络字节序 → 主机序往返：任意端口的 from_be 幂等性。
         for port in [80u16, 443, 3000, 5173, 65535] {
             let network_ordered = u16::to_be(port); // API 存储形态（u16 取低 16 位）
-            assert_eq!(ntohs_port(network_ordered as u32), port, "端口 {port} 往返应一致");
+            assert_eq!(
+                ntohs_port(network_ordered as u32),
+                port,
+                "端口 {port} 往返应一致"
+            );
         }
     }
 
@@ -1047,7 +1154,10 @@ mod tests {
         // 绝不进入任何 Vec），系统端口放行。
         let report = scan_and_collect(true).expect("本机监听表扫描应成功");
         for entry in &report.entries {
-            assert!(entry.pid > 4, "物理阻断失效：即使显示系统服务，PID ≤ 4 也不得进入");
+            assert!(
+                entry.pid > 4,
+                "物理阻断失效：即使显示系统服务，PID ≤ 4 也不得进入"
+            );
         }
     }
 }

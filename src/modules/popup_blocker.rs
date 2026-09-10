@@ -81,8 +81,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError, RwLock as StdRwLock};
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
@@ -544,7 +544,10 @@ impl PopupBlockerModule {
 
     /// 当前生效的截图目录（未启用时返回 `None`，供 UI 展示与「打开目录」入口）。
     pub fn screenshot_dir(&self) -> Option<PathBuf> {
-        self.inner.screenshots.as_ref().map(|state| state.dir.clone())
+        self.inner
+            .screenshots
+            .as_ref()
+            .map(|state| state.dir.clone())
     }
 
     /// 热更新黑名单：整体替换规则快照（发布-订阅语义）。

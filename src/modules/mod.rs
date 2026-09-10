@@ -92,3 +92,6 @@ pub mod topmost_manager;
 /// （[`port_hunter::logger`]，与全局审计日志构成双轨日志体系）；UI 侧为「即开即用」
 /// 卡片 + 管理弹窗，无常驻后台开关。
 pub mod port_hunter;
+
+/// Desktop icon layout lock (v0.6.0).
+pub mod icon_locker;

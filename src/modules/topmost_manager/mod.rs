@@ -85,10 +85,9 @@ use windows::Win32::{
     System::Threading::GetCurrentThreadId,
     UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
     UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
-        PostThreadMessageW, SetTimer, TranslateMessage, EVENT_SYSTEM_FOREGROUND,
-        EVENT_SYSTEM_MINIMIZESTART, MSG, PM_NOREMOVE, WINEVENT_OUTOFCONTEXT,
-        WINEVENT_SKIPOWNPROCESS, WM_QUIT, WM_TIMER,
+        DispatchMessageW, GetMessageW, KillTimer, PeekMessageW, PostMessageW, PostThreadMessageW,
+        SetTimer, TranslateMessage, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZESTART, MSG,
+        PM_NOREMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT, WM_TIMER,
     },
 };
 
@@ -188,15 +187,16 @@ impl TopmostState {
     }
 
     fn find(&self, hwnd: isize) -> Option<ActivePinnedWindow> {
-        self.snapshot()
-            .into_iter()
-            .find(|entry| entry.hwnd == hwnd)
+        self.snapshot().into_iter().find(|entry| entry.hwnd == hwnd)
     }
 
     /// 追加或原位更新一条受管条目（新条目追加在向量末尾 = 同优先级组内最下）。
     fn upsert(&self, entry: ActivePinnedWindow) {
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        match guard.iter_mut().find(|existing| existing.hwnd == entry.hwnd) {
+        match guard
+            .iter_mut()
+            .find(|existing| existing.hwnd == entry.hwnd)
+        {
             Some(existing) => *existing = entry,
             None => guard.push(entry),
         }
@@ -227,7 +227,12 @@ impl TopmostState {
 
     /// 拉取并清除守护失败标志（一次性告警）。
     fn take_guard_failure(&self) -> bool {
-        std::mem::take(&mut *self.guard_failure.lock().unwrap_or_else(PoisonError::into_inner))
+        std::mem::take(
+            &mut *self
+                .guard_failure
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 }
 
@@ -314,17 +319,22 @@ impl TopmostManagerModule {
     pub fn with_bus(self, bus: Option<EventBus>) -> Self {
         if let Some(bus) = bus {
             // 总线在模块构造时装配一次（不可变字段）。
-            self.inner.bus.lock().unwrap_or_else(PoisonError::into_inner).replace(bus);
+            self.inner
+                .bus
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .replace(bus);
         }
         self
     }
 
     /// 装配规则持久化通道（单写者；置顶 / 解除 / 改级后投递最新 [`PinnedRule`] 列表）。
-    pub fn attach_rule_persister(
-        &self,
-        tx: tokio::sync::mpsc::UnboundedSender<Vec<PinnedRule>>,
-    ) {
-        *self.inner.rules_tx.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+    pub fn attach_rule_persister(&self, tx: tokio::sync::mpsc::UnboundedSender<Vec<PinnedRule>>) {
+        *self
+            .inner
+            .rules_tx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
     }
 
     /// 当前受管条目快照（插入序；调试 / 测试用）。
@@ -372,8 +382,8 @@ impl TopmostManagerModule {
         engine::set_topmost(hwnd)?;
 
         // 2) 采集实时元数据并入状态（进程名 / 标题以置顶时刻为准）。
-        let (process_name, title) = window_identity(hwnd)
-            .unwrap_or_else(|| ("<unknown.exe>".to_string(), String::new()));
+        let (process_name, title) =
+            window_identity(hwnd).unwrap_or_else(|| ("<unknown.exe>".to_string(), String::new()));
         // 3) 写入进程级优先级记忆（v0.4.1：解除置顶后仍可回填 / 持久化）。
         self.memorize_priority(&process_name, priority);
         self.upsert_entry(ActivePinnedWindow {
@@ -961,7 +971,9 @@ fn pump_thread_main(
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         if hook.0.is_null() {
-            let _ = ready_tx.send(Err("SetWinEventHook 安装失败（前台 / 最小化事件钩子）".to_string()));
+            let _ = ready_tx.send(Err(
+                "SetWinEventHook 安装失败（前台 / 最小化事件钩子）".to_string()
+            ));
             return;
         }
 
@@ -1098,15 +1110,17 @@ mod tests {
     /// 受管条目与配置节双向互转的端到端往返（结构体序列化测试之一）。
     #[test]
     fn pinned_snapshot_roundtrips_through_config_section() {
-        let managed = [entry(0x1, "a.exe", "标题 A", 2), entry(0x2, "b.exe", "标题 B", 9)];
+        let managed = [
+            entry(0x1, "a.exe", "标题 A", 2),
+            entry(0x2, "b.exe", "标题 B", 9),
+        ];
         let rules: Vec<PinnedRule> = managed.iter().map(ActivePinnedWindow::to_rule).collect();
         let cfg = TopmostManagerConfig {
             enabled: true,
             pinned_rules: rules,
         };
         let toml_text = toml::to_string_pretty(&cfg).expect("序列化应成功");
-        let parsed: TopmostManagerConfig =
-            toml::from_str(&toml_text).expect("反序列化应成功");
+        let parsed: TopmostManagerConfig = toml::from_str(&toml_text).expect("反序列化应成功");
         assert_eq!(parsed.pinned_rules.len(), 2);
         assert_eq!(parsed.pinned_rules[0].process_name, "a.exe");
         assert_eq!(parsed.pinned_rules[0].priority, 2);
@@ -1178,7 +1192,11 @@ mod tests {
 
         let sorted = state.sorted_snapshot();
         let order: Vec<isize> = sorted.iter().map(|e| e.hwnd).collect();
-        assert_eq!(order, vec![0x10, 0x12, 0x20, 0x30], "优先级升序 + 插入序稳定");
+        assert_eq!(
+            order,
+            vec![0x10, 0x12, 0x20, 0x30],
+            "优先级升序 + 插入序稳定"
+        );
 
         // 同优先级改级：upsert 原位更新保持位置（find 命中更新）。
         state.upsert(ActivePinnedWindow {
@@ -1255,7 +1273,10 @@ mod tests {
         assert!(rule_matches_window_info(&rule, &window));
         assert_eq!(rule.priority, 2);
 
-        let disabled = PinnedRule { enabled: false, ..rule };
+        let disabled = PinnedRule {
+            enabled: false,
+            ..rule
+        };
         assert!(!rule_matches_window_info(&disabled, &window));
     }
 
@@ -1416,7 +1437,10 @@ mod tests {
             enabled: false,
         }];
         let module = TopmostManagerModule::with_rules(rules);
-        module.inner.state.upsert(entry(0x1111, "notepad.exe", "文档 - 记事本", 4));
+        module
+            .inner
+            .state
+            .upsert(entry(0x1111, "notepad.exe", "文档 - 记事本", 4));
         assert_eq!(module.remembered_priority("notepad.exe"), Some(4));
 
         let _ = module.apply_unpin(0x1111); // 伪句柄 → InvalidWindow，但移除已完成
@@ -1448,10 +1472,7 @@ mod tests {
         // 与“窗口在解置顶前已消亡”同语义，同样视为解除完成）。
         module.handle_minimized(0x2222);
 
-        assert!(
-            module.pinned().is_empty(),
-            "最小化受管窗口后条目必须被移除"
-        );
+        assert!(module.pinned().is_empty(), "最小化受管窗口后条目必须被移除");
         match rx.try_recv() {
             Ok(AppEvent::ToastRequested(message)) => {
                 assert!(
@@ -1472,7 +1493,10 @@ mod tests {
         module.handle_minimized(0x9999);
         assert!(module.pinned().is_empty());
         assert!(
-            matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)),
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
             "非受管窗口最小化不应发布任何事件"
         );
     }

@@ -181,6 +181,58 @@ pub struct AppConfig {
     /// 本地开发端口猎手（v0.5.0，见 [`PortHunterConfig`]）。
     #[serde(default)]
     pub port_hunter: PortHunterConfig,
+    /// 桌面图标布局锁（v0.6.0）：启停事实源与已保存布局方案。
+    #[serde(default)]
+    pub icon_locker: IconLockerConfig,
+}
+
+/// 桌面图标布局锁配置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IconLockerConfig {
+    /// 模块启停的唯一配置事实源。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 显示器拓扑变化（WM_DISPLAYCHANGE）稳定后是否自动还原布局（默认开启）。
+    #[serde(default = "IconLockerConfig::default_auto_restore")]
+    pub auto_restore: bool,
+    /// 已保存的桌面图标布局方案。
+    #[serde(default)]
+    pub profiles: Vec<IconLayoutProfile>,
+}
+
+impl IconLockerConfig {
+    fn default_auto_restore() -> bool {
+        true
+    }
+}
+
+impl Default for IconLockerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_restore: Self::default_auto_restore(),
+            profiles: Vec::new(),
+        }
+    }
+}
+
+/// 一份绑定显示器拓扑的桌面图标布局。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IconLayoutProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub topology_fingerprint: String,
+    /// DisplayName -> absolute desktop coordinate.
+    #[serde(default)]
+    pub icon_positions: HashMap<String, IconCoordinate>,
+}
+
+/// 桌面图标绝对坐标。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IconCoordinate {
+    pub x: i32,
+    pub y: i32,
 }
 
 /// 全局窗口置顶守护（v0.4.0）的配置节。
@@ -378,6 +430,7 @@ impl Default for AppConfig {
             module_custom_params: HashMap::new(),
             topmost_manager: TopmostManagerConfig::default(),
             port_hunter: PortHunterConfig::default(),
+            icon_locker: IconLockerConfig::default(),
         }
     }
 }
@@ -568,7 +621,8 @@ impl ConfigManager {
         // 1) 写入同目录临时文件（保证与目标文件处于同一文件系统，rename 才可能原子）。
         //    经 SharingViolation 重试执行器落盘：瞬态共享冲突平滑降级。
         let tmp_path = self.tmp_path();
-        if let Err(source) = retry_on_sharing_violation(|| fs::write(&tmp_path, content.as_bytes())).await
+        if let Err(source) =
+            retry_on_sharing_violation(|| fs::write(&tmp_path, content.as_bytes())).await
         {
             return Err(ConfigError::Io {
                 path: tmp_path,
@@ -803,7 +857,11 @@ mod tests {
         let mut cfg = AppConfig::default();
         let abs_app = std::env::temp_dir().join("tltoolbox-app-logs");
         cfg.app_log_dir = Some(abs_app.clone());
-        assert_eq!(cfg.effective_app_log_dir(), abs_app, "显式绝对路径应原样返回");
+        assert_eq!(
+            cfg.effective_app_log_dir(),
+            abs_app,
+            "显式绝对路径应原样返回"
+        );
 
         let abs_shot = std::env::temp_dir().join("tltoolbox-shots");
         cfg.popup_screenshot_dir = Some(abs_shot.clone());
@@ -1097,7 +1155,10 @@ mod tests {
         .unwrap();
 
         let mgr = ConfigManager::new(&path);
-        let cfg = mgr.load().await.expect("含全局日志目录字段的配置应正常解析");
+        let cfg = mgr
+            .load()
+            .await
+            .expect("含全局日志目录字段的配置应正常解析");
         assert_eq!(
             cfg.app_log_dir,
             Some(PathBuf::from("data/app-logs")),
@@ -1266,19 +1327,18 @@ mod tests {
     #[tokio::test]
     async fn retry_on_sharing_violation_retries_up_to_three_times_then_succeeds() {
         let mut calls = 0usize;
-        let (value, attempts) =
-            retry_on_sharing_violation(|| {
-                calls += 1;
-                async move {
-                    if calls < 4 {
-                        Err(sharing_violation_error())
-                    } else {
-                        Ok("落盘成功")
-                    }
+        let (value, attempts) = retry_on_sharing_violation(|| {
+            calls += 1;
+            async move {
+                if calls < 4 {
+                    Err(sharing_violation_error())
+                } else {
+                    Ok("落盘成功")
                 }
-            })
-            .await
-            .expect("第 4 次尝试应成功");
+            }
+        })
+        .await
+        .expect("第 4 次尝试应成功");
         assert_eq!(value, "落盘成功");
         assert_eq!(attempts, 4, "应为 初次 + 3 次重试 = 4 次实际执行");
         assert_eq!(calls, 4);
@@ -1505,7 +1565,10 @@ mod tests {
 
         let memory_rule = &loaded.topmost_manager.pinned_rules[1];
         assert_eq!(memory_rule.process_name, "chrome.exe");
-        assert!(memory_rule.title_pattern.is_empty(), "记忆规则标题模式应为空串");
+        assert!(
+            memory_rule.title_pattern.is_empty(),
+            "记忆规则标题模式应为空串"
+        );
         assert_eq!(memory_rule.priority, 7);
         assert!(!memory_rule.enabled, "记忆规则必须保持 enabled = false");
 
@@ -1566,7 +1629,11 @@ mod tests {
         let abs = std::env::temp_dir().join("tltoolbox-port-hunter-logs");
         let mut cfg = AppConfig::default();
         cfg.port_hunter.log_dir = Some(abs.clone());
-        assert_eq!(cfg.effective_port_hunter_log_dir(), abs, "显式绝对路径应原样返回");
+        assert_eq!(
+            cfg.effective_port_hunter_log_dir(),
+            abs,
+            "显式绝对路径应原样返回"
+        );
 
         // 显式相对路径：锚定 exe 目录（与 CWD 解耦）。
         cfg.port_hunter.log_dir = Some(PathBuf::from("data/port-hunter-logs"));
@@ -1624,7 +1691,10 @@ mod tests {
         .unwrap();
 
         let mgr = ConfigManager::new(&path);
-        let cfg = mgr.load().await.expect("含端口猎手配置节的 TOML 应正常解析");
+        let cfg = mgr
+            .load()
+            .await
+            .expect("含端口猎手配置节的 TOML 应正常解析");
         assert!(!cfg.port_hunter.confirm_before_kill);
         assert!(cfg.port_hunter.show_system_ports);
         assert_eq!(
@@ -1633,7 +1703,10 @@ mod tests {
             "显式目录应原样读入（相对路径由 effective 访问器消费时再锚定）"
         );
         // 其余键缺省仍回退默认值，互不影响。
-        assert_eq!(cfg.auto_start_modules, AppConfig::default().auto_start_modules);
+        assert_eq!(
+            cfg.auto_start_modules,
+            AppConfig::default().auto_start_modules
+        );
 
         // None 的 log_dir 键不应序列化落盘（与 terminal_log_dir 等既有约定一致）。
         let serialized = toml::to_string_pretty(&AppConfig::default()).expect("序列化应成功");
@@ -1643,5 +1716,61 @@ mod tests {
         );
 
         remove_if_exists(&path).await;
+    }
+
+    /// [icon_locker] 配置节的 TOML 往返：启停 / 自动还原 / 方案列表（含坐标）逐字段
+    /// 保真；旧配置缺失该节时回退默认（enabled=false、auto_restore=true、无方案）。
+    #[tokio::test]
+    async fn icon_locker_section_roundtrips_and_legacy_config_falls_back() {
+        // 1) 显式节 → 逐字段往返。
+        let path = temp_cfg_path("icon-locker");
+        remove_if_exists(&path).await;
+        let cfg = AppConfig {
+            icon_locker: IconLockerConfig {
+                enabled: true,
+                auto_restore: false,
+                profiles: vec![IconLayoutProfile {
+                    id: "profile-1".into(),
+                    name: "工作区".into(),
+                    topology_fingerprint: "P:0,0,2560x1440".into(),
+                    icon_positions: HashMap::from([
+                        ("此电脑".to_string(), IconCoordinate { x: 30, y: 24 }),
+                        ("回收站".to_string(), IconCoordinate { x: 30, y: 120 }),
+                    ]),
+                }],
+            },
+            ..AppConfig::default()
+        };
+        let mgr = ConfigManager::new(&path);
+        mgr.save(&cfg).await.expect("保存应成功");
+        let loaded = mgr.load().await.expect("加载应成功");
+        assert_eq!(loaded, cfg, "图标布局锁配置节应逐字段往返一致");
+        assert!(loaded.icon_locker.enabled);
+        assert!(!loaded.icon_locker.auto_restore);
+        assert_eq!(loaded.icon_locker.profiles.len(), 1);
+        assert_eq!(
+            loaded.icon_locker.profiles[0].icon_positions["此电脑"],
+            IconCoordinate { x: 30, y: 24 }
+        );
+        remove_if_exists(&path).await;
+
+        // 2) 旧配置（无 [icon_locker] 节）→ 回退默认：enabled=false、
+        //    auto_restore=true、profiles 为空。
+        let legacy_path = temp_cfg_path("icon-locker-legacy");
+        remove_if_exists(&legacy_path).await;
+        fs::write(&legacy_path, "auto_start_modules = [\"popup_blocker\"]\n")
+            .await
+            .unwrap();
+        let legacy_mgr = ConfigManager::new(&legacy_path);
+        let legacy = legacy_mgr.load().await.expect("旧配置应正常解析");
+        assert_eq!(
+            legacy.icon_locker,
+            IconLockerConfig::default(),
+            "缺失 [icon_locker] 节时应整体回退默认值"
+        );
+        assert!(!legacy.icon_locker.enabled);
+        assert!(legacy.icon_locker.auto_restore, "自动还原默认应开启");
+        assert!(legacy.icon_locker.profiles.is_empty());
+        remove_if_exists(&legacy_path).await;
     }
 }

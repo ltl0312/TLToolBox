@@ -120,7 +120,11 @@ impl PortHunterModule {
 
     /// 当前事件总线句柄（引用，短临界读取）。
     fn bus_ref(&self) -> Option<EventBus> {
-        self.inner.bus.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.inner
+            .bus
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// 执行一次同步扫描：Win32 枚举 + 会话隔离降噪，结果写入缓存并返回观测值。
@@ -139,7 +143,11 @@ impl PortHunterModule {
         let report = scanner::scan_and_collect(show_system_ports)?;
         let cached = report.entries.clone();
         {
-            let mut guard = self.inner.cached_rows.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut guard = self
+                .inner
+                .cached_rows
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             *guard = cached;
         }
         self.inner.logger.log_scan(
@@ -198,14 +206,18 @@ impl PortHunterModule {
         let elapsed_ms = started.elapsed().as_millis();
 
         match &outcome {
-            Ok(()) => self
-                .inner
-                .logger
-                .log_kill_success(port, protocol, &process_name, pid, elapsed_ms),
-            Err(error) => self
-                .inner
-                .logger
-                .log_kill_failure(port, protocol, &process_name, pid, &error.to_string()),
+            Ok(()) => {
+                self.inner
+                    .logger
+                    .log_kill_success(port, protocol, &process_name, pid, elapsed_ms)
+            }
+            Err(error) => self.inner.logger.log_kill_failure(
+                port,
+                protocol,
+                &process_name,
+                pid,
+                &error.to_string(),
+            ),
         }
         KillReport {
             process_name,
@@ -301,7 +313,11 @@ mod tests {
     fn cached_rows_roundtrip_and_pid_lookup() {
         let module = PortHunterModule::default();
         {
-            let mut guard = module.inner.cached_rows.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut guard = module
+                .inner
+                .cached_rows
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             *guard = vec![scanner::PortEntry {
                 protocol: "TCP".to_string(),
                 local_port: 8080,

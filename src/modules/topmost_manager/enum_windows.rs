@@ -123,8 +123,7 @@ const OWN_TITLE_MARKER: &str = "TLToolBox";
 
 /// 判定窗口是否属于 TLToolBox 自身（标题以产品名开头 / 类名含 slint 标记）。
 fn is_self_window(title: &str, class_name: &str) -> bool {
-    title.starts_with(OWN_TITLE_MARKER)
-        || class_name.to_ascii_lowercase().contains("slint")
+    title.starts_with(OWN_TITLE_MARKER) || class_name.to_ascii_lowercase().contains("slint")
 }
 
 /// 判定一个窗口是否属于系统桌面容器（任务栏 / 桌面 / 开始按钮等）。
@@ -231,7 +230,12 @@ fn class_name_of(hwnd: HWND) -> String {
 fn is_cloaked(hwnd: HWND) -> bool {
     unsafe {
         let mut cloaked: u32 = 0;
-        let result = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut c_void, std::mem::size_of::<u32>() as u32);
+        let result = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
         result.is_ok() && cloaked != 0
     }
 }
@@ -294,10 +298,7 @@ pub fn enumerate_top_level_windows() -> Vec<WindowInfo> {
             // SAFETY: EnumWindowsProc 回调在 EnumWindows 返回前同步调用完毕，
             // 槽位生命周期严格包含于本闭包内；回调不触碰任何 Rust 借用。
             unsafe {
-                let _ = EnumWindows(
-                    Some(enum_proc),
-                    LPARAM(0),
-                );
+                let _ = EnumWindows(Some(enum_proc), LPARAM(0));
             }
             results = std::mem::take(&mut *bucket.borrow_mut());
         });
@@ -397,7 +398,14 @@ mod tests {
     /// 最小化窗口（IsIconic 为真）必须被剔除（v0.4.1：最小化到任务栏不入列）。
     #[test]
     fn minimized_window_is_filtered() {
-        assert!(!passes_visible_filter(0, "无标题 - 记事本", "Notepad", "", "", true));
+        assert!(!passes_visible_filter(
+            0,
+            "无标题 - 记事本",
+            "Notepad",
+            "",
+            "",
+            true
+        ));
         // 即使带工具条扩展样式，最小化也优先剥离（最小化是最强过滤前置）。
         assert!(!passes_visible_filter(
             WS_EX_TOOLWINDOW.0,
@@ -412,7 +420,14 @@ mod tests {
     /// 非最小化普通窗口应通过最小化剥离。
     #[test]
     fn non_minimized_window_passes_iconic_check() {
-        assert!(passes_visible_filter(0, "无标题 - 记事本", "Notepad", "", "", false));
+        assert!(passes_visible_filter(
+            0,
+            "无标题 - 记事本",
+            "Notepad",
+            "",
+            "",
+            false
+        ));
     }
 
     /// 工具条窗口（WS_EX_TOOLWINDOW 且无 WS_EX_APPWINDOW）必须被剔除。
@@ -433,25 +448,53 @@ mod tests {
     #[test]
     fn tool_window_with_appwindow_is_kept() {
         let ex = WS_EX_TOOLWINDOW.0 | WS_EX_APPWINDOW.0;
-        assert!(passes_visible_filter(ex, "工具面板", "SomeApp", "", "", false));
+        assert!(passes_visible_filter(
+            ex,
+            "工具面板",
+            "SomeApp",
+            "",
+            "",
+            false
+        ));
     }
 
     /// 普通窗口（无工具条扩展样式）应通过。
     #[test]
     fn plain_window_passes() {
-        assert!(passes_visible_filter(0, "无标题 - 记事本", "Notepad", "", "", false));
+        assert!(passes_visible_filter(
+            0,
+            "无标题 - 记事本",
+            "Notepad",
+            "",
+            "",
+            false
+        ));
     }
 
     /// 自身窗口剥离：标题以产品名开头即视为 TLToolBox 自身。
     #[test]
     fn self_window_by_title_is_filtered() {
-        assert!(!passes_visible_filter(0, "TLToolBox - 桌面实用工具箱", "SomeWin", "", "", false));
+        assert!(!passes_visible_filter(
+            0,
+            "TLToolBox - 桌面实用工具箱",
+            "SomeWin",
+            "",
+            "",
+            false
+        ));
     }
 
     /// 自身窗口剥离：类名含 slint 标记即视为 TLToolBox 自身（winit 后端窗口）。
     #[test]
     fn self_window_by_slint_class_is_filtered() {
-        assert!(!passes_visible_filter(0, "任意标题", "slint-window-0x1", "", "", false));
+        assert!(!passes_visible_filter(
+            0,
+            "任意标题",
+            "slint-window-0x1",
+            "",
+            "",
+            false
+        ));
     }
 
     /// 显式传入的“自身窗口”完整匹配也剥离（模块装配时把主窗口句柄带名注入）。
@@ -487,8 +530,22 @@ mod tests {
     /// 名称贴近但并非系统容器的类名不得误杀（如用户窗口自定义类名 ButtonEx）。
     #[test]
     fn lookalike_classes_are_not_over_filtered() {
-        assert!(passes_visible_filter(0, "应用窗口", "ButtonEx", "", "", false));
-        assert!(passes_visible_filter(0, "应用窗口", "WorkerWnd", "", "", false));
+        assert!(passes_visible_filter(
+            0,
+            "应用窗口",
+            "ButtonEx",
+            "",
+            "",
+            false
+        ));
+        assert!(passes_visible_filter(
+            0,
+            "应用窗口",
+            "WorkerWnd",
+            "",
+            "",
+            false
+        ));
     }
 
     /// 判定谓词在空标题等已由调用方短路的前提下仍不 panic（容错）。

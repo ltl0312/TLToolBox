@@ -181,10 +181,10 @@ mod imp {
     use std::ffi::c_void;
     use windows::core::PCWSTR;
     use windows::Win32::Networking::WinHttp::{
-        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-        WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-        WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_REFRESH,
-        WINHTTP_FLAG_SECURE, WINHTTP_QUERY_STATUS_CODE,
+        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+        WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+        WinHttpSendRequest, WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_FLAG_REFRESH, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_STATUS_CODE,
     };
 
     /// WinHttp 句柄 RAII 守卫：任何错误路径都保证 `WinHttpCloseHandle`。
@@ -241,7 +241,12 @@ mod imp {
             let mut read = 0u32;
             // SAFETY: buffer 长度 ≥ to_read，写入不越界；read 指向栈上 u32。
             if unsafe {
-                WinHttpReadData(request, buffer.as_mut_ptr().cast(), to_read as u32, &mut read)
+                WinHttpReadData(
+                    request,
+                    buffer.as_mut_ptr().cast(),
+                    to_read as u32,
+                    &mut read,
+                )
             }
             .is_err()
             {
@@ -278,9 +283,8 @@ mod imp {
         // 2) 连接 api.github.com:443（HTTPS）。
         let host = to_wide_units("api.github.com");
         // SAFETY: host 在本调用期间存活；端口 443 = HTTPS。
-        let connection = HttpHandle(unsafe {
-            WinHttpConnect(session.0, PCWSTR(host.as_ptr()), 443, 0)
-        });
+        let connection =
+            HttpHandle(unsafe { WinHttpConnect(session.0, PCWSTR(host.as_ptr()), 443, 0) });
         if connection.0.is_null() {
             return Err(UpdateError::Http {
                 message: "WinHttpConnect(api.github.com:443) 失败".to_string(),
@@ -312,22 +316,23 @@ mod imp {
 
         // 4) 统一收紧超时（解析/连接/发送/接收各 8 秒，防极端网络挂起 UI 侧任务）。
         // SAFETY: 请求句柄在本调用期间存活。
-        let _ = unsafe {
-            WinHttpSetTimeouts(request.0, 8000, 8000, 8000, 8000)
-        };
+        let _ = unsafe { WinHttpSetTimeouts(request.0, 8000, 8000, 8000, 8000) };
 
         // 5) 携带 UA 头发送（GitHub 强制要求 User-Agent，缺失返回 403）。
-        let headers = to_wide_units("User-Agent: TLToolBox\r\nAccept: application/vnd.github+json\r\n");
+        let headers =
+            to_wide_units("User-Agent: TLToolBox\r\nAccept: application/vnd.github+json\r\n");
         // SAFETY: headers 为 NUL 结尾 UTF-16 缓冲，本调用期间存活。
         unsafe {
-            WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0)
-                .map_err(|err| UpdateError::Http {
+            WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0).map_err(|err| {
+                UpdateError::Http {
                     message: format!("WinHttpSendRequest 失败: {err}"),
-                })?;
-            WinHttpReceiveResponse(request.0, std::ptr::null_mut())
-                .map_err(|err| UpdateError::Http {
+                }
+            })?;
+            WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|err| {
+                UpdateError::Http {
                     message: format!("WinHttpReceiveResponse 失败: {err}"),
-                })?;
+                }
+            })?;
         }
 
         // 6) 读取响应体（先取状态码再读正文；失败路径一律 Ok(None)——不误报）。
@@ -414,7 +419,10 @@ mod tests {
     fn newer_version_comparison_is_strict_and_conservative() {
         assert!(is_newer_version("0.3.1", "0.3.2"));
         assert!(is_newer_version("v0.3.2", "v1.0.0"));
-        assert!(is_newer_version("1.2.3", "1.2.10"), "patch 按数值比较而非字典序");
+        assert!(
+            is_newer_version("1.2.3", "1.2.10"),
+            "patch 按数值比较而非字典序"
+        );
         // 相同版本 → 不视为更新。
         assert!(!is_newer_version("0.3.2", "0.3.2"));
         // 候选更旧 → 不视为更新。

@@ -80,7 +80,10 @@ impl std::fmt::Display for Win32Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidWindow => write!(f, "窗口已不存在"),
-            Self::AccessDenied => write!(f, "拒绝访问（目标窗口完整性级别更高，请提权运行 TLToolBox）"),
+            Self::AccessDenied => write!(
+                f,
+                "拒绝访问（目标窗口完整性级别更高，请提权运行 TLToolBox）"
+            ),
             Self::Other(reason) => write!(f, "Win32 调用失败: {reason}"),
         }
     }
@@ -127,16 +130,8 @@ fn set_window_pos(hwnd: isize, insert_after: HWND) -> Result<(), Win32Error> {
     // SAFETY: SetWindowPos 为纯句柄调用；前置 IsWindow 校验由调用方完成，
     // 此处对已失效句柄调用仅返回错误码，无未定义行为。
     unsafe {
-        SetWindowPos(
-            to_hwnd(hwnd),
-            insert_after,
-            0,
-            0,
-            0,
-            0,
-            ZORDER_ONLY_FLAGS,
-        )
-        .map_err(classify_win32_error)
+        SetWindowPos(to_hwnd(hwnd), insert_after, 0, 0, 0, 0, ZORDER_ONLY_FLAGS)
+            .map_err(classify_win32_error)
     }
 }
 
@@ -217,10 +212,7 @@ pub fn chain_apply_plan(ordered: &[ChainEntry]) -> Vec<(isize, bool)> {
 /// 前方没有 1~2 级窗口。
 ///
 /// # 纯函数（无 FFI）
-pub fn plan_shield_refresh(
-    ordered: &[ChainEntry],
-    activated: isize,
-) -> Option<Vec<(isize, bool)>> {
+pub fn plan_shield_refresh(ordered: &[ChainEntry], activated: isize) -> Option<Vec<(isize, bool)>> {
     let activated_pos = ordered.iter().position(|entry| entry.hwnd == activated)?;
     if activated_pos == 0 {
         return None; // 激活的已是链条首位（1 级），无需纠偏
@@ -310,7 +302,11 @@ mod tests {
     use super::*;
 
     fn entry(hwnd: isize, priority: u8, seq: u64) -> ChainEntry {
-        ChainEntry { hwnd, priority, seq }
+        ChainEntry {
+            hwnd,
+            priority,
+            seq,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -340,7 +336,11 @@ mod tests {
             entry(0x18, 2, 0),
         ]);
         let order: Vec<isize> = sorted.iter().map(|e| e.hwnd).collect();
-        assert_eq!(order, vec![0x10, 0x18, 0x20, 0x30], "应按优先级升序（1 最前）");
+        assert_eq!(
+            order,
+            vec![0x10, 0x18, 0x20, 0x30],
+            "应按优先级升序（1 最前）"
+        );
     }
 
     #[test]
@@ -365,7 +365,11 @@ mod tests {
 
     #[test]
     fn chain_plan_anchors_first_to_topmost_rest_after_previous() {
-        let ordered = order_entries(vec![entry(0x10, 1, 0), entry(0x20, 2, 0), entry(0x30, 3, 0)]);
+        let ordered = order_entries(vec![
+            entry(0x10, 1, 0),
+            entry(0x20, 2, 0),
+            entry(0x30, 3, 0),
+        ]);
         let plan = chain_apply_plan(&ordered);
         assert_eq!(
             plan,
@@ -422,7 +426,11 @@ mod tests {
     #[test]
     fn shield_refresh_is_noop_without_protected_predecessors() {
         let ordered = order_entries(vec![entry(0x30, 3, 0), entry(0x50, 5, 0)]);
-        assert_eq!(plan_shield_refresh(&ordered, 0x50), None, "前方 3/5 级窗口不在 1~2 级保护带内");
+        assert_eq!(
+            plan_shield_refresh(&ordered, 0x50),
+            None,
+            "前方 3/5 级窗口不在 1~2 级保护带内"
+        );
     }
 
     /// 纠偏重刷的锚定与整链应用一致（复用同一规划器，回归防线）。
@@ -446,12 +454,13 @@ mod tests {
     #[test]
     fn removed_window_is_absent_from_all_chain_plans() {
         // 链条：0x10(1) → 0x20(2) → 0x30(3)；取消 0x20 后。
-        let before = order_entries(vec![entry(0x10, 1, 0), entry(0x20, 2, 0), entry(0x30, 3, 0)]);
-        let remaining: Vec<ChainEntry> = before
-            .iter()
-            .copied()
-            .filter(|e| e.hwnd != 0x20)
-            .collect();
+        let before = order_entries(vec![
+            entry(0x10, 1, 0),
+            entry(0x20, 2, 0),
+            entry(0x30, 3, 0),
+        ]);
+        let remaining: Vec<ChainEntry> =
+            before.iter().copied().filter(|e| e.hwnd != 0x20).collect();
 
         let plan = chain_apply_plan(&remaining);
         assert_eq!(

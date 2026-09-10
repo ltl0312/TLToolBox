@@ -30,9 +30,7 @@ use crate::bus::AppEvent;
 #[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
 #[cfg(windows)]
-use windows::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-};
+use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
 /// 释放端口（终止进程）的 Win32 失败模型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +66,9 @@ impl PortError {
     pub fn is_access_denied(&self) -> bool {
         match self {
             #[cfg(windows)]
-            PortError::OpenProcessFailed { code, .. }
-            | PortError::TerminateFailed { code, .. } => *code == ERROR_ACCESS_DENIED.0,
+            PortError::OpenProcessFailed { code, .. } | PortError::TerminateFailed { code, .. } => {
+                *code == ERROR_ACCESS_DENIED.0
+            }
             _ => false,
         }
     }
@@ -124,11 +123,7 @@ impl std::error::Error for PortError {}
 /// - `port` / `protocol` 仅用于错误文本的上下文回显（无副作用）；
 /// - 成功返回 `Ok(())`；任何失败返回结构化 [`PortError`]（含错误码）；
 /// - 不含 Toast / 审计——反馈职责见 [`kill_process_with_events`] 与装配层。
-pub fn kill_process_and_release_port(
-    pid: u32,
-    port: u16,
-    protocol: &str,
-) -> Result<(), PortError> {
+pub fn kill_process_and_release_port(pid: u32, port: u16, protocol: &str) -> Result<(), PortError> {
     #[cfg(windows)]
     {
         let _ = (port, protocol);
@@ -141,7 +136,7 @@ pub fn kill_process_and_release_port(
                     // Error::code() 为 HRESULT（0x8007xxxx 形态）；低 16 位即
                     // Win32 原始错误码（HRESULT::from_win32 编码契约）。
                     code: (err.code().0 as u32) & 0xFFFF,
-                })
+                });
             }
         };
 
@@ -210,9 +205,15 @@ mod tests {
     #[test]
     fn error_enum_reports_access_denied_and_codes() {
         let denied_open = PortError::OpenProcessFailed { pid: 42, code: 5 };
-        assert!(denied_open.is_access_denied(), "错误码 5 应判定为 UIPI 拦截");
+        assert!(
+            denied_open.is_access_denied(),
+            "错误码 5 应判定为 UIPI 拦截"
+        );
         assert_eq!(denied_open.code(), Some(5));
-        assert_eq!(denied_open.win32_summary(), "Win32 错误码 5 (ERROR_ACCESS_DENIED)");
+        assert_eq!(
+            denied_open.win32_summary(),
+            "Win32 错误码 5 (ERROR_ACCESS_DENIED)"
+        );
         assert!(
             denied_open.to_string().contains("PID: 42"),
             "错误文本应回显 PID"
@@ -223,9 +224,15 @@ mod tests {
 
         let other = PortError::OpenProcessFailed { pid: 1, code: 87 };
         assert!(!other.is_access_denied(), "87 不是 access denied");
-        assert_eq!(other.win32_summary(), "Win32 错误码 87 (ERROR_INVALID_PARAMETER)");
+        assert_eq!(
+            other.win32_summary(),
+            "Win32 错误码 87 (ERROR_INVALID_PARAMETER)"
+        );
 
-        let scan = PortError::ScanFailed { context: "GetExtendedTcpTable 枚举", code: 122 };
+        let scan = PortError::ScanFailed {
+            context: "GetExtendedTcpTable 枚举",
+            code: 122,
+        };
         assert!(!scan.is_access_denied());
         assert!(scan.to_string().contains("GetExtendedTcpTable"));
     }
@@ -237,10 +244,7 @@ mod tests {
     fn killing_nonexistent_process_fails_gracefully() {
         let err = kill_process_and_release_port(u32::MAX, 8080, "TCP")
             .expect_err("不存在的 PID 应报错而非 panic");
-        assert!(
-            err.code().is_some(),
-            "应携带 Win32 错误码，实际: {err}"
-        );
+        assert!(err.code().is_some(), "应携带 Win32 错误码，实际: {err}");
         // 打开不存在的进程 = ERROR_INVALID_PARAMETER(87) 或 ACCESS_DENIED(5)，
         // 两者都不应 panic 且 message 可展示。
         assert!(!err.to_string().is_empty());
@@ -255,6 +259,9 @@ mod tests {
         #[cfg(not(windows))]
         assert_eq!(err, PortError::UnsupportedPlatform);
         #[cfg(windows)]
-        assert!(err.code().is_some(), "Windows 下应携带 Win32 错误码，实际: {err}");
+        assert!(
+            err.code().is_some(),
+            "Windows 下应携带 Win32 错误码，实际: {err}"
+        );
     }
 }

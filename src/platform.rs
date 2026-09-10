@@ -256,7 +256,10 @@ impl fmt::Display for ShellError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedPlatform => {
-                write!(f, "该操作仅支持 Windows（ShellExecuteW / SHBrowseForFolderW 原生能力）")
+                write!(
+                    f,
+                    "该操作仅支持 Windows（ShellExecuteW / SHBrowseForFolderW 原生能力）"
+                )
             }
             Self::ShellExecute { code } => {
                 write!(
@@ -361,7 +364,9 @@ pub fn capture_window_png(hwnd: usize, dest: &Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     {
         let _ = (hwnd, dest);
-        Err(std::io::Error::other("窗口截图仅支持 Windows（PrintWindow + GDI+）"))
+        Err(std::io::Error::other(
+            "窗口截图仅支持 Windows（PrintWindow + GDI+）",
+        ))
     }
 }
 
@@ -462,9 +467,9 @@ mod imp {
         SelectObject, HBITMAP, HPALETTE,
     };
     use windows::Win32::Graphics::GdiPlus::{
-        GdiplusStartup, GdiplusStartupInput, GdiplusStartupOutput, GdipCreateBitmapFromHBITMAP,
-        GdipDisposeImage, GdipGetImageEncoders, GdipGetImageEncodersSize, GdipSaveImageToFile,
-        GpBitmap, GpImage, ImageCodecInfo, Ok as GdiplusOk,
+        GdipCreateBitmapFromHBITMAP, GdipDisposeImage, GdipGetImageEncoders,
+        GdipGetImageEncodersSize, GdipSaveImageToFile, GdiplusStartup, GdiplusStartupInput,
+        GdiplusStartupOutput, GpBitmap, GpImage, ImageCodecInfo, Ok as GdiplusOk,
     };
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
@@ -472,7 +477,7 @@ mod imp {
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS, PW_CLIENTONLY};
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::Win32::UI::Shell::{ShellExecuteW, SHBrowseForFolderW, SHGetPathFromIDListW};
+    use windows::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW};
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SW_SHOWNORMAL};
 
     /// UAC 确认框被用户取消时 `ShellExecuteW` 返回的错误码（`ERROR_CANCELLED`）。
@@ -506,10 +511,11 @@ mod imp {
         // - EmptyWorkingSet 修剪本进程工作集，不持有句柄、不跨进程，失败仅返回
         //   错误码（windows 绑定映射为 Err）。
         unsafe {
-            windows::Win32::System::ProcessStatus::EmptyWorkingSet(GetCurrentProcess())
-                .map_err(|err| MemoryError::EmptyWorkingSet {
+            windows::Win32::System::ProcessStatus::EmptyWorkingSet(GetCurrentProcess()).map_err(
+                |err| MemoryError::EmptyWorkingSet {
                     message: format!("{err}"),
-                })
+                },
+            )
         }
     }
 
@@ -729,7 +735,10 @@ mod imp {
                 reason: "SHGetPathFromIDListW 解析选中项失败".to_string(),
             });
         }
-        let end = path_buf.iter().position(|&unit| unit == 0).unwrap_or(path_buf.len());
+        let end = path_buf
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(path_buf.len());
         let path = PathBuf::from(String::from_utf16_lossy(&path_buf[..end]));
         if path.as_os_str().is_empty() {
             return Err(ShellError::Browse {
@@ -833,9 +842,8 @@ mod imp {
         // SAFETY: rect 指向栈上结构体；GetWindowRect 失败返回 Err（windows 绑定
         // 把 BOOL 失败映射为 Result）。
         unsafe {
-            GetWindowRect(hwnd, &mut rect).map_err(|err| {
-                std::io::Error::other(format!("GetWindowRect 失败: {err}"))
-            })?;
+            GetWindowRect(hwnd, &mut rect)
+                .map_err(|err| std::io::Error::other(format!("GetWindowRect 失败: {err}")))?;
         }
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;

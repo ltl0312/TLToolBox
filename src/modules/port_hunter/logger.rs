@@ -106,7 +106,13 @@ impl PortHunterLogger {
     /// - `tcp_listeners` / `udp_listeners`：两协议下系统原始枚举出的 LISTEN 条目数；
     /// - `kept`：经「会话隔离」等扫描期降噪后保留并缓存的条目数；
     /// - `show_system_ports`：本次扫描携带的显示选项（决定后续渲染期两阶段过滤）。
-    pub fn log_scan(&self, tcp_listeners: usize, udp_listeners: usize, kept: usize, show_system_ports: bool) {
+    pub fn log_scan(
+        &self,
+        tcp_listeners: usize,
+        udp_listeners: usize,
+        kept: usize,
+        show_system_ports: bool,
+    ) {
         self.log_line(
             "SCAN",
             &format!(
@@ -122,7 +128,11 @@ impl PortHunterLogger {
             Some(port) => format!("（解析出显式端口号 {port}，动态端口过滤已豁免）"),
             None => String::new(),
         };
-        self.log_line("SEARCH", &format!("搜索关键词 \"{keyword}\"{port_hint}"), "已应用");
+        self.log_line(
+            "SEARCH",
+            &format!("搜索关键词 \"{keyword}\"{port_hint}"),
+            "已应用",
+        );
     }
 
     /// KILL 事件：一次成功释放端口（终止进程）的耗时明细。
@@ -205,7 +215,13 @@ mod tests {
         logger.log_scan(8, 3, 9, false);
         logger.log_search("5173", Some(5173));
         logger.log_kill_success(5173, "TCP", "node.exe", 12345, 2);
-        logger.log_kill_failure(8080, "TCP", "java.exe", 54321, "Win32 错误码 5 (ERROR_ACCESS_DENIED)");
+        logger.log_kill_failure(
+            8080,
+            "TCP",
+            "java.exe",
+            54321,
+            "Win32 错误码 5 (ERROR_ACCESS_DENIED)",
+        );
 
         let content = std::fs::read_to_string(logger.file_path()).expect("日志文件应可读");
         let lines: Vec<&str> = content.lines().collect();
@@ -216,7 +232,9 @@ mod tests {
             lines[0]
         );
         assert!(
-            lines[1].contains("[SEARCH]") && lines[1].contains("5173") && lines[1].contains("已应用"),
+            lines[1].contains("[SEARCH]")
+                && lines[1].contains("5173")
+                && lines[1].contains("已应用"),
             "SEARCH 行应含关键词与显式端口提示，实际: {}",
             lines[1]
         );
@@ -237,9 +255,16 @@ mod tests {
 
         // 每行行首都应携带 UTC 微秒时间戳（RFC3339 形态）。
         for line in &lines {
-            let timestamp = line.split(']').next().expect("行首应为时间戳").trim_start_matches('[');
+            let timestamp = line
+                .split(']')
+                .next()
+                .expect("行首应为时间戳")
+                .trim_start_matches('[');
             let parsed = chrono::DateTime::parse_from_rfc3339(timestamp);
-            assert!(parsed.is_ok(), "时间戳应可被 RFC3339 解析，实际: {timestamp:?}");
+            assert!(
+                parsed.is_ok(),
+                "时间戳应可被 RFC3339 解析，实际: {timestamp:?}"
+            );
         }
 
         // 追加语义：再次写入后原内容保留、新行追加在后。
@@ -247,7 +272,10 @@ mod tests {
         let content = std::fs::read_to_string(logger.file_path()).expect("日志文件应可读");
         assert_eq!(content.lines().count(), 5, "追加写入应保留既有行");
         assert!(content.lines().last().unwrap().contains("[SEARCH]"));
-        assert!(!content.lines().last().unwrap().contains("5173"), "无显式端口时不应带豁免提示");
+        assert!(
+            !content.lines().last().unwrap().contains("5173"),
+            "无显式端口时不应带豁免提示"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

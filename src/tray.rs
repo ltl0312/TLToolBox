@@ -773,9 +773,11 @@ mod platform {
     fn load_system_app_icon() -> Option<Icon> {
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, SelectObject,
-            BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+            BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         };
-        use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, LoadIconW, ICONINFO, IDI_APPLICATION};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetIconInfo, LoadIconW, ICONINFO, IDI_APPLICATION,
+        };
 
         unsafe {
             // 1) 系统共享「应用程序」图标句柄（hInstance=None + IDI_APPLICATION）。
@@ -795,7 +797,12 @@ mod platform {
 
             // 3) 位图尺寸（GetObjectW → BITMAP）。
             let mut bm = BITMAP::default();
-            if GetObjectW(info.hbmColor, std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut core::ffi::c_void)) == 0 {
+            if GetObjectW(
+                info.hbmColor,
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bm as *mut _ as *mut core::ffi::c_void),
+            ) == 0
+            {
                 let _ = DeleteObject(info.hbmMask);
                 let _ = DeleteObject(info.hbmColor);
                 return None;
@@ -914,7 +921,13 @@ mod platform {
                     rgba[di + 2] = color[si]; // R → B
                     let has_alpha = color[si + 3] != 0;
                     let masked = alpha_mask.as_ref().is_some_and(|m| m[y * w as usize + x]);
-                    rgba[di + 3] = if has_alpha && !masked { color[si + 3] } else if masked { 0 } else { 255 };
+                    rgba[di + 3] = if has_alpha && !masked {
+                        color[si + 3]
+                    } else if masked {
+                        0
+                    } else {
+                        255
+                    };
                 }
             }
 

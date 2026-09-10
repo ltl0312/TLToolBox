@@ -1,6 +1,6 @@
 [package]
 name = "tltoolbox"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 build = "build.rs"
 
@@ -67,7 +67,9 @@ tray-icon = "0.19"
 #                                  工作集，常驻内存从 ~54MB 骤降至 ~10MB 以内，见 platform）
 #   - Win32_Graphics_Gdi          ：GetDIBits / GetObjectW / CreateCompatibleDC 等（托盘图标
 #                                  从 Win32 原生 LoadIconW(None, IDI_APPLICATION) 兜底取帧时
-#                                  把 HICON 位图解码为 RGBA，见 tray.rs 的图标降级链）
+#                                  把 HICON 位图解码为 RGBA，见 tray.rs 的图标降级链）；
+#                                  另含 EnumDisplayMonitors / GetMonitorInfoW / MONITORINFO
+#                                  （icon_locker 屏幕拓扑指纹，见 modules/icon_locker/daemon）
 #   - Win32_UI_Shell              ：ShellExecuteW（提权重启：以 "runas" 动词经 UAC 拉起
 #                                  高权限副本，见 src/platform.rs）。注意 windows 0.58 的
 #                                  ShellExecuteW 本体按 Win32_UI_WindowsAndMessaging 门控，
@@ -112,6 +114,8 @@ features = [
     # windows-0.58 把这些符号单独门控在 Win32_UI_Shell_Common 之下，
     # 与既有的 Win32_UI_Shell（ShellExecuteW）互不包含、须显式并启。
     "Win32_UI_Shell_Common",
+    # Win32_System_Ole：CoInitializeEx / COINIT_APARTMENTTHREADED（icon_locker STA COM）
+    "Win32_System_Ole",
     # Win32_Graphics_Dwm：DwmGetWindowAttribute / DWMWA_CLOAKED（v0.4.0 窗口置顶
     # 守护的枚举过滤——排除 DWM 挂起 / 虚拟桌面隐藏的窗口，见 topmost_manager）
     "Win32_Graphics_Dwm",

@@ -131,6 +131,18 @@ export struct PortEntryItem {
     process_path: string,
 }
 
+// —— 桌面图标布局锁方案行（与 icon_locker::IconLayoutProfile 对应） ——
+export struct IconLockerProfileItem {
+    // 方案唯一 ID（还原 / 删除的回调载荷；绝不使用行索引）
+    id: string,
+    // 方案名称（用户输入，如「工作区」）
+    name: string,
+    // 方案包含的图标数量（抓取时坐标条目数）
+    icon_count: int,
+    // 绑定的显示器拓扑指纹（当前环境指纹与之匹配才建议直接还原）
+    fingerprint: string,
+}
+
 // —— 全局设置目录行的键（与 Rust 侧 browse/reset/open 分派一致） ——
 export enum PathKind {
     app-log,
@@ -2453,6 +2465,263 @@ component Toast inherits Rectangle {
     }
 }
 
+// —— 桌面图标布局锁 · 方案行（名称 + 图标数 + 拓扑摘要 + 还原 / 删除） ——
+component IconLockerProfileRow inherits Rectangle {
+    in property <IconLockerProfileItem> profile;
+    callback restore-requested;
+    callback delete-requested;
+
+    height: 46px;
+    border-radius: 8px;
+    background: transparent;
+
+    states [
+        hover when row-hover.has-hover : {
+            background: Theme.row-bg-hover;
+        }
+    ]
+    animate background { duration: 90ms; }
+
+    row-hover := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+    }
+
+    HorizontalBox {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 8px;
+        alignment: center;
+
+        VerticalBox {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            alignment: center;
+
+            Text {
+                text: root.profile.name + "（" + root.profile.icon_count + " 个图标）";
+                font-size: 12px;
+                color: Theme.text-primary;
+                overflow: elide;
+            }
+            Text {
+                text: root.profile.fingerprint;
+                font-size: 9.5px;
+                color: Theme.text-muted;
+                overflow: elide;
+            }
+        }
+
+        GhostButton {
+            text: "还原";
+            button-width: 56px;
+            height: 24px;
+            clicked => { root.restore-requested(); }
+        }
+
+        Rectangle {
+            width: 24px;
+            height: 24px;
+            border-radius: 6px;
+            background: transparent;
+
+            states [
+                hover when del-touch.has-hover && !del-touch.pressed : {
+                    background: Theme.danger-hover-bg;
+                }
+                pressed when del-touch.pressed : {
+                    background: Theme.danger-pressed-bg;
+                }
+            ]
+            animate background { duration: 90ms; }
+
+            Image {
+                source: @image-url("icons/trash.svg");
+                colorize: Theme.danger;
+                width: 14px;
+                height: 14px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+            del-touch := TouchArea {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.delete-requested(); }
+            }
+        }
+    }
+}
+
+// —— 桌面图标布局锁 · 管理弹窗（v0.6.0） ——
+// 顶栏：标题 + 关闭；环境指纹展示；自动还原复选（拓扑变化后 1500ms 防抖自动还原）；
+// 保存区（方案名输入 + 保存按钮）；方案列表（还原 / 删除）；底部「自动排列图标」排查提示。
+component IconLockerModal inherits Rectangle {
+    in property <bool> show;
+    in property <string> fingerprint: "";
+    in property <[IconLockerProfileItem]> profiles;
+    in-out property <bool> auto-restore: true;
+    in-out property <string> profile-name: "";
+    in property <string> status-text: "";
+    callback close-requested;
+    callback save-requested(string);
+    callback restore-requested(string);
+    callback delete-requested(string);
+    callback auto-restore-changed(bool);
+
+    background: Theme.overlay-scrim;
+    opacity: root.show ? 1.0 : 0.0;
+    animate opacity { duration: 160ms; easing: ease-out; }
+
+    backdrop := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.show;
+        clicked => { root.close-requested(); }
+        scroll-event(event) => { return accept; }
+    }
+
+    if root.show : dialog := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(470px, parent.width - 32px);
+        height: min(540px, parent.height - 24px);
+        border-radius: 14px;
+        background: Theme.dialog-bg;
+        border-width: 1px;
+        border-color: Theme.dialog-border;
+        clip: true;
+
+        body-catcher := TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+            scroll-event(event) => { return accept; }
+        }
+
+        VerticalBox {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 10px;
+
+            // —— 顶栏：标题 + 关闭 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                Text {
+                    text: "桌面图标布局锁";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: Theme.text-strong;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                }
+                GhostIconButton {
+                    icon: @image-url("icons/close.svg");
+                    icon-size: 13px;
+                    icon-color: Theme.text-muted;
+                    clicked => { root.close-requested(); }
+                }
+            }
+
+            // —— 环境指纹（拓扑稳定标识，还原前可与方案指纹比对） ——
+            Text {
+                text: "环境指纹：" + root.fingerprint;
+                font-size: 10.5px;
+                color: Theme.text-secondary;
+                overflow: elide;
+            }
+
+            // —— 自动还原复选（拓扑变化后 1500ms 防抖自动还原） ——
+            CheckBox {
+                text: "显示器拓扑变化后自动还原";
+                font-size: 11px;
+                checked <=> root.auto-restore;
+                toggled => { root.auto-restore-changed(self.checked); }
+            }
+
+            // —— 保存区：方案名输入 + 保存布局 ——
+            HorizontalBox {
+                spacing: 8px;
+
+                LineEdit {
+                    placeholder-text: "方案名称（如：工作区）";
+                    font-size: 12px;
+                    horizontal-stretch: 1;
+                    text: root.profile-name;
+                    edited(text) => {
+                        root.profile-name = text;
+                    }
+                }
+                TextButton {
+                    text: "保存布局";
+                    button-width: 88px;
+                    clicked => { root.save-requested(root.profile-name); }
+                }
+            }
+
+            // —— 状态条 ——
+            Text {
+                text: root.status-text;
+                font-size: 10.5px;
+                color: Theme.text-muted;
+                overflow: elide;
+            }
+
+            // —— 方案列表 ——
+            layout-scroll := ScrollView {
+                vertical-stretch: 1;
+
+                VerticalBox {
+                    padding-right: 8px;
+                    padding-top: 2px;
+                    padding-bottom: 2px;
+                    spacing: 4px;
+                    width: layout-scroll.visible-width;
+
+                    if root.profiles.length == 0 : Rectangle {
+                        height: 90px;
+
+                        Text {
+                            text: "还没有保存的布局方案\n先调整好桌面图标，再点击「保存布局」";
+                            font-size: 11px;
+                            color: Theme.text-muted;
+                            width: parent.width;
+                            height: parent.height;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    for item in root.profiles: IconLockerProfileRow {
+                        profile: item;
+                        restore-requested => { root.restore-requested(item.id); }
+                        delete-requested => { root.delete-requested(item.id); }
+                    }
+                }
+            }
+
+            // —— 容错排查提示：还原后图标被系统弹回 → 检查「自动排列图标」 ——
+            Text {
+                text: "若还原后图标被系统弹回，请排查桌面右键「自动排列图标」";
+                font-size: 10px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     // v0.5.1：窗口标题收敛为产品名；窗口 / 任务栏图标由 Slint 框架原生绑定
     // res/app.png（@image-url 相对本文件所在 ui/ 目录解析），框架在 Win32
@@ -2498,6 +2767,13 @@ export component MainWindow inherits Window {
     in-out property <bool> port_confirm_before_kill: true;
     in-out property <bool> port_show_system_ports: false;
     in property <string> port_hunter_status: "";
+    // 桌面图标布局锁（v0.6.0）：显隐 / 环境指纹 / 方案列表 / 自动还原复选 / 状态条。
+    in property <bool> show_icon_locker_modal: false;
+    in property <string> icon_locker_fingerprint: "";
+    in property <[IconLockerProfileItem]> icon_locker_profiles;
+    in-out property <bool> icon_locker_auto_restore: true;
+    in-out property <string> icon_locker_profile_name: "";
+    in property <string> icon_locker_status: "";
     // 关于弹窗（v0.3.2）：显隐开关、更新状态文本 / 下载入口。
     in property <bool> show_about_modal: false;
     in property <string> update_status: "";
@@ -2531,6 +2807,12 @@ export component MainWindow inherits Window {
     callback open_capture_dir();
     // 关于弹窗 / 检查更新（v0.3.2）。
     callback open_about_modal();
+    callback open_icon_locker_modal();
+    callback close_icon_locker_modal();
+    callback icon_locker_save(string);
+    callback icon_locker_restore(string);
+    callback icon_locker_delete(string);
+    callback icon_locker_auto_restore_changed(bool);
     callback close_about_modal();
     callback open_repo_url();
     callback check_for_updates();
@@ -2791,7 +3073,25 @@ export component MainWindow inherits Window {
     }
 
     // ============================================================
-    //  根层级「关于 TLToolBox」遮罩层（v0.3.2：版本 / 开源地址 / 检查更新）
+    //  根层级「桌面图标布局锁」遮罩层（v0.6.0）
+    // ============================================================
+    icon-locker-modal := IconLockerModal {
+        width: root.width;
+        height: root.height;
+        show: root.show_icon_locker_modal;
+        fingerprint: root.icon_locker_fingerprint;
+        profiles: root.icon_locker_profiles;
+        auto-restore <=> root.icon_locker_auto_restore;
+        profile-name <=> root.icon_locker_profile_name;
+        status-text: root.icon_locker_status;
+
+        close-requested => { root.close_icon_locker_modal(); }
+        save-requested(name) => { root.icon_locker_save(name); }
+        restore-requested(id) => { root.icon_locker_restore(id); }
+        delete-requested(id) => { root.icon_locker_delete(id); }
+        auto-restore-changed(checked) => { root.icon_locker_auto_restore_changed(checked); }
+    }
+
     // ============================================================
     about-modal := AboutModal {
         width: root.width;

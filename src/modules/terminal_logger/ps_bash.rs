@@ -183,7 +183,10 @@ impl fmt::Display for TerminalHookError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HomeUnavailable => {
-                write!(f, "无法确定用户主目录（HOME / USERPROFILE 均缺失或非绝对路径）")
+                write!(
+                    f,
+                    "无法确定用户主目录（HOME / USERPROFILE 均缺失或非绝对路径）"
+                )
             }
             Self::Read { path, source } => write!(f, "读取失败 '{}': {source}", path.display()),
             Self::Decode { path, hint } => write!(f, "无法解码 '{}': {hint}", path.display()),
@@ -1173,14 +1176,16 @@ mod tests {
         let targets = detect_powershell_profiles().expect("Windows 上应可解析 $PROFILE");
         assert_eq!(targets.len(), 4, "应为 2 引擎 × 2 宿主: {targets:?}");
         for target in &targets {
-            assert!(target.is_absolute(), "探测路径应为绝对路径: {}", target.display());
             assert!(
-                target
-                    .file_name()
-                    .is_some_and(|name| {
-                        let name = name.to_string_lossy();
-                        name == PS_PROFILE_FILE_NAME || name == PS_ALL_HOSTS_FILE_NAME
-                    }),
+                target.is_absolute(),
+                "探测路径应为绝对路径: {}",
+                target.display()
+            );
+            assert!(
+                target.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name == PS_PROFILE_FILE_NAME || name == PS_ALL_HOSTS_FILE_NAME
+                }),
                 "目标应以 {PS_PROFILE_FILE_NAME} / {PS_ALL_HOSTS_FILE_NAME} 收尾，实际 {}",
                 target.display()
             );
@@ -1199,7 +1204,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn documents_of_derives_two_levels_up_from_probe_path() {
-        let probe = Path::new(r"C:\Users\张三\OneDrive\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1");
+        let probe = Path::new(
+            r"C:\Users\张三\OneDrive\Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1",
+        );
         assert_eq!(
             documents_of(probe),
             Some(Path::new(r"C:\Users\张三\OneDrive\Documents"))
@@ -1572,7 +1579,8 @@ mod tests {
         let hook = PowerShellHook::at_all(vec![current_host.clone(), all_hosts.clone()]);
         assert_eq!(hook.targets().len(), 2);
 
-        hook.install(Path::new(r"D:\logs\terminals")).expect("多目标安装应成功");
+        hook.install(Path::new(r"D:\logs\terminals"))
+            .expect("多目标安装应成功");
         for target in [&current_host, &all_hosts] {
             let text = std::fs::read_to_string(target).unwrap();
             assert_eq!(count_blocks(&text, PS_TAG), 1, "{}", target.display());
@@ -1604,7 +1612,8 @@ mod tests {
         let hook = BashHook::at_pair(&rc, &profile);
         assert_eq!(hook.targets().len(), 2);
 
-        hook.install(Path::new(r"D:\logs\terminals")).expect("双入口安装应成功");
+        hook.install(Path::new(r"D:\logs\terminals"))
+            .expect("双入口安装应成功");
         for target in [&rc, &profile] {
             let text = std::fs::read_to_string(target).unwrap();
             assert_eq!(count_blocks(&text, BASH_TAG), 1, "{}", target.display());
@@ -1619,8 +1628,12 @@ mod tests {
         }
 
         // 幂等：重复安装不改变任何目标。
-        hook.install(Path::new(r"D:\logs\terminals")).expect("重复安装应幂等");
-        assert_eq!(count_blocks(&std::fs::read_to_string(&rc).unwrap(), BASH_TAG), 1);
+        hook.install(Path::new(r"D:\logs\terminals"))
+            .expect("重复安装应幂等");
+        assert_eq!(
+            count_blocks(&std::fs::read_to_string(&rc).unwrap(), BASH_TAG),
+            1
+        );
         assert_eq!(
             count_blocks(&std::fs::read_to_string(&profile).unwrap(), BASH_TAG),
             1

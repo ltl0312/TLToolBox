@@ -117,7 +117,7 @@ fn scan_dir(dir: &Path, cutoff: &SystemTime, report: &mut CleanupReport) {
                         Err(_) => report.skipped += 1,
                     }
                 }
-                Ok(_) => {}   // 未过期：保留
+                Ok(_) => {}                    // 未过期：保留
                 Err(_) => report.skipped += 1, // mtime 不可读：保守跳过
             }
         }
@@ -154,7 +154,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("系统时钟应晚于 UNIX 纪元")
             .as_nanos();
-        std::env::temp_dir().join(format!("tltoolbox-ret-{tag}-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "tltoolbox-ret-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     /// 把文件的修改时间改写为指定时刻（`File::set_modified`，模拟旧日志的 mtime）。
@@ -251,7 +254,10 @@ mod tests {
             "未过期日志应保留"
         );
         // cmd 会话日志（文件名不含旧日期标记，mtime 为当前时刻）保留。
-        assert!(survivor("cmd_101523_42.log").exists(), "未过期 cmd 日志应保留");
+        assert!(
+            survivor("cmd_101523_42.log").exists(),
+            "未过期 cmd 日志应保留"
+        );
         // 旧文件全部删除。
         assert!(
             !survivor("2026-01-01_10-00-00_pid123.log").exists(),
@@ -282,7 +288,10 @@ mod tests {
 
         let report = cleanup_expired_logs_sync(&root, 0);
         assert_eq!(report.removed, 6, "保留 0 天 = 全部受管日志过期");
-        assert!(created.iter().filter(|p| p.ends_with(".log")).all(|p| !p.exists()));
+        assert!(created
+            .iter()
+            .filter(|p| p.ends_with(".log"))
+            .all(|p| !p.exists()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

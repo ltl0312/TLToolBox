@@ -115,7 +115,10 @@
 
 slint::include_modules!();
 
-use slint::{CloseRequestResponse, ComponentHandle, Image as SlintImage, Model, ModelRc, SharedString, VecModel};
+use slint::{
+    CloseRequestResponse, ComponentHandle, Image as SlintImage, Model, ModelRc, SharedString,
+    VecModel,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -125,6 +128,8 @@ use tltoolbox::config::{AppConfig, ConfigManager, PinnedRule};
 use tltoolbox::logging::{self, AuditSink};
 use tltoolbox::manager::{ModuleManager, SharedManager};
 use tltoolbox::modules::clipboard_purifier::ClipboardPurifierModule;
+use tltoolbox::modules::icon_locker::explorer;
+use tltoolbox::modules::icon_locker::IconLockerModule;
 use tltoolbox::modules::keep_awake::KeepAwakeModule;
 use tltoolbox::modules::popup_blocker::{CaptureRecord, PopupBlockerModule};
 use tltoolbox::modules::port_hunter::{PortEntry, PortHunterModule};
@@ -158,7 +163,7 @@ use tokio::sync::Mutex;
 fn module_has_settings(id: &str) -> bool {
     matches!(
         id,
-        "popup_blocker" | "terminal_logger" | "topmost_manager" | "port_hunter"
+        "popup_blocker" | "terminal_logger" | "topmost_manager" | "port_hunter" | "icon_locker"
     )
 }
 
@@ -256,10 +261,14 @@ fn refresh_settings_displays(ui: &MainWindow, cfg: &AppConfig) {
         cfg.effective_app_log_dir().to_string_lossy().into_owned(),
     ));
     ui.set_terminal_log_dir_display(SharedString::from(
-        cfg.effective_terminal_log_dir().to_string_lossy().into_owned(),
+        cfg.effective_terminal_log_dir()
+            .to_string_lossy()
+            .into_owned(),
     ));
     ui.set_screenshot_dir_display(SharedString::from(
-        cfg.effective_popup_screenshot_dir().to_string_lossy().into_owned(),
+        cfg.effective_popup_screenshot_dir()
+            .to_string_lossy()
+            .into_owned(),
     ));
 }
 
@@ -349,7 +358,11 @@ fn topmost_row_from(
     // 优先级事实源：受管条目 > 进程级记忆（v0.4.1）> 默认值。
     let priority = entry
         .map(|e| e.priority as i32)
-        .or_else(|| module.remembered_priority(&window.process_name).map(|p| p as i32))
+        .or_else(|| {
+            module
+                .remembered_priority(&window.process_name)
+                .map(|p| p as i32)
+        })
         .unwrap_or(tltoolbox::modules::topmost_manager::DEFAULT_PRIORITY as i32);
     TopmostWindowItem {
         hwnd: SharedString::from(format!("0x{:X}", window.hwnd)),
@@ -379,10 +392,7 @@ fn filter_topmost_rows(rows: &[TopmostWindowItem], search: &str) -> Vec<TopmostW
 }
 
 /// 【任意线程可调用】重建全量候选行快照并刷新弹窗模型（枚举在阻塞线程执行）。
-fn refresh_topmost_rows(
-    ui_weak: &slint::Weak<MainWindow>,
-    module: Arc<TopmostManagerModule>,
-) {
+fn refresh_topmost_rows(ui_weak: &slint::Weak<MainWindow>, module: Arc<TopmostManagerModule>) {
     let weak = ui_weak.clone();
     tokio::spawn(async move {
         // 枚举（EnumWindows + 逐窗口元数据查询）为同步 Win32 调用，移出运行时。
@@ -394,15 +404,17 @@ fn refresh_topmost_rows(
             .iter()
             .map(|window| topmost_row_from(window, &pinned, &module))
             .collect();
-        *topmost_full_rows().lock().unwrap_or_else(|e| e.into_inner()) = rows.clone();
+        *topmost_full_rows()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = rows.clone();
 
         // 在 UI 线程读取当前搜索词并交付过滤结果（跨线程载荷仅 Weak + Vec）。
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(ui) = weak.upgrade() {
                 let search = ui.get_topmost_search().to_string();
-                ui.set_topmost_windows(ModelRc::new(VecModel::from(
-                    filter_topmost_rows(&rows, &search),
-                )));
+                ui.set_topmost_windows(ModelRc::new(VecModel::from(filter_topmost_rows(
+                    &rows, &search,
+                ))));
             }
         });
     });
@@ -478,16 +490,17 @@ fn handle_topmost_pin(
                     "失败: 窗口已关闭".to_string(),
                     "窗口已关闭或句柄失效".to_string(),
                 ),
-                other => (
-                    format!("失败: {other}"),
-                    format!("置顶操作失败：{other}"),
-                ),
+                other => (format!("失败: {other}"), format!("置顶操作失败：{other}")),
             };
             audit.record(
                 "TOPMOST",
                 format!(
                     "{} HWND: 0x{hwnd:X}",
-                    if pinned { "开启窗口置顶" } else { "解除窗口置顶" }
+                    if pinned {
+                        "开启窗口置顶"
+                    } else {
+                        "解除窗口置顶"
+                    }
                 ),
                 audit_result,
             );
@@ -534,10 +547,7 @@ fn handle_topmost_priority(
                     "失败: 窗口已关闭".to_string(),
                     "窗口已关闭或句柄失效".to_string(),
                 ),
-                other => (
-                    format!("失败: {other}"),
-                    format!("调整优先级失败：{other}"),
-                ),
+                other => (format!("失败: {other}"), format!("调整优先级失败：{other}")),
             };
             audit.record(
                 "TOPMOST",
@@ -654,7 +664,10 @@ fn open_port_hunter_modal(
     tokio::spawn(async move {
         let (confirm, show_system) = {
             let cfg = runtime_config.lock().await;
-            (cfg.port_hunter.confirm_before_kill, cfg.port_hunter.show_system_ports)
+            (
+                cfg.port_hunter.confirm_before_kill,
+                cfg.port_hunter.show_system_ports,
+            )
         };
         let weak_ui = weak.clone();
         let _ = slint::invoke_from_event_loop(move || {
@@ -750,7 +763,10 @@ impl PortHunterCtx {
                         ),
                         "成功",
                     );
-                    show_toast(&weak, &format!("{}已{}", label, if value { "开启" } else { "关闭" }));
+                    show_toast(
+                        &weak,
+                        &format!("{}已{}", label, if value { "开启" } else { "关闭" }),
+                    );
                 }
                 Err(err) => {
                     audit.record(
@@ -795,10 +811,9 @@ fn handle_port_kill(
         let pid_u = pid as u32;
         let port_u = port as u16;
         let protocol_text = protocol.clone();
-        let report = tokio::task::spawn_blocking(move || {
-            module_kill.kill(pid_u, port_u, &protocol_text)
-        })
-        .await;
+        let report =
+            tokio::task::spawn_blocking(move || module_kill.kill(pid_u, port_u, &protocol_text))
+                .await;
 
         match report {
             Ok(report) => {
@@ -917,29 +932,44 @@ fn handle_dir_setting(
             DirSettingAction::Browse => {
                 // 「更改…」：原生文件夹选择；取消（None）静默保持原配置。
                 let title = dir_setting_title(&key);
-                let chosen = match tokio::task::spawn_blocking(move || platform::browse_for_folder(&title))
-                    .await
-                {
-                    Ok(Ok(Some(dir))) => dir,
-                    Ok(Ok(None)) => return, // 用户取消：不产生任何变更
-                    Ok(Err(err)) => {
-                        audit.record("路径更改", &key, format!("选择目录失败: {err}"));
-                        show_toast(&weak, &format!("选择目录失败：{err}"));
-                        return;
-                    }
-                    Err(_err) => {
-                        audit.record("路径更改", &key, "选择目录任务异常");
-                        show_toast(&weak, "选择目录任务异常，请重试");
-                        return;
-                    }
-                };
-                apply_dir_field_change(weak.clone(), &config_mgr, &runtime_config, &audit, &key, Some(chosen))
-                    .await;
+                let chosen =
+                    match tokio::task::spawn_blocking(move || platform::browse_for_folder(&title))
+                        .await
+                    {
+                        Ok(Ok(Some(dir))) => dir,
+                        Ok(Ok(None)) => return, // 用户取消：不产生任何变更
+                        Ok(Err(err)) => {
+                            audit.record("路径更改", &key, format!("选择目录失败: {err}"));
+                            show_toast(&weak, &format!("选择目录失败：{err}"));
+                            return;
+                        }
+                        Err(_err) => {
+                            audit.record("路径更改", &key, "选择目录任务异常");
+                            show_toast(&weak, "选择目录任务异常，请重试");
+                            return;
+                        }
+                    };
+                apply_dir_field_change(
+                    weak.clone(),
+                    &config_mgr,
+                    &runtime_config,
+                    &audit,
+                    &key,
+                    Some(chosen),
+                )
+                .await;
             }
             DirSettingAction::Reset => {
                 // 「恢复默认」：字段置 None → 回退 exe 同级默认布局。
-                apply_dir_field_change(weak.clone(), &config_mgr, &runtime_config, &audit, &key, None)
-                    .await;
+                apply_dir_field_change(
+                    weak.clone(),
+                    &config_mgr,
+                    &runtime_config,
+                    &audit,
+                    &key,
+                    None,
+                )
+                .await;
             }
         }
     });
@@ -975,7 +1005,10 @@ async fn apply_dir_field_change(
             audit.record("路径更改", action_text, "成功");
             let message = match value.as_deref() {
                 Some(dir) if key == "popup_screenshot" => {
-                    format!("截图目录已更新（弹窗拦截下次启动时生效）：{}", dir.display())
+                    format!(
+                        "截图目录已更新（弹窗拦截下次启动时生效）：{}",
+                        dir.display()
+                    )
                 }
                 Some(dir) => format!("目录已更新：{}", dir.display()),
                 None => "已恢复默认目录".to_string(),
@@ -983,7 +1016,10 @@ async fn apply_dir_field_change(
             // 三类展示文本一律以**最新快照**的 effective_* 解析（任一目录变更后
             // 其它目录的展示同步收敛，避免展示陈旧路径）。
             let (app_dir, term_dir, shot_dir) = (
-                snapshot.effective_app_log_dir().to_string_lossy().into_owned(),
+                snapshot
+                    .effective_app_log_dir()
+                    .to_string_lossy()
+                    .into_owned(),
                 snapshot
                     .effective_terminal_log_dir()
                     .to_string_lossy()
@@ -1049,7 +1085,11 @@ fn check_for_updates(ui_weak: &slint::Weak<MainWindow>, audit: &AuditSink) {
         audit.record(
             "检查更新",
             &status_text,
-            if available { "发现新版本" } else { "完成" },
+            if available {
+                "发现新版本"
+            } else {
+                "完成"
+            },
         );
 
         let status_for_toast = status_text.clone();
@@ -1350,6 +1390,74 @@ fn spawn_topmost_rules_persister(
 }
 
 // ---------------------------------------------------------------------------
+// 桌面图标布局锁 · 弹窗助手（v0.6.0：指纹采集 / 方案模型重建 / 配置持久化）
+// ---------------------------------------------------------------------------
+
+/// 【UI 线程内】把模块方案快照重建为 `icon_locker_profiles` 模型并刷新状态条。
+fn set_icon_locker_profiles_model(ui: &MainWindow, module: &IconLockerModule) {
+    let profiles = module.profiles();
+    let items = profiles
+        .iter()
+        .map(|profile| IconLockerProfileItem {
+            id: SharedString::from(profile.id.clone()),
+            name: SharedString::from(profile.name.clone()),
+            icon_count: profile.icon_positions.len() as i32,
+            fingerprint: SharedString::from(profile.topology_fingerprint.clone()),
+        })
+        .collect::<Vec<_>>();
+    ui.set_icon_locker_profiles(ModelRc::new(VecModel::from(items)));
+    ui.set_icon_locker_status(SharedString::from(format!(
+        "共 {} 个布局方案",
+        profiles.len()
+    )));
+}
+
+/// 打开「桌面图标布局锁」设置弹窗。
+///
+/// 线程模型：环境指纹采集（`EnumDisplayMonitors`）虽是轻量 Win32 枚举，仍按既有
+/// 纪律经 `spawn_blocking` 移出 UI 线程（COM / 系统枚举严禁阻塞 Slint 事件循环）；
+/// 落定后经 `invoke_from_event_loop` 回 UI 线程填充指纹、方案模型与自动还原开关，
+/// 再展示弹窗。
+fn open_icon_locker_modal(ui_weak: &slint::Weak<MainWindow>, module: Arc<IconLockerModule>) {
+    let weak = ui_weak.clone();
+    tokio::spawn(async move {
+        let fingerprint = tokio::task::spawn_blocking(
+            tltoolbox::modules::icon_locker::daemon::current_topology_fingerprint,
+        )
+        .await
+        .unwrap_or_default();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_icon_locker_fingerprint(SharedString::from(fingerprint));
+                set_icon_locker_profiles_model(&ui, &module);
+                ui.set_icon_locker_auto_restore(module.auto_restore());
+                ui.set_show_icon_locker_modal(true);
+            }
+        });
+    });
+}
+
+/// 把模块当前方案列表 + 自动还原开关持久化到配置 `[icon_locker]` 节。
+///
+/// 方案列表的事实源是模块内存态（与启动时注入的配置同源），落盘仅是镜像收敛；
+/// 失败仅告警（下一次成功操作 / 重启加载时自愈）。
+async fn persist_icon_locker_config(
+    config_mgr: &Arc<ConfigManager>,
+    runtime_config: &Arc<Mutex<AppConfig>>,
+    module: &IconLockerModule,
+) {
+    let snapshot = {
+        let mut cfg = runtime_config.lock().await;
+        cfg.icon_locker.profiles = module.profiles();
+        cfg.icon_locker.auto_restore = module.auto_restore();
+        cfg.clone()
+    };
+    if let Err(err) = config_mgr.save(&snapshot).await {
+        tracing::error!(target: "main", "图标布局锁配置落盘失败: {err}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 总线 → UI 投递（跨线程边界；模型改写严格发生在 UI 线程闭包内）
 // ---------------------------------------------------------------------------
 
@@ -1495,7 +1603,11 @@ async fn lifecycle_controller(
                 TrayAction::ToggleAllModules(enable) => {
                     audit.record(
                         "全部模块",
-                        if enable { "托盘：全部启用" } else { "托盘：全部停用" },
+                        if enable {
+                            "托盘：全部启用"
+                        } else {
+                            "托盘：全部停用"
+                        },
                         "进行中",
                     );
                     let mgr = Arc::clone(&manager);
@@ -1504,11 +1616,16 @@ async fn lifecycle_controller(
                         set_all_modules(&mgr, enable).await;
                         audit.record(
                             "全部模块",
-                            if enable { "托盘：全部启用" } else { "托盘：全部停用" },
+                            if enable {
+                                "托盘：全部启用"
+                            } else {
+                                "托盘：全部停用"
+                            },
                             "完成",
                         );
                     });
-                }                TrayAction::ExitApp => {
+                }
+                TrayAction::ExitApp => {
                     tracing::info!(target: "main", "托盘「退出程序」触发，调度应用平滑收尾");
                     quit_scheduled = true;
                     let _ = slint::invoke_from_event_loop(|| {
@@ -1567,9 +1684,10 @@ async fn main() -> Result<(), AppError> {
     //          故跳过 b) 的退出路径、降级为无互斥继续装配（旧实例必然随即退出）。
     let restarting_elevated = std::env::args().any(|arg| arg == platform::RESTART_MARKER_ARG);
     let (instance_guard, instance_log) = match single_instance::acquire() {
-        Ok(single_instance::SingleInstanceOutcome::Primary(guard)) => {
-            (Some(guard), "单实例守护已就绪：本进程为唯一实例，互斥句柄持有至退出".to_string())
-        }
+        Ok(single_instance::SingleInstanceOutcome::Primary(guard)) => (
+            Some(guard),
+            "单实例守护已就绪：本进程为唯一实例，互斥句柄持有至退出".to_string(),
+        ),
         Ok(single_instance::SingleInstanceOutcome::Secondary { .. }) if restarting_elevated => (
             None,
             "提权重启握手期：既有实例即将退出并释放互斥，本实例跳过「第二实例退出」路径继续装配"
@@ -1633,7 +1751,11 @@ async fn main() -> Result<(), AppError> {
     //      高精度时间戳（微秒 UTC）由 AuditSink 在记录时刻生成；发送端被下述各
     //      UI 回调句柄持有至进程收尾（落盘任务串行消费，调用方绝不阻塞）。
     let audit = logging::AuditSink::new(app_config.effective_app_log_dir());
-    audit.record("应用启动", format!("v{}", env!("CARGO_PKG_VERSION")), "成功");
+    audit.record(
+        "应用启动",
+        format!("v{}", env!("CARGO_PKG_VERSION")),
+        "成功",
+    );
 
     tracing::info!(
         target: "main",
@@ -1742,6 +1864,12 @@ async fn main() -> Result<(), AppError> {
     ));
     port_hunter.attach_bus(Some(event_bus.clone()));
     module_mgr.register(port_hunter.clone());
+    let icon_locker = Arc::new(
+        IconLockerModule::new(app_config.icon_locker.profiles.clone())
+            .with_auto_restore(app_config.icon_locker.auto_restore)
+            .with_bus(Some(event_bus.clone())),
+    );
+    module_mgr.register(icon_locker.clone());
     let shared_mgr: SharedManager = Arc::new(module_mgr);
     let registered_modules: Vec<&str> = shared_mgr
         .get_metadata_list()
@@ -1762,9 +1890,13 @@ async fn main() -> Result<(), AppError> {
     //      与 auto_start_modules 等价（窗口置顶守护 = 显式开启才合理，不写入
     //      auto_start_modules 默认列表；但用户一旦开启，重启后应保持守护）。
     let mut auto_start_ids: Vec<String> = app_config.auto_start_modules.clone();
-    if app_config.topmost_manager.enabled && !auto_start_ids.iter().any(|id| id == "topmost_manager")
+    if app_config.topmost_manager.enabled
+        && !auto_start_ids.iter().any(|id| id == "topmost_manager")
     {
         auto_start_ids.push("topmost_manager".to_string());
+    }
+    if app_config.icon_locker.enabled && !auto_start_ids.iter().any(|id| id == "icon_locker") {
+        auto_start_ids.push("icon_locker".to_string());
     }
     for module_id in &auto_start_ids {
         if shared_mgr.get_module(module_id).is_none() {
@@ -1807,6 +1939,14 @@ async fn main() -> Result<(), AppError> {
     ui.set_port_hunter_search(SharedString::from(""));
     ui.set_port_hunter_entries(ModelRc::new(VecModel::from(Vec::<PortEntryItem>::new())));
     ui.set_port_hunter_status(SharedString::from("打开弹窗后自动扫描本地监听端口"));
+    // v0.6.0 桌面图标布局锁初始状态（弹窗打开时再重读 / 重算，见 8.4.7）。
+    ui.set_icon_locker_fingerprint(SharedString::from(""));
+    ui.set_icon_locker_profiles(ModelRc::new(VecModel::from(
+        Vec::<IconLockerProfileItem>::new(),
+    )));
+    ui.set_icon_locker_auto_restore(app_config.icon_locker.auto_restore);
+    ui.set_icon_locker_profile_name(SharedString::from(""));
+    ui.set_icon_locker_status(SharedString::from("尚未保存布局方案"));
     tracing::info!(
         target: "main",
         "UI 已实例化，初始注入 {} 个模块（提权展示形态: {}）",
@@ -1876,6 +2016,15 @@ async fn main() -> Result<(), AppError> {
                                 "窗口置顶启停状态写入配置失败（下次启动将按配置收敛）: {err}"
                             );
                         }
+                    } else if id_text == "icon_locker" {
+                        let snapshot = {
+                            let mut cfg = cfg_lock.lock().await;
+                            cfg.icon_locker.enabled = enable;
+                            cfg.clone()
+                        };
+                        if let Err(err) = cfg_mgr.save(&snapshot).await {
+                            tracing::warn!(target: "main", "图标布局锁启停状态写入配置失败: {err}");
+                        }
                     }
                 }
                 Err(err) => {
@@ -1897,7 +2046,11 @@ async fn main() -> Result<(), AppError> {
         let cfg_lock = Arc::clone(&autostart_cfg);
         let weak = autostart_ui.clone();
         let audit = autostart_audit.clone();
-        let action_text = if enable { "开机自启 -> 开启" } else { "开机自启 -> 关闭" };
+        let action_text = if enable {
+            "开机自启 -> 开启"
+        } else {
+            "开机自启 -> 关闭"
+        };
         tokio::spawn(async move {
             // 1) 注册表镜像（同步 API 走 spawn_blocking，不占用 UI / 运行时工作线程）。
             let applied =
@@ -1955,7 +2108,11 @@ async fn main() -> Result<(), AppError> {
         let mgr = Arc::clone(&all_mgr);
         let weak = all_ui.clone();
         let audit = all_audit.clone();
-        let action_text = if enable { "全部模块 -> 启用" } else { "全部模块 -> 停用" };
+        let action_text = if enable {
+            "全部模块 -> 启用"
+        } else {
+            "全部模块 -> 停用"
+        };
         tokio::spawn(async move {
             audit.record("全部模块", action_text, "进行中");
             set_all_modules(&mgr, enable).await;
@@ -1993,6 +2150,7 @@ async fn main() -> Result<(), AppError> {
     let open_ui = ui.as_weak();
     let open_topmost_module = Arc::clone(&topmost_manager);
     let open_port_module = Arc::clone(&port_hunter);
+    let open_icon_module = Arc::clone(&icon_locker);
     let open_port_audit = audit.clone();
     ui.on_open_module_settings(move |module_id| {
         let weak = open_ui.clone();
@@ -2021,6 +2179,9 @@ async fn main() -> Result<(), AppError> {
                     ui.set_show_topmost_modal(true);
                 }
             }
+            "icon_locker" => {
+                open_icon_locker_modal(&weak, Arc::clone(&open_icon_module));
+            }
             "port_hunter" => {
                 // 读取配置选项 → 展示弹窗 → 立即扫描（v0.5.0，见 8.9 的接线）。
                 open_port_hunter_modal(
@@ -2036,7 +2197,213 @@ async fn main() -> Result<(), AppError> {
         }
     });
 
-    // 8.4.2 弹窗关闭（右上角 × / 点击遮罩空白）。
+    let close_icon_ui = ui.as_weak();
+    ui.on_close_icon_locker_modal(move || {
+        if let Some(ui) = close_icon_ui.upgrade() {
+            ui.set_show_icon_locker_modal(false);
+        }
+    });
+
+    // 8.4.7 桌面图标布局锁 · 弹窗回调闭环（v0.6.0）：
+    //      - icon_locker_save(name)：抓取当前布局 → 保存方案 → 持久化 → 刷新列表；
+    //      - icon_locker_restore(id)：按 ID 批量还原（COM 经独立 OS 线程，绝不
+    //        阻塞 UI 线程与 Tokio 工作线程池）；失败 / 被系统弹回时 Toast 提示排查
+    //        「自动排列图标」；
+    //      - icon_locker_delete(id)：删除方案 → 持久化 → 刷新列表；
+    //      - icon_locker_auto_restore_changed(checked)：切换自动还原开关并持久化。
+    //      COM 抓取 / 还原统一走 explorer::spawn_com_thread：std::thread::spawn 拉
+    //      **全新 OS 线程**，线程内 CoInitializeEx(COINIT_APARTMENTTHREADED) → 操作
+    //      → CoUninitialize（RPC_E_CHANGED_MODE 容错），结果经 tokio::sync::oneshot
+    //      异步回传——Tokio 工作线程池永不接触 Shell COM（避免 spawn_blocking 阻塞
+    //      池线程的 COM 公寓污染）；UI 模型改写仅在 invoke_from_event_loop 闭包内
+    //      执行（与既有模块同一跨线程纪律）。
+    let save_icon_module = Arc::clone(&icon_locker);
+    let save_icon_cfg = Arc::clone(&config_mgr);
+    let save_icon_runtime = Arc::clone(&runtime_config);
+    let save_icon_ui = ui.as_weak();
+    let save_icon_audit = audit.clone();
+    ui.on_icon_locker_save(move |name| {
+        let weak = save_icon_ui.clone();
+        let module = Arc::clone(&save_icon_module);
+        let cfg_mgr = Arc::clone(&save_icon_cfg);
+        let cfg_lock = Arc::clone(&save_icon_runtime);
+        let audit = save_icon_audit.clone();
+        let trimmed = name.trim().to_string();
+        let profile_name = if trimmed.is_empty() {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("布局-{seconds}")
+        } else {
+            trimmed
+        };
+        // COM 抓取在**全新独立 OS 线程**执行（绝不占用 Tokio 阻塞池线程）：线程内
+        // CoInitializeEx(COINIT_APARTMENTTHREADED)（RPC_E_CHANGED_MODE 容错）→
+        // capture_profile → CoUninitialize，结果经 oneshot 通道异步回传（见
+        // explorer::spawn_com_thread）。
+        let module_for_capture = Arc::clone(&module);
+        let (com_tx, com_rx) = tokio::sync::oneshot::channel();
+        let spawn_result = explorer::spawn_com_thread(
+            "tlt-icon-locker-save",
+            move || module_for_capture.capture_profile(profile_name),
+            com_tx,
+        );
+        tokio::spawn(async move {
+            if let Err(err) = spawn_result {
+                audit.record("图标布局", "保存方案", format!("独立线程启动失败: {err}"));
+                show_toast(&weak, &format!("保存布局失败：无法启动 COM 线程（{err}）"));
+                return;
+            }
+            match com_rx.await {
+                Ok(Ok(profile)) => {
+                    persist_icon_locker_config(&cfg_mgr, &cfg_lock, &module).await;
+                    audit.record(
+                        "图标布局",
+                        format!(
+                            "保存方案 \"{}\"（{} 个图标）",
+                            profile.name,
+                            profile.icon_positions.len()
+                        ),
+                        "成功",
+                    );
+                    let weak_inner = weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = weak_inner.upgrade() {
+                            set_icon_locker_profiles_model(&ui, &module);
+                            ui.set_icon_locker_profile_name(SharedString::from(""));
+                        }
+                    });
+                    show_toast(&weak, "已保存桌面图标布局");
+                }
+                Ok(Err(err)) => {
+                    audit.record("图标布局", "保存方案", format!("失败: {err}"));
+                    show_toast(&weak, &format!("保存布局失败：{err}"));
+                }
+                Err(_) => {
+                    audit.record("图标布局", "保存方案", "任务异常（COM 结果通道中断）");
+                    show_toast(&weak, "保存布局任务异常，请重试");
+                }
+            }
+        });
+    });
+
+    let restore_icon_module = Arc::clone(&icon_locker);
+    let restore_icon_ui = ui.as_weak();
+    let restore_icon_audit = audit.clone();
+    ui.on_icon_locker_restore(move |id| {
+        let weak = restore_icon_ui.clone();
+        let module = Arc::clone(&restore_icon_module);
+        let audit = restore_icon_audit.clone();
+        let id_text = id.to_string();
+        // 与保存同一 COM 线程纪律：独立 OS 线程 + STA 生命周期 + oneshot 回传
+        // （explorer::spawn_com_thread），Tokio 工作线程池不接触 Shell COM。
+        let module_for_restore = Arc::clone(&module);
+        let id_for_task = id_text.clone();
+        let (com_tx, com_rx) = tokio::sync::oneshot::channel();
+        let spawn_result = explorer::spawn_com_thread(
+            "tlt-icon-locker-restore",
+            move || module_for_restore.restore_profile(&id_for_task),
+            com_tx,
+        );
+        tokio::spawn(async move {
+            if let Err(err) = spawn_result {
+                audit.record(
+                    "图标布局",
+                    format!("还原方案 {id_text}"),
+                    format!("独立线程启动失败: {err}"),
+                );
+                show_toast(&weak, &format!("还原布局失败：无法启动 COM 线程（{err}）"));
+                return;
+            }
+            match com_rx.await {
+                Ok(Ok(())) => {
+                    audit.record("图标布局", format!("还原方案 {id_text}"), "成功");
+                    show_toast(
+                        &weak,
+                        "已还原桌面图标布局（若图标被系统弹回，请排查桌面右键「自动排列图标」）",
+                    );
+                }
+                Ok(Err(err)) => {
+                    audit.record("图标布局", format!("还原方案 {id_text}"), format!("失败: {err}"));
+                    show_toast(
+                        &weak,
+                        &format!("还原布局失败：{err}（若图标被系统弹回，请排查桌面右键「自动排列图标」）"),
+                    );
+                }
+                Err(_) => {
+                    audit.record(
+                        "图标布局",
+                        format!("还原方案 {id_text}"),
+                        "任务异常（COM 结果通道中断）",
+                    );
+                    show_toast(&weak, "还原布局任务异常，请重试");
+                }
+            }
+        });
+    });
+
+    let delete_icon_module = Arc::clone(&icon_locker);
+    let delete_icon_cfg = Arc::clone(&config_mgr);
+    let delete_icon_runtime = Arc::clone(&runtime_config);
+    let delete_icon_ui = ui.as_weak();
+    let delete_icon_audit = audit.clone();
+    ui.on_icon_locker_delete(move |id| {
+        let weak = delete_icon_ui.clone();
+        let module = Arc::clone(&delete_icon_module);
+        let cfg_mgr = Arc::clone(&delete_icon_cfg);
+        let cfg_lock = Arc::clone(&delete_icon_runtime);
+        let audit = delete_icon_audit.clone();
+        let id_text = id.to_string();
+        tokio::spawn(async move {
+            let removed = module.remove_profile(&id_text);
+            if removed {
+                persist_icon_locker_config(&cfg_mgr, &cfg_lock, &module).await;
+                audit.record("图标布局", format!("删除方案 {id_text}"), "成功");
+                let weak_inner = weak.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = weak_inner.upgrade() {
+                        set_icon_locker_profiles_model(&ui, &module);
+                    }
+                });
+                show_toast(&weak, "已删除布局方案");
+            } else {
+                audit.record("图标布局", format!("删除方案 {id_text}"), "未找到");
+                show_toast(&weak, "未找到该布局方案");
+            }
+        });
+    });
+
+    let auto_icon_module = Arc::clone(&icon_locker);
+    let auto_icon_cfg = Arc::clone(&config_mgr);
+    let auto_icon_runtime = Arc::clone(&runtime_config);
+    let auto_icon_ui = ui.as_weak();
+    let auto_icon_audit = audit.clone();
+    ui.on_icon_locker_auto_restore_changed(move |checked| {
+        let weak = auto_icon_ui.clone();
+        let module = Arc::clone(&auto_icon_module);
+        let cfg_mgr = Arc::clone(&auto_icon_cfg);
+        let cfg_lock = Arc::clone(&auto_icon_runtime);
+        let audit = auto_icon_audit.clone();
+        tokio::spawn(async move {
+            module.set_auto_restore(checked);
+            persist_icon_locker_config(&cfg_mgr, &cfg_lock, &module).await;
+            audit.record(
+                "图标布局",
+                format!("自动还原 -> {}", if checked { "开启" } else { "关闭" }),
+                "成功",
+            );
+            show_toast(
+                &weak,
+                if checked {
+                    "已开启显示器拓扑变化自动还原"
+                } else {
+                    "已关闭自动还原"
+                },
+            );
+        });
+    });
+
     let close_ui = ui.as_weak();
     ui.on_close_rules_modal(move || {
         if let Some(ui) = close_ui.upgrade() {
@@ -2179,7 +2546,11 @@ async fn main() -> Result<(), AppError> {
             {
                 Ok(Ok(())) => audit.record("打开下载页", update::RELEASES_PAGE_URL, "成功"),
                 Ok(Err(err)) => {
-                    audit.record("打开下载页", update::RELEASES_PAGE_URL, format!("失败: {err}"));
+                    audit.record(
+                        "打开下载页",
+                        update::RELEASES_PAGE_URL,
+                        format!("失败: {err}"),
+                    );
                     show_toast(&weak, &format!("打开下载页失败：{err}"));
                 }
                 Err(_err) => {
@@ -2541,12 +2912,14 @@ async fn main() -> Result<(), AppError> {
         // （托盘「退出程序」/ 提权重启）。这一形态同时修正了 slint 默认循环
         // 「最后一个可见窗口消失即退出」对托盘应用的误伤（含 --silent 静默
         // 常驻：窗口从未显示也可长期驻留）。
-        slint::run_event_loop_until_quit()
-            .map_err(|err| -> AppError { format!("Slint 事件循环运行失败: {err}").into() })?;
+        slint::run_event_loop_until_quit().map_err(|err| -> AppError {
+            format!("Slint 事件循环运行失败: {err}").into()
+        })?;
     } else {
         // 常规形态（minimize_to_tray 关闭 / 托盘不可用）：关闭最后窗口即退出。
-        slint::run_event_loop()
-            .map_err(|err| -> AppError { format!("Slint 事件循环运行失败: {err}").into() })?;
+        slint::run_event_loop().map_err(|err| -> AppError {
+            format!("Slint 事件循环运行失败: {err}").into()
+        })?;
     }
     tracing::info!(target: "main", "UI 事件循环已退出，开始平滑收尾");
 

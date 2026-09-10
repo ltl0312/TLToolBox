@@ -698,7 +698,10 @@ mod tests {
         assert!(ps_once.contains(&block_end_marker(PS_TAG)));
         assert!(ps_once.contains("Start-Transcript"));
         assert!(bash_once.contains(&block_start_marker(BASH_TAG)));
-        assert!(bash_once.contains("PROMPT_COMMAND"), "bash 钩子应为 PROMPT_COMMAND + history 方案");
+        assert!(
+            bash_once.contains("PROMPT_COMMAND"),
+            "bash 钩子应为 PROMPT_COMMAND + history 方案"
+        );
 
         // 2) 幂等：同参数重复安装逐字节不变。
         hooks.install_all(&log_base).expect("重复安装应幂等成功");
