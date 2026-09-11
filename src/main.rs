@@ -238,11 +238,11 @@ fn set_popup_rules_model(ui: &MainWindow, rules: Vec<String>) {
 /// 行元素；排队到下一轮事件循环即可让当前事件干净收尾后再重建列表。
 fn deliver_popup_rules_refresh(ui_weak: &slint::Weak<MainWindow>, rules: Vec<String>) {
     let weak = ui_weak.clone();
-    let queued = slint::invoke_from_event_loop(move || {
+    let queued = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
         if let Some(ui) = weak.upgrade() {
             set_popup_rules_model(&ui, rules);
         }
-    });
+    }));
     if queued.is_err() {
         tracing::warn!(target: "main", "无法投递规则列表刷新：UI 事件循环已不可用");
     }
@@ -296,11 +296,11 @@ fn set_captures_model(ui: &MainWindow, records: Vec<CaptureRecord>) {
 /// 【任意线程可调用】把最新留痕记录异步刷入 UI（经事件循环排队到 UI 线程）。
 fn deliver_captures_refresh(ui_weak: &slint::Weak<MainWindow>, records: Vec<CaptureRecord>) {
     let weak = ui_weak.clone();
-    let queued = slint::invoke_from_event_loop(move || {
+    let queued = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
         if let Some(ui) = weak.upgrade() {
             set_captures_model(&ui, records);
         }
-    });
+    }));
     if queued.is_err() {
         tracing::warn!(target: "main", "无法投递留痕列表刷新：UI 事件循环已不可用");
     }
@@ -409,14 +409,14 @@ fn refresh_topmost_rows(ui_weak: &slint::Weak<MainWindow>, module: Arc<TopmostMa
             .unwrap_or_else(|e| e.into_inner()) = rows.clone();
 
         // 在 UI 线程读取当前搜索词并交付过滤结果（跨线程载荷仅 Weak + Vec）。
-        let _ = slint::invoke_from_event_loop(move || {
+        let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
             if let Some(ui) = weak.upgrade() {
                 let search = ui.get_topmost_search().to_string();
                 ui.set_topmost_windows(ModelRc::new(VecModel::from(filter_topmost_rows(
                     &rows, &search,
                 ))));
             }
-        });
+        }));
     });
 }
 
@@ -643,12 +643,12 @@ fn scan_port_hunter(
 
         match result {
             Ok(Ok(_outcome)) => {
-                let _ = slint::invoke_from_event_loop(move || {
+                let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                     if let Some(ui) = weak.upgrade() {
                         // 扫描成功：缓存已在阻塞线程更新，按缓存重刷展示。
                         refresh_port_hunter_display(&ui, &module_ui);
                     }
-                });
+                }));
             }
             Ok(Err(err)) => {
                 audit.record("PORT_HUNTER", "扫描监听端口", format!("失败: {err}"));
@@ -680,14 +680,14 @@ fn open_port_hunter_modal(
             )
         };
         let weak_ui = weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
+        let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
             if let Some(ui) = weak_ui.upgrade() {
                 ui.set_port_confirm_before_kill(confirm);
                 ui.set_port_show_system_ports(show_system);
                 ui.set_port_hunter_search(SharedString::from(""));
                 ui.set_show_port_hunter_modal(true);
             }
-        });
+        }));
         scan_port_hunter(&weak, module, runtime_config, audit);
     });
 }
@@ -749,7 +749,7 @@ impl PortHunterCtx {
             // 读取的正是本属性）三方收敛；排队的顺序保证本写回先于下方 rescan
             // 的展示刷新执行。
             let sync_weak = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
+            let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                 if let Some(ui) = sync_weak.upgrade() {
                     match field {
                         "confirm" => ui.set_port_confirm_before_kill(value),
@@ -757,7 +757,7 @@ impl PortHunterCtx {
                         _ => {}
                     }
                 }
-            });
+            }));
             let label = if field == "confirm" {
                 "二次确认"
             } else {
@@ -1040,13 +1040,13 @@ async fn apply_dir_field_change(
                     .into_owned(),
             );
             let weak_display = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
+            let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                 if let Some(ui) = weak_display.upgrade() {
                     ui.set_app_log_dir_display(SharedString::from(app_dir));
                     ui.set_terminal_log_dir_display(SharedString::from(term_dir));
                     ui.set_screenshot_dir_display(SharedString::from(shot_dir));
                 }
-            });
+            }));
             show_toast(&weak, &message);
         }
         Err(err) => {
@@ -1104,13 +1104,13 @@ fn check_for_updates(ui_weak: &slint::Weak<MainWindow>, audit: &AuditSink) {
 
         let status_for_toast = status_text.clone();
         let weak_ui = weak.clone();
-        let _ = slint::invoke_from_event_loop(move || {
+        let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
             if let Some(ui) = weak_ui.upgrade() {
                 ui.set_update_status(SharedString::from(status_text));
                 ui.set_update_available(available);
                 ui.set_latest_version(SharedString::from(latest));
             }
-        });
+        }));
         show_toast(&weak, &status_for_toast);
     });
 }
@@ -1141,12 +1141,12 @@ fn open_terminal_settings(
             cfg.effective_terminal_log_dir()
         };
         let display = log_dir.to_string_lossy().into_owned();
-        let _ = slint::invoke_from_event_loop(move || {
+        let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_terminal_log_dir_display(SharedString::from(display));
                 ui.set_show_terminal_modal(true);
             }
-        });
+        }));
     });
 }
 
@@ -1246,12 +1246,12 @@ fn show_toast(ui_weak: &slint::Weak<MainWindow>, message: &str) {
 
     // 1) 展示：写入文案并亮起胶囊（排队到 UI 线程执行）。
     let show_weak = ui_weak.clone();
-    let queued = slint::invoke_from_event_loop(move || {
+    let queued = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
         if let Some(ui) = show_weak.upgrade() {
             ui.set_toast_message(message);
             ui.set_show_toast(true);
         }
-    });
+    }));
     if queued.is_err() {
         tracing::warn!(target: "main", "无法投递 Toast 展示：UI 事件循环已不可用");
         return;
@@ -1265,11 +1265,11 @@ fn show_toast(ui_weak: &slint::Weak<MainWindow>, message: &str) {
         if TOAST_EPOCH.load(Ordering::Relaxed) != epoch {
             return;
         }
-        let _ = slint::invoke_from_event_loop(move || {
+        let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
             if let Some(ui) = hide_weak.upgrade() {
                 ui.set_show_toast(false);
             }
-        });
+        }));
     });
 }
 
@@ -1310,9 +1310,9 @@ fn trigger_admin_restart(ui_weak: &slint::Weak<MainWindow>, audit: &AuditSink) {
             Ok(Ok(())) => {
                 audit.record("UAC 提权", "以管理员身份重启", "成功（新实例已拉起）");
                 tracing::info!(target: "main", "提权实例已确认启动，调度旧进程平滑收尾");
-                let _ = slint::invoke_from_event_loop(|| {
+                let _ = tltoolbox::thread_rules::deliver_ui(Box::new(|| {
                     let _ = slint::quit_event_loop();
-                });
+                }));
             }
             Ok(Err(err)) => {
                 // 最常见的失败 = 用户在 UAC 确认框选择“否”/直接取消（错误码 1223）；
@@ -1436,14 +1436,14 @@ fn open_icon_locker_modal(ui_weak: &slint::Weak<MainWindow>, module: Arc<IconLoc
         )
         .await
         .unwrap_or_default();
-        let _ = slint::invoke_from_event_loop(move || {
+        let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
             if let Some(ui) = weak.upgrade() {
                 ui.set_icon_locker_fingerprint(SharedString::from(fingerprint));
                 set_icon_locker_profiles_model(&ui, &module);
                 ui.set_icon_locker_auto_restore(module.auto_restore());
                 ui.set_show_icon_locker_modal(true);
             }
-        });
+        }));
     });
 }
 
@@ -1476,11 +1476,11 @@ async fn persist_icon_locker_config(
 /// 返回 `false` 表示事件循环已不可用（窗口关闭 / 后端退出），调用方应终止转发。
 fn deliver_module_sync(ui_weak: &slint::Weak<MainWindow>, manager: SharedManager) -> bool {
     let weak = ui_weak.clone();
-    let queued = slint::invoke_from_event_loop(move || {
+    let queued = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
         if let Some(ui) = weak.upgrade() {
             refresh_modules_model(&ui, &manager);
         }
-    });
+    }));
     queued.is_ok()
 }
 
@@ -1549,13 +1549,13 @@ fn all_modules_enabled(manager: &ModuleManager) -> bool {
 /// UI 线程执行（还原最小化 + show），杜绝跨线程触碰 Slint 窗口对象。
 fn request_show_main_window(ui_weak: &slint::Weak<MainWindow>) {
     let weak = ui_weak.clone();
-    let queued = slint::invoke_from_event_loop(move || {
+    let queued = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
         if let Some(ui) = weak.upgrade() {
             // 若窗口曾被最小化到任务栏，先还原再显示（show 幂等）。
             ui.window().set_minimized(false);
             let _ = ui.show();
         }
-    });
+    }));
     if queued.is_err() {
         tracing::warn!(target: "main", "无法投递「显示主窗口」：UI 事件循环已不可用");
     }
@@ -1655,9 +1655,9 @@ async fn lifecycle_controller(
                 TrayAction::ExitApp => {
                     tracing::info!(target: "main", "托盘「退出程序」触发，调度应用平滑收尾");
                     quit_scheduled = true;
-                    let _ = slint::invoke_from_event_loop(|| {
+                    let _ = tltoolbox::thread_rules::deliver_ui(Box::new(|| {
                         let _ = slint::quit_event_loop();
-                    });
+                    }));
                 }
                 TrayAction::RestartAsAdmin => {
                     // 托盘「以管理员身份重启」（仅未提权菜单渲染该项）：与 UI 盾牌
@@ -1784,14 +1784,33 @@ async fn main() -> Result<(), AppError> {
     );
     tracing::info!(target: "main", "{instance_log}");
 
-    // ---- 1.5 线程铁律 ① 类型化（v0.6.2 · P2-14）：在 UI 线程领取唯一令牌。 ----
-    //       `main` 所在线程即 Slint 事件循环线程（run_event_loop 在本线程执行）；
-    //       令牌全局唯一，二次领取即装配冲突（存在第二个"UI 线程"声明）。
-    //       令牌用于构造 [`tltoolbox::thread_rules::UiDeliver`]——"向 UI 投递"的
-    //       能力自此只能由装配层显式分发。
+    // ---- 1.5 线程铁律 ① 类型化（v0.6.2 · P2-14）：在 UI 线程领取唯一令牌， ----
+    //       并安装进程级 UI 交付通道。`main` 所在线程即 Slint 事件循环线程
+    //       （run_event_loop 在本线程执行）；令牌全局唯一，二次领取即装配冲突
+    //       （存在第二个"UI 线程"声明）。此后全部"跨线程触碰 UI"的动作一律经
+    //       [`tltoolbox::thread_rules::deliver_ui`] 进入规范通道，由下方单泵统一
+    //       转发到 `invoke_from_event_loop`（铁律①的执行端收敛为一处）。
     match tltoolbox::thread_rules::UiThreadToken::claim() {
-        Ok(_ui_token) => {
-            tracing::debug!(target: "main", "UI 线程令牌已领取（铁律①：模型只在 UI 线程改写）")
+        Ok(ui_token) => {
+            tracing::debug!(target: "main", "UI 线程令牌已领取（铁律①：模型只在 UI 线程改写）");
+            // 单泵：Tokio 工作线程消费通道内作业，逐条转发到 UI 线程消息循环；
+            // FIFO 转发保证作业到达顺序与投递顺序一致（与直连 invoke 语义一致）。
+            let ui_deliver = tltoolbox::thread_rules::UiDeliver::new(&ui_token, |mut rx| {
+                tokio::spawn(async move {
+                    while let Some(job) = rx.recv().await {
+                        if slint::invoke_from_event_loop(job).is_err() {
+                            tracing::warn!(
+                                target: "main",
+                                "UI 作业投递失败：Slint 事件循环已退出，作业被丢弃"
+                            );
+                        }
+                    }
+                });
+            });
+            // 令牌随安装被消费：只有 UI 线程装配层能同时持有令牌与通道。
+            if !tltoolbox::thread_rules::install_ui_deliver(ui_token, ui_deliver) {
+                return Err("UI 交付通道重复安装（装配冲突）".into());
+            }
         }
         Err(err) => return Err(format!("线程装配冲突: {err}").into()),
     }
@@ -2193,11 +2212,11 @@ async fn main() -> Result<(), AppError> {
                 );
             }
             // 3) 回读注册表真实状态刷新开关：失败路径自然回弹为原状态。
-            let _ = slint::invoke_from_event_loop(move || {
+            let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                 if let Some(ui) = weak.upgrade() {
                     ui.set_autostart_enabled(autostart::is_autostart_enabled());
                 }
-            });
+            }));
         });
     });
 
@@ -2370,12 +2389,12 @@ async fn main() -> Result<(), AppError> {
                         "成功",
                     );
                     let weak_inner = weak.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
+                    let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                         if let Some(ui) = weak_inner.upgrade() {
                             set_icon_locker_profiles_model(&ui, &module);
                             ui.set_icon_locker_profile_name(SharedString::from(""));
                         }
-                    });
+                    }));
                     show_toast(&weak, "已保存桌面图标布局");
                 }
                 Ok(Err(err)) => {
@@ -2463,11 +2482,11 @@ async fn main() -> Result<(), AppError> {
                 persist_icon_locker_config(&cfg_mgr, &cfg_lock, &module).await;
                 audit.record("图标布局", format!("删除方案 {id_text}"), "成功");
                 let weak_inner = weak.clone();
-                let _ = slint::invoke_from_event_loop(move || {
+                let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                     if let Some(ui) = weak_inner.upgrade() {
                         set_icon_locker_profiles_model(&ui, &module);
                     }
-                });
+                }));
                 show_toast(&weak, "已删除布局方案");
             } else {
                 audit.record("图标布局", format!("删除方案 {id_text}"), "未找到");
@@ -2697,12 +2716,12 @@ async fn main() -> Result<(), AppError> {
         let cfg_lock = Arc::clone(&settings_cfg);
         tokio::spawn(async move {
             let cfg = cfg_lock.lock().await.clone();
-            let _ = slint::invoke_from_event_loop(move || {
+            let _ = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                 if let Some(ui) = weak.upgrade() {
                     refresh_settings_displays(&ui, &cfg);
                     ui.set_show_settings_modal(true);
                 }
-            });
+            }));
         });
     });
 
@@ -2980,7 +2999,7 @@ async fn main() -> Result<(), AppError> {
         let ui_weak = ui.as_weak();
         ui.window().on_close_requested(move || {
             let hide_ui = ui_weak.clone();
-            let queued = slint::invoke_from_event_loop(move || {
+            let queued = tltoolbox::thread_rules::deliver_ui(Box::new(move || {
                 if let Some(ui) = hide_ui.upgrade() {
                     let _ = ui.hide();
                 }
@@ -2989,7 +3008,7 @@ async fn main() -> Result<(), AppError> {
                 if let Err(err) = platform::empty_working_set() {
                     tracing::warn!(target: "main", "隐藏进托盘后内存工作集压制失败: {err}");
                 }
-            });
+            }));
             if queued.is_err() {
                 tracing::warn!(target: "main", "关闭请求后无法排队隐藏动作：事件循环已不可用");
             }

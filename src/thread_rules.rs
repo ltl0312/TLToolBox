@@ -27,6 +27,7 @@
 //! 调用点逐步收敛到该类型铺路（迁移是渐进的，本模块不强制一次性替换全部调用点）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 /// UI 线程令牌：进程内**仅可领取一次**。
 ///
@@ -114,6 +115,44 @@ impl<T: Send + 'static> UiDeliver<T> {
     pub fn deliver(&self, payload: T) -> Result<(), T> {
         self.tx.send(payload).map_err(|send_err| send_err.0)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 进程级规范通道（v0.6.2 · P2-14 迁移收拢点）
+// ---------------------------------------------------------------------------
+
+/// 待在 UI 线程执行的作业（自包含闭包：自行捕获所需的弱句柄 / 数据快照）。
+pub type UiJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// 进程内唯一的 UI 交付通道。由装配层在 UI 线程凭 [`UiThreadToken`] 安装一次；
+/// 此后全部"跨线程触碰 UI"的动作都必须经 [`deliver_ui`] 进入。
+static UI_DELIVER: OnceLock<UiDeliver<UiJob>> = OnceLock::new();
+
+/// 安装进程级 UI 交付通道（装配期一次性）。
+///
+/// 消费 [`UiThreadToken`] 作为凭据——只有 UI 线程装配层能同时持有令牌与本通道；
+/// 重复安装返回 `Err`（携带原通道，交还调用方处置）。
+pub fn install_ui_deliver(token: UiThreadToken, deliver: UiDeliver<UiJob>) -> bool {
+    // 令牌在此被消费：它是"安装动作发生在 UI 线程装配期"的类型化证据。
+    let _ = token;
+    UI_DELIVER.set(deliver).is_ok()
+}
+
+/// 向 UI 线程交付一份作业（**任意线程可调用**；铁律①的规范入口）。
+///
+/// - 通道未安装（装配早期 / 测试环境）或已关闭时返回 `Err(job)` 归还作业，
+///   绝不 panic、绝不静默吞掉——调用方自行决定降级策略；
+/// - 通道内为 FIFO 单泵转发，作业到达 UI 线程的顺序与投递顺序一致。
+pub fn deliver_ui(job: UiJob) -> Result<(), UiJob> {
+    match UI_DELIVER.get() {
+        Some(deliver) => deliver.deliver(job),
+        None => Err(job),
+    }
+}
+
+/// 规范通道是否已安装（测试 / 诊断用）。
+pub fn ui_deliver_installed() -> bool {
+    UI_DELIVER.get().is_some()
 }
 
 #[cfg(test)]
