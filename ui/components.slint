@@ -1,0 +1,246 @@
+// —— 共享 UI 控件库（v0.6.2 · P2-13：自 app.slint 拆出） ——
+//
+// 全部控件仅依赖 Theme 主题令牌与 std-widgets，不含任何模块业务逻辑；
+// 由 app.slint 统一导入供各弹窗 / 卡片复用，保证视觉与交互一致。
+
+import { Switch, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// —— 轻量操作按钮：全部启用 / 全部停用 / 关于 / 设置（幽灵样式，低打扰） ——
+export component GhostButton inherits Rectangle {
+    in property <string> text: "";
+    in property <length> button-width: 76px;
+    callback clicked;
+
+    width: root.button-width;
+    height: 26px;
+    border-radius: 7px;
+    border-width: 1px;
+    background: Theme.btn-bg;
+    border-color: Theme.btn-border;
+
+    states [
+        hover when ghost-touch.has-hover && !ghost-touch.pressed : {
+            background: Theme.btn-bg-hover;
+            border-color: Theme.btn-border-hover;
+        }
+        pressed when ghost-touch.pressed : {
+            background: Theme.btn-bg-pressed;
+            border-color: Theme.btn-border-hover;
+        }
+    ]
+    animate background, border-color { duration: 100ms; }
+
+    Text {
+        text: root.text;
+        font-size: 12px;
+        font-weight: 600;
+        color: Theme.text-primary;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ghost-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 提权盾牌按钮：标题旁的醒目提权入口（仅未提权形态渲染） ——
+// 琥珀金描边 + 淡琥珀底，与全界面锌灰/翡翠基调刻意区分——它在视觉上宣告
+// “当前运行权限受限，点击可一键提权重启以突破 UIPI 弹窗拦截限制”。
+export component ElevateButton inherits Rectangle {
+    callback clicked;
+
+    width: 28px;
+    height: 26px;
+    border-radius: 8px;
+    background: Theme.elevate-bg;
+    border-width: 1px;
+    border-color: Theme.elevate-border;
+
+    states [
+        hover when elevate-touch.has-hover && !elevate-touch.pressed : {
+            background: Theme.elevate-bg-hover;
+            border-color: Theme.elevate-border-hover;
+        }
+        pressed when elevate-touch.pressed : {
+            background: Theme.elevate-bg-pressed;
+            border-color: Theme.elevate-border-hover;
+        }
+    ]
+    animate background, border-color { duration: 100ms; }
+
+    Image {
+        source: @image-url("icons/shield.svg");
+        colorize: Theme.elevate-icon;
+        width: 15px;
+        height: 15px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    elevate-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 管理员徽标：标题 / 版本旁的翡翠色小徽标（仅已提权形态渲染） ——
+// 与版本号徽标同高同族的“翡翠胶囊”；存在即向用户确认“当前实例已以管理员权限
+// 运行，弹窗拦截已突破 UIPI 限制”，同时提权按钮 / 托盘提权菜单随之隐藏。
+export component AdminBadge inherits Rectangle {
+    width: 104px;
+    height: 20px;
+    border-radius: 10px;
+    background: Theme.admin-badge-bg;
+    border-width: 1px;
+    border-color: Theme.admin-badge-border;
+
+    Text {
+        text: "管理员 (Admin)";
+        font-size: 10px;
+        font-weight: 600;
+        color: Theme.admin-badge-text;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// —— 轻量图标按钮：模块齿轮入口 / 弹窗右上角关闭（透明底 + 悬停微亮） ——
+export component GhostIconButton inherits Rectangle {
+    in property <image> icon;
+    in property <color> icon-color: Theme.text-secondary;
+    in property <length> icon-size: 15px;
+    callback clicked;
+
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: transparent;
+
+    states [
+        hover when icon-touch.has-hover && !icon-touch.pressed : {
+            background: Theme.btn-bg-hover;
+        }
+        pressed when icon-touch.pressed : {
+            background: Theme.btn-bg-pressed;
+        }
+    ]
+    animate background { duration: 100ms; }
+
+    Image {
+        source: root.icon;
+        colorize: root.icon-color;
+        width: root.icon-size;
+        height: root.icon-size;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+    icon-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 实底主按钮：「添加」规则（空输入时禁用态） ——
+export component PrimaryButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: 92px;
+    height: 32px;
+    border-radius: 8px;
+    background: Theme.accent-bg;
+
+    states [
+        disabled when !root.enabled : {
+            background: Theme.accent-bg-disabled;
+        }
+        hover when root.enabled && touch.has-hover && !touch.pressed : {
+            background: Theme.accent-bg-hover;
+        }
+        pressed when root.enabled && touch.pressed : {
+            background: Theme.accent-bg-pressed;
+        }
+    ]
+    animate background { duration: 100ms; }
+
+    Text {
+        text: root.text;
+        font-size: 12px;
+        font-weight: 700;
+        color: root.enabled ? Theme.accent-fg : Theme.accent-fg-disabled;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// —— 通用文本按钮：幽灵底 / 实底强调两态（存储管理、全局设置、关于弹窗复用） ——
+export component TextButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> primary: false;
+    in property <length> button-width: 84px;
+    in property <length> button-height: 30px;
+    callback clicked;
+
+    width: root.button-width;
+    height: root.button-height;
+    border-radius: 7px;
+    background: root.primary ? Theme.accent-bg : Theme.btn-bg;
+    border-width: 1px;
+    border-color: root.primary ? Theme.accent-bg : Theme.btn-border;
+
+    states [
+        hover when btn-touch.has-hover && !btn-touch.pressed : {
+            background: root.primary ? Theme.accent-bg-hover : Theme.btn-bg-hover;
+            border-color: root.primary ? Theme.accent-bg-hover : Theme.btn-border-hover;
+        }
+        pressed when btn-touch.pressed : {
+            background: root.primary ? Theme.accent-bg-pressed : Theme.btn-bg-pressed;
+            border-color: root.primary ? Theme.accent-bg-pressed : Theme.btn-border-hover;
+        }
+    ]
+    animate background, border-color { duration: 100ms; }
+
+    Text {
+        text: root.text;
+        font-size: 11.5px;
+        font-weight: 600;
+        color: root.primary ? Theme.accent-fg : Theme.text-primary;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    btn-touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        clicked => { root.clicked(); }
+    }
+}

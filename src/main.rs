@@ -565,6 +565,11 @@ fn handle_topmost_priority(
 // ---------------------------------------------------------------------------
 
 /// 把模块侧 [`PortEntry`] 转换为 UI 列表行（`PortEntryItem`）。
+///
+/// v0.6.1（S2）：同时计算 `protected` 标记——命中系统关键进程清单
+/// （内核态 PID ≤ 4 / 系统服务镜像 / 系统保留端口）的行在 UI 侧不渲染释放入口。
+/// 该标记与 [`killer::is_protected_target`] 同源，保证"界面禁用"与"入口拒绝"
+/// 永不出现口径分叉。
 fn port_entry_to_item(entry: &PortEntry) -> PortEntryItem {
     PortEntryItem {
         protocol: SharedString::from(entry.protocol.clone()),
@@ -573,6 +578,11 @@ fn port_entry_to_item(entry: &PortEntry) -> PortEntryItem {
         pid: entry.pid as i32,
         process_name: SharedString::from(entry.process_name.clone()),
         process_path: SharedString::from(entry.process_path.clone()),
+        protected: tltoolbox::modules::port_hunter::killer::is_protected_target(
+            entry.pid,
+            &entry.process_name,
+            entry.local_port,
+        ),
     }
 }
 
@@ -1558,7 +1568,9 @@ fn request_show_main_window(ui_weak: &slint::Weak<MainWindow>) {
 /// 菜单文案回流）；单模块失败仅告警并继续，不中断整体操作。
 /// v0.5.0：跳过无常驻后台开关的模块（`port_hunter` 即开即用工具——全部切换
 /// 不应对其产生任何副作用）。
-async fn set_all_modules(manager: &SharedManager, enable: bool) {
+/// v0.6.2（M10）：失败路径**写审计**——此前只 `warn`，而「模块启停」属用户
+/// 关键操作，失败（尤其 `terminal_logger` 的卸载 = 回滚系统改写）必须留痕。
+async fn set_all_modules(manager: &SharedManager, enable: bool, audit: &AuditSink) {
     for meta in manager.get_metadata_list() {
         if !module_is_toggleable(meta.id) {
             continue; // 即开即用工具：不参与全量启停
@@ -1572,6 +1584,11 @@ async fn set_all_modules(manager: &SharedManager, enable: bool) {
                 "全量切换：模块 {} -> {} 失败: {err}",
                 meta.id,
                 enable
+            );
+            audit.record(
+                "模块开关",
+                format!("{} -> {}", meta.id, if enable { "开启" } else { "关闭" }),
+                format!("失败: {err}"),
             );
         }
     }
@@ -1623,7 +1640,7 @@ async fn lifecycle_controller(
                     let mgr = Arc::clone(&manager);
                     let audit = audit.clone();
                     tokio::spawn(async move {
-                        set_all_modules(&mgr, enable).await;
+                        set_all_modules(&mgr, enable, &audit).await;
                         audit.record(
                             "全部模块",
                             if enable {
@@ -1692,18 +1709,35 @@ async fn main() -> Result<(), AppError> {
     //          特例——提权重启握手期（命令行含 RESTART_MARKER_ARG）：新（高权限）
     //          实例由旧实例的 ShellExecuteW("runas") 拉起，而旧实例尚持有互斥、要等
     //          平滑收尾才释放；此时“检测到既有实例”不是重复启动而是预期的交接，
-    //          故跳过 b) 的退出路径、降级为无互斥继续装配（旧实例必然随即退出）。
+    //          故跳过 b) 的退出路径。
+    //          v0.6.1（S6）：交接期**不再降级为无守卫**——旧实例退出会释放互斥，
+    //          若不重新持有，整个提权执行期间单实例保证被打破（此时再次双击 exe 的
+    //          副本会被判定为 Primary 并常驻 → 托盘双图标、钩子 / 监听重复注册、
+    //          模块状态互相覆盖、日志跨进程竞争）。现改为 acquire_after_handoff
+    //          退避询位直到真正取得互斥，超时才降级并如实告警。
     let restarting_elevated = std::env::args().any(|arg| arg == platform::RESTART_MARKER_ARG);
     let (instance_guard, instance_log) = match single_instance::acquire() {
         Ok(single_instance::SingleInstanceOutcome::Primary(guard)) => (
             Some(guard),
             "单实例守护已就绪：本进程为唯一实例，互斥句柄持有至退出".to_string(),
         ),
-        Ok(single_instance::SingleInstanceOutcome::Secondary { .. }) if restarting_elevated => (
-            None,
-            "提权重启握手期：既有实例即将退出并释放互斥，本实例跳过「第二实例退出」路径继续装配"
-                .to_string(),
-        ),
+        Ok(single_instance::SingleInstanceOutcome::Secondary { .. }) if restarting_elevated => {
+            match single_instance::acquire_after_handoff(single_instance::HANDOFF_WAIT).await {
+                Ok(single_instance::SingleInstanceOutcome::Primary(guard)) => (
+                    Some(guard),
+                    "提权重启交接期：已在旧实例释放互斥后重新持有单实例守护（无空窗）".to_string(),
+                ),
+                Ok(single_instance::SingleInstanceOutcome::Secondary { .. }) => (
+                    None,
+                    "提权重启交接期：等待旧实例释放互斥超时，本次降级为无单实例守护运行"
+                        .to_string(),
+                ),
+                Err(err) => (
+                    None,
+                    format!("提权重启交接期：互斥重取失败，本次降级为允许并行运行: {err}"),
+                ),
+            }
+        }
         Ok(single_instance::SingleInstanceOutcome::Secondary { wakeup_delivered }) => {
             // 日志尚未装配：该路径立即退出进程（唤醒广播已投递给既有实例）。
             eprintln!(
@@ -1719,12 +1753,14 @@ async fn main() -> Result<(), AppError> {
     let _instance_guard = instance_guard;
 
     // ---- 1. 配置加载（先于日志装配）：首次运行自动落盘默认 TOML，随后异步加载。
-    //      加载失败 → 先以**默认日志目录**（exe 同级 logs/）装配日志，把失败原因
-    //      落盘后上报错误；加载成功 → effective_app_log_dir 决定后续日志 / 审计
-    //      的落盘目录。 ----
+    //      v0.6.1（M1）：改用 load_or_recover —— 配置文件存在但**解析失败**时不再
+    //      直接终止启动（release 无控制台，用户只看到"双击没反应"且无处修复），
+    //      而是把坏文件备份为 `<原文件>.bak.<时间戳>`、以默认配置继续启动，并在
+    //      日志就绪后写审计 + 弹 Toast 告知用户备份位置。仅当连备份都失败（继续
+    //      运行会因随后的 save 原子替换而销毁用户内容）才终止启动。 ----
     let config_mgr = Arc::new(ConfigManager::default());
-    let app_config = match config_mgr.load().await {
-        Ok(cfg) => cfg,
+    let (app_config, config_recovery) = match config_mgr.load_or_recover().await {
+        Ok(loaded) => (loaded.config, loaded.recovery),
         Err(err) => {
             // 兜底日志装配（默认目录）：保证配置加载失败原因也能写入日志文件。
             let _fallback_guard = logging::init();
@@ -1747,6 +1783,19 @@ async fn main() -> Result<(), AppError> {
         logging::MAX_LOG_FILES
     );
     tracing::info!(target: "main", "{instance_log}");
+
+    // ---- 1.5 线程铁律 ① 类型化（v0.6.2 · P2-14）：在 UI 线程领取唯一令牌。 ----
+    //       `main` 所在线程即 Slint 事件循环线程（run_event_loop 在本线程执行）；
+    //       令牌全局唯一，二次领取即装配冲突（存在第二个"UI 线程"声明）。
+    //       令牌用于构造 [`tltoolbox::thread_rules::UiDeliver`]——"向 UI 投递"的
+    //       能力自此只能由装配层显式分发。
+    match tltoolbox::thread_rules::UiThreadToken::claim() {
+        Ok(_ui_token) => {
+            tracing::debug!(target: "main", "UI 线程令牌已领取（铁律①：模型只在 UI 线程改写）")
+        }
+        Err(err) => return Err(format!("线程装配冲突: {err}").into()),
+    }
+
     if silent_launch {
         tracing::info!(target: "main", "检测到 --silent：本次由系统开机自启拉起");
     }
@@ -1767,6 +1816,29 @@ async fn main() -> Result<(), AppError> {
         format!("v{}", env!("CARGO_PKG_VERSION")),
         "成功",
     );
+
+    // v0.6.1（M1）：配置自愈留痕——审计 + 启动日志即刻落盘；Toast 因总线尚无
+    // 订阅者，延后到「总线 → UI 桥」就绪后补发（见第 7 步之后）。
+    let config_recovery_notice = match &config_recovery {
+        Some(recovery) => {
+            let detail = format!(
+                "配置文件解析失败，已备份为 '{}' 并以默认配置继续启动",
+                recovery.backup_path.display()
+            );
+            audit.record("配置自愈", detail, format!("原因: {}", recovery.reason));
+            tracing::error!(
+                target: "main",
+                backup = %recovery.backup_path.display(),
+                "配置自愈生效：{}（原文件已完整备份，本次以默认配置运行）",
+                recovery.reason
+            );
+            Some(format!(
+                "配置文件已损坏，原文件已备份至 {}，本次以默认设置启动",
+                recovery.backup_path.display()
+            ))
+        }
+        None => None,
+    };
 
     tracing::info!(
         target: "main",
@@ -1854,9 +1926,10 @@ async fn main() -> Result<(), AppError> {
     //      start 期惰性装配，模块注册本身零系统探测 / 改写。同样**不**进入默认自动
     //      启动列表——向用户 Shell 配置文件与注册表 AutoRun 注入钩子属「显式开启才
     //      合理」的系统改写（默认名单仅弹窗拦截，见 AppConfig::default_auto_start_modules）。
-    module_mgr.register(Arc::new(TerminalLoggerModule::new(Arc::clone(
-        &runtime_config,
-    ))));
+    //      v0.6.2（M10）：绑定命名句柄 `terminal_logger`——「强制清理终端日志钩子」
+    //      的手动修复入口（终端设置弹窗按钮）需要模块级 API（force_cleanup_hooks）。
+    let terminal_logger = Arc::new(TerminalLoggerModule::new(Arc::clone(&runtime_config)));
+    module_mgr.register(terminal_logger.clone());
     //      全局窗口置顶守护模块（v0.4.0）：以配置节装配——置顶规则记忆
     //      （`pinned_rules`，启动恢复）+ 事件总线（守护线程 UIPI 失败 →
     //      ToastRequested 提示提权）。同样**不**进入默认自动启动列表；但
@@ -1992,6 +2065,11 @@ async fn main() -> Result<(), AppError> {
         forward_module_events(bus_rx, forwarder_mgr, forwarder_ui, forwarder_audit).await;
     });
     tracing::info!(target: "main", "总线 → UI 转发任务已启动");
+
+    // 7.1 配置自愈的 Toast 补发（M1）：此刻转发任务已订阅总线，事件不再被丢弃。
+    if let Some(notice) = config_recovery_notice {
+        event_bus.publish(AppEvent::ToastRequested(notice));
+    }
 
     // ---- 8. 回调绑定：UI 控件 → 异步动作；落定后的真实状态回流刷新（含失败回滚）。 ----
     //      回调在 UI 线程触发；实际动作派发到 Tokio 任务执行，形成
@@ -2139,7 +2217,7 @@ async fn main() -> Result<(), AppError> {
         };
         tokio::spawn(async move {
             audit.record("全部模块", action_text, "进行中");
-            set_all_modules(&mgr, enable).await;
+            set_all_modules(&mgr, enable, &audit).await;
             audit.record("全部模块", action_text, "完成");
             show_toast(
                 &weak,
@@ -2510,6 +2588,34 @@ async fn main() -> Result<(), AppError> {
     let explorer_ui = ui.as_weak();
     ui.on_open_log_dir_in_explorer(move || {
         open_terminal_log_dir_in_explorer(&explorer_ui, Arc::clone(&explorer_cfg));
+    });
+
+    // 8.4.1 强制清理终端日志钩子（v0.6.2 · M10 手动修复入口）：对「上次卸载
+    //       失败的残留」或「外部注入的历史残留」做一次幂等清理，成败均写审计
+    //       并 Toast 反馈；成功后模块的「需修复」状态随之解除。
+    let cleanup_module = Arc::clone(&terminal_logger);
+    let cleanup_ui = ui.as_weak();
+    let cleanup_audit = audit.clone();
+    ui.on_force_cleanup_terminal_hooks(move || {
+        let module = Arc::clone(&cleanup_module);
+        let weak = cleanup_ui.clone();
+        let audit = cleanup_audit.clone();
+        tokio::spawn(async move {
+            audit.record("终端日志", "强制清理会话钩子", "开始");
+            match module.force_cleanup_hooks().await {
+                Ok(()) => {
+                    audit.record("终端日志", "强制清理会话钩子", "成功");
+                    show_toast(&weak, "终端日志钩子已清理：Shell 配置与注册表无本模块残留");
+                }
+                Err(err) => {
+                    audit.record("终端日志", "强制清理会话钩子", format!("失败: {err}"));
+                    show_toast(
+                        &weak,
+                        &format!("强制清理失败：{err}（可关闭占用该文件的程序后重试）"),
+                    );
+                }
+            }
+        });
     });
 
     // 8.5 「关于」弹窗（v0.3.2）：显隐 / 开源地址（ShellExecuteW 打开浏览器）/
@@ -2947,11 +3053,17 @@ async fn main() -> Result<(), AppError> {
                 }
                 Err(err) => {
                     tracing::error!(target: "main", "收尾：停止模块 {0} 失败: {err}", meta.id);
-                    audit.record(
-                        "模块开关",
-                        format!("{} -> 关闭", meta.id),
-                        format!("失败: {err}"),
-                    );
+                    // v0.6.2（M10）：`terminal_logger` 的停止承担**回滚系统改写**的
+                    // 职责（移除 Shell 配置注入块 / 注册表 AutoRun 片段）。失败即
+                    // 残留，审计里必须点名风险与修复入口，而不是一条泛泛的"失败"。
+                    let detail = if meta.id == "terminal_logger" {
+                        format!(
+                            "失败: {err}（系统侧可能残留终端日志钩子；下次启动后在「终端日志记录」设置弹窗点击「强制清理钩子」可手动清除）"
+                        )
+                    } else {
+                        format!("失败: {err}")
+                    };
+                    audit.record("模块开关", format!("{} -> 关闭", meta.id), detail);
                 }
             }
         }

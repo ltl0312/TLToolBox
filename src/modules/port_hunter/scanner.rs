@@ -90,12 +90,33 @@ const SYSTEM_IMAGE_BLACKLIST: &[&str] = &[
 /// 数据报）、1900（SSDP 即插即用发现）、5353（mDNS 多播域名解析）与
 /// 5355（LLMNR 链路本地名称解析）——`show_system_ports == false` 时这些系统 /
 /// 广播监听不再出现在常规开发列表中。
-const SYSTEM_RESERVED_PORTS: &[u16] = &[135, 137, 138, 139, 445, 1900, 5353, 5355, 5357];
+///
+/// 该清单同时被 `killer` 的**系统关键进程闸门**（S2）复用：占用保留端口的目标
+/// 一律拒绝终止，与展示选项无关。
+pub const SYSTEM_RESERVED_PORTS: &[u16] = &[135, 137, 138, 139, 445, 1900, 5353, 5355, 5357];
 
 /// `ERROR_INSUFFICIENT_BUFFER`（122）：探测尺寸后以正确缓冲重试的标准二段式。
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 /// `AF_INET`（2）：仅枚举 IPv4 监听（与 `netstat -ano` 默认口径一致）。
 const AF_INET: u32 = 2;
+
+/// 进程镜像路径查询的初始缓冲容量（宽字符）；不足时按 API 回填的所需长度扩容。
+const IDENTITY_BUFFER_INITIAL: usize = 1024;
+/// 进程镜像路径查询的缓冲容量上限（宽字符，对应 ~32K 字符的极长路径）。
+///
+/// v0.6.1（M9②）：旧实现固定 `[0u16; 1024]`，路径超过 1023 宽字符时
+/// `QueryFullProcessImageNameW` 返回 `ERROR_INSUFFICIENT_BUFFER`，被统一归入
+/// `Err(_) => (<unknown>, "")`——**进程名与路径全部丢失**，既让 UI 失去悬停路径，
+/// 也抽掉了「终止前身份复核」（S3）的依据。现改为按错误码扩容重试。
+const IDENTITY_BUFFER_MAX: usize = 32_768;
+
+/// 二段式原生表枚举的重试上限（v0.6.2 · M5）。
+///
+/// 「探测尺寸 → 分配缓冲 → 再次调用」两步之间监听表可能继续增大，此时 API 返回
+/// `ERROR_INSUFFICIENT_BUFFER` 并回填新尺寸；旧实现直接 `if ret != 0 { return Err }`，
+/// 导致连接频繁变动的机器上扫描**偶发失败且 UI 无任何结果**。现循环重试，
+/// 上限取 5（超过即认为表处于持续增长状态，报错比无限重试更诚实）。
+const TABLE_SCAN_MAX_RETRIES: usize = 5;
 
 /// `IPPROTO_TCP`（6）：TCP 原生表行的协议码（复合去重主键用）。
 const TCP_PROTOCOL_CODE: u8 = 6;
@@ -365,7 +386,15 @@ pub fn scan_and_collect(show_system_ports: bool) -> Result<ScanReport, super::Po
     let udp_count = udp_raw.len();
 
     // 富集进程元数据（进程名 / 路径），并一次性收集会话查询结果。
-    let entries: Vec<PortEntry> = tcp_raw.into_iter().chain(udp_raw).map(enrich).collect();
+    // L13（v0.6.2）：同一 PID 常监听多个端口，经 `identity_cache` 复用一次查询结果
+    // ——旧实现对每行都 `OpenProcess` + `QueryFullProcessImageNameW`，同一进程重复
+    // 几十次属无谓开销。
+    let mut identity_cache: HashMap<u32, (String, String)> = HashMap::new();
+    let entries: Vec<PortEntry> = tcp_raw
+        .into_iter()
+        .chain(udp_raw)
+        .map(|raw| enrich(raw, &mut identity_cache))
+        .collect();
     let mut sessions: HashMap<u32, Option<u32>> = HashMap::new();
     for entry in &entries {
         sessions
@@ -386,50 +415,137 @@ pub fn scan_and_collect(show_system_ports: bool) -> Result<ScanReport, super::Po
     })
 }
 
+/// 重新枚举监听表，返回**此刻**持有 `port` / `protocol` 的 PID（无持有者 → `None`）。
+///
+/// # 用途（v0.6.1 · S3）
+/// 「一键释放」的目标来自**上一次扫描的缓存**，而点击可能发生在数分钟之后。
+/// 从「枚举到该 PID」到「真正 `OpenProcess`」之间，原进程可能已退出、端口可能
+/// 已被释放，或 PID 被系统**复用**给任意其他进程（含系统服务 / 提权进程）。
+/// 终止前调用本函数做一次新鲜度核验，可消除「误杀与目标端口毫无关系的进程」。
+///
+/// # 口径
+/// 以 `show_system_ports = true` 重扫（不做动态端口 / 系统端口过滤，避免因展示
+/// 选项把目标藏掉而误判为"端口已释放"）；`pid <= 4` 的内核态条目仍被物理阻断，
+/// 但此类目标会在更早的**系统关键进程闸门**（S2）被拒绝，不会走到本核验。
+///
+/// 非 Windows 恒返回 `Ok(None)`（端口猎手为 Win32 能力）。
+#[cfg(windows)]
+pub fn owner_of_port(port: u16, protocol: &str) -> Result<Option<u32>, super::PortError> {
+    let report = scan_and_collect(true)?;
+    Ok(report
+        .entries
+        .iter()
+        .find(|entry| entry.local_port == port && entry.protocol.eq_ignore_ascii_case(protocol))
+        .map(|entry| entry.pid))
+}
+
+/// 非 Windows 兜底：无原生监听表，恒无持有者。
+#[cfg(not(windows))]
+pub fn owner_of_port(_port: u16, _protocol: &str) -> Result<Option<u32>, super::PortError> {
+    Ok(None)
+}
+
 /// 仅枚举 TCP LISTEN 项（`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)`；
 /// 解析期即应用 [`is_listen_state`] 状态降噪与循环首行物理阻断）。
 #[cfg(windows)]
 fn scan_tcp_listeners(show_system_ports: bool) -> Result<Vec<RawListener>, super::PortError> {
-    let mut size: u32 = 0;
-    let mut ret = unsafe {
+    let buffer = enumerate_table("GetExtendedTcpTable 枚举", |table, size| unsafe {
+        // SAFETY: table 为本次分配的可写缓冲（首轮为 None 表示仅探测尺寸），
+        // size 指向栈上 u32；失败仅返回错误码，无未定义行为。
         GetExtendedTcpTable(
-            None,
-            &mut size,
+            table,
+            size,
             BOOL::from(false),
             AF_INET,
             TCP_TABLE_OWNER_PID_ALL,
             0,
         )
-    };
-    if ret == 0 {
-        // 空表（无任何监听）：直接返回空。
-        return Ok(Vec::new());
-    }
-    if ret != ERROR_INSUFFICIENT_BUFFER {
-        return Err(super::PortError::ScanFailed {
-            context: "GetExtendedTcpTable 尺寸探测",
-            code: ret,
-        });
-    }
-
-    let mut buffer = vec![0u8; size as usize];
-    ret = unsafe {
-        GetExtendedTcpTable(
-            Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
-            &mut size,
-            BOOL::from(false),
-            AF_INET,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        )
-    };
-    if ret != 0 {
-        return Err(super::PortError::ScanFailed {
-            context: "GetExtendedTcpTable 枚举",
-            code: ret,
-        });
-    }
+    })?;
     Ok(parse_tcp_table(&buffer, show_system_ports))
+}
+
+/// 仅枚举 UDP 绑定项（`GetExtendedUdpTable(UDP_TABLE_OWNER_PID)`；UDP 无状态
+/// 概念，全部视为监听；解析期即应用循环首行物理阻断）。
+#[cfg(windows)]
+fn scan_udp_listeners(show_system_ports: bool) -> Result<Vec<RawListener>, super::PortError> {
+    let buffer = enumerate_table("GetExtendedUdpTable 枚举", |table, size| unsafe {
+        // SAFETY: 同 scan_tcp_listeners。
+        GetExtendedUdpTable(
+            table,
+            size,
+            BOOL::from(false),
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
+    })?;
+    Ok(parse_udp_table(&buffer, show_system_ports))
+}
+
+/// 二段式原生表枚举的通用骨架（v0.6.2 · M5）：
+/// 「尺寸探测（`table = None`）→ 分配缓冲 → 枚举 → 缓冲不足则按新尺寸重试」。
+///
+/// - `ret == 0`：枚举完成（含**空表**：首轮 `size == 0` 时 API 直接返回 0），
+///   返回写满的缓冲；
+/// - `ret == ERROR_INSUFFICIENT_BUFFER`：表在两步之间增大，`size` 已被 API 回填为
+///   新尺寸 → 重新分配后重试，至多 [`TABLE_SCAN_MAX_RETRIES`] 次；
+/// - 其他非零：硬失败，携错误码上抛（错误文本由 `context` 定位到具体表）。
+///
+/// `invoke` 由调用方绑定具体的 API 与表类（TCP / UDP 仅表类常量不同）。
+#[cfg(windows)]
+fn enumerate_table(
+    context: &'static str,
+    mut invoke: impl FnMut(Option<*mut core::ffi::c_void>, *mut u32) -> u32,
+) -> Result<Vec<u8>, super::PortError> {
+    let mut size: u32 = 0;
+    for _ in 0..TABLE_SCAN_MAX_RETRIES {
+        let mut buffer = vec![0u8; size as usize];
+        // 首轮 size == 0：传 None 仅探测尺寸（与 MSDN 二段式示例一致），
+        // 避免把空 Vec 的悬垂指针交给 API。
+        let table = if buffer.is_empty() {
+            None
+        } else {
+            Some(buffer.as_mut_ptr() as *mut core::ffi::c_void)
+        };
+        let ret = invoke(table, &mut size);
+        match ret {
+            0 => return Ok(buffer),
+            ERROR_INSUFFICIENT_BUFFER => {
+                // API 已回填所需尺寸；尺寸未增长（异常值）则跳出，避免空转。
+                if size == 0 {
+                    break;
+                }
+            }
+            other => {
+                return Err(super::PortError::ScanFailed {
+                    context,
+                    code: other,
+                })
+            }
+        }
+    }
+    Err(super::PortError::ScanFailed {
+        context,
+        code: ERROR_INSUFFICIENT_BUFFER,
+    })
+}
+
+/// 行切片安全边界：按 `dwNumEntries` 计算行数，但**必须**以缓冲区实际长度封顶
+/// （v0.6.2 · L12）。
+///
+/// 旧实现只校验 `buffer.len() < 4` 就 `from_raw_parts(ptr + 4, count)`——完全信赖
+/// API 写入的 `dwNumEntries`。一旦该字段与实际长度不符（第三方 API 拦截 / 驱动
+/// 改写 / 未来布局变化），就会构造越界切片，属未定义行为。
+///
+/// `row_size` 为单行字节数（TCP 24 / UDP 12）；头部 4 字节不参与计算。
+fn bounded_row_count(buffer: &[u8], row_size: usize) -> usize {
+    if buffer.len() < 4 || row_size == 0 {
+        return 0;
+    }
+    // SAFETY: 缓冲区头部为 API 写入的 u32 条目数；read_unaligned 不要求对齐。
+    let declared = unsafe { (buffer.as_ptr() as *const u32).read_unaligned() } as usize;
+    let capacity = buffer.len().saturating_sub(4) / row_size;
+    declared.min(capacity)
 }
 
 /// 解析 `MIB_TCPTABLE_OWNER_PID` 缓冲区：逐行应用状态降噪 + **循环首行物理
@@ -446,14 +562,15 @@ fn scan_tcp_listeners(show_system_ports: bool) -> Result<Vec<RawListener>, super
 /// 其后紧邻 `dwNumEntries` 个 `MIB_TCPROW_OWNER_PID`（24 字节 / 行，4 字节对齐）。
 /// 头部以 `read_unaligned` 读取（不假设缓冲对齐）；行切片基址 = 堆指针 + 4，
 /// Windows 全局分配器返回的内存至少 16 字节对齐，故 +4 后仍满足 4 字节对齐
-/// （与 windows-rs 官方示例同一读写模式）。
+/// （与 windows-rs 官方示例同一读写模式）。行数经 [`bounded_row_count`] 以实际
+/// 缓冲长度封顶（L12），畸形表不会产生越界切片。
 fn parse_tcp_table(buffer: &[u8], show_system_ports: bool) -> Vec<RawListener> {
-    if buffer.len() < 4 {
+    let count = bounded_row_count(buffer, std::mem::size_of::<MIB_TCPROW_OWNER_PID>());
+    if count == 0 {
         return Vec::new();
     }
-    // SAFETY: 缓冲区头部为 API 写入的 u32 条目数；read_unaligned 不要求对齐。
-    let count = unsafe { (buffer.as_ptr() as *const u32).read_unaligned() } as usize;
-    // SAFETY: 条目数 × 行大小必须落在缓冲区内（API 契约保证），行切片满足对齐。
+    // SAFETY: count 已由 bounded_row_count 保证 4 + count * 24 <= buffer.len()，
+    // 行切片满足对齐（见上文布局说明）。
     let rows = unsafe {
         std::slice::from_raw_parts(buffer.as_ptr().add(4) as *const MIB_TCPROW_OWNER_PID, count)
     };
@@ -482,61 +599,16 @@ fn parse_tcp_table(buffer: &[u8], show_system_ports: bool) -> Vec<RawListener> {
         .collect()
 }
 
-/// 仅枚举 UDP 绑定项（`GetExtendedUdpTable(UDP_TABLE_OWNER_PID)`；UDP 无状态
-/// 概念，全部视为监听；解析期即应用循环首行物理阻断）。
-#[cfg(windows)]
-fn scan_udp_listeners(show_system_ports: bool) -> Result<Vec<RawListener>, super::PortError> {
-    let mut size: u32 = 0;
-    let mut ret = unsafe {
-        GetExtendedUdpTable(
-            None,
-            &mut size,
-            BOOL::from(false),
-            AF_INET,
-            UDP_TABLE_OWNER_PID,
-            0,
-        )
-    };
-    if ret == 0 {
-        return Ok(Vec::new());
-    }
-    if ret != ERROR_INSUFFICIENT_BUFFER {
-        return Err(super::PortError::ScanFailed {
-            context: "GetExtendedUdpTable 尺寸探测",
-            code: ret,
-        });
-    }
-
-    let mut buffer = vec![0u8; size as usize];
-    ret = unsafe {
-        GetExtendedUdpTable(
-            Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
-            &mut size,
-            BOOL::from(false),
-            AF_INET,
-            UDP_TABLE_OWNER_PID,
-            0,
-        )
-    };
-    if ret != 0 {
-        return Err(super::PortError::ScanFailed {
-            context: "GetExtendedUdpTable 枚举",
-            code: ret,
-        });
-    }
-    Ok(parse_udp_table(&buffer, show_system_ports))
-}
-
 /// 解析 `MIB_UDPTABLE_OWNER_PID` 缓冲区：循环首行物理阻断 + 复合主键去重
 /// （布局 / 安全说明同 [`parse_tcp_table`]，拦截语义见其文档与
 /// [`is_physically_blocked`]）。
 fn parse_udp_table(buffer: &[u8], show_system_ports: bool) -> Vec<RawListener> {
-    if buffer.len() < 4 {
+    let count = bounded_row_count(buffer, std::mem::size_of::<MIB_UDPROW_OWNER_PID>());
+    if count == 0 {
         return Vec::new();
     }
-    // SAFETY: 同 parse_tcp_table——头部 u32 条目数以 read_unaligned 读取。
-    let count = unsafe { (buffer.as_ptr() as *const u32).read_unaligned() } as usize;
-    // SAFETY: 行切片 = 堆指针 + 4（4 字节对齐），条目数落在缓冲区内（API 契约）。
+    // SAFETY: count 已由 bounded_row_count 保证 4 + count * 12 <= buffer.len()
+    //（同 parse_tcp_table 的对齐说明）。
     let rows = unsafe {
         std::slice::from_raw_parts(buffer.as_ptr().add(4) as *const MIB_UDPROW_OWNER_PID, count)
     };
@@ -578,9 +650,15 @@ fn fmt_ipv4(raw: u32) -> String {
 /// 富集进程元数据：`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` +
 /// `QueryFullProcessImageNameW(PROCESS_NAME_WIN32)` 取得可执行文件绝对路径，
 /// 文件名由路径末级派生；任一步失败回退占位（进程多半已退出或受保护）。
+///
+/// `identity_cache`：本轮扫描内 `pid → (进程名, 路径)` 的复用表（v0.6.2 · L13），
+/// 消除"同一 PID 多端口重复查询"的放大。
 #[cfg(windows)]
-fn enrich(raw: RawListener) -> PortEntry {
-    let (process_name, process_path) = query_process_identity(raw.pid);
+fn enrich(raw: RawListener, identity_cache: &mut HashMap<u32, (String, String)>) -> PortEntry {
+    let (process_name, process_path) = identity_cache
+        .entry(raw.pid)
+        .or_insert_with(|| query_process_identity(raw.pid))
+        .clone();
     PortEntry {
         protocol: raw.protocol,
         local_port: raw.local_port,
@@ -592,6 +670,12 @@ fn enrich(raw: RawListener) -> PortEntry {
 }
 
 /// 查询 PID 对应的（可执行文件名, 绝对路径）；失败返回（`<unknown>`, 空串）。
+///
+/// # 缓冲策略（v0.6.1 · M9②）
+/// 从 [`IDENTITY_BUFFER_INITIAL`] 起按 `ERROR_INSUFFICIENT_BUFFER` 扩容重试
+/// （API 会把所需长度回填进 `lpdwsize`），上限 [`IDENTITY_BUFFER_MAX`]——超长路径
+/// 不再退化为「进程名 / 路径全部丢失」。该结果同时是「终止前身份复核」（S3）的
+/// 唯一依据，故不得再以固定小缓冲换取"够用就行"。
 #[cfg(windows)]
 pub fn query_process_identity(pid: u32) -> (String, String) {
     // SAFETY: OpenProcess 以受限查询权限打开，句柄使用后经 CloseHandle 释放；
@@ -601,24 +685,12 @@ pub fn query_process_identity(pid: u32) -> (String, String) {
         Err(_) => return (UNKNOWN_PROCESS.to_string(), String::new()),
     };
 
-    let mut buffer = [0u16; 1024];
-    let mut size = buffer.len() as u32;
-    // SAFETY: 形参为有效句柄与可写缓冲区；PWSTR 指向的缓冲容量实时同步给
-    // lpdwsize，API 按容量截断 / 请求扩容，无越界写风险。
-    let result = unsafe {
-        windows::Win32::System::Threading::QueryFullProcessImageNameW(
-            handle,
-            windows::Win32::System::Threading::PROCESS_NAME_WIN32,
-            windows::core::PWSTR(buffer.as_mut_ptr()),
-            &mut size,
-        )
-    };
+    let outcome = query_image_path(handle);
     // SAFETY: 句柄使用完毕，CloseHandle 释放（失败仅返回错误码）。
     let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
 
-    match result {
-        Ok(()) => {
-            let path = String::from_utf16_lossy(&buffer[..size as usize]);
+    match outcome {
+        Some(path) => {
             let name = Path::new(&path)
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -626,7 +698,55 @@ pub fn query_process_identity(pid: u32) -> (String, String) {
                 .unwrap_or_else(|| path.clone());
             (name, path)
         }
-        Err(_) => (UNKNOWN_PROCESS.to_string(), String::new()),
+        None => (UNKNOWN_PROCESS.to_string(), String::new()),
+    }
+}
+
+/// 按需扩容读取进程镜像全路径（`QueryFullProcessImageNameW`）。
+///
+/// 返回 `None` = 该进程无法读取映像路径（权限 / 进程已退出 / API 持续报错）。
+#[cfg(windows)]
+fn query_image_path(handle: windows::Win32::Foundation::HANDLE) -> Option<String> {
+    use windows::Win32::System::Threading::{QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+
+    let mut capacity = IDENTITY_BUFFER_INITIAL;
+    loop {
+        let mut buffer = vec![0u16; capacity];
+        let mut size = capacity as u32;
+        // SAFETY: 形参为有效句柄与容量为 capacity 的可写缓冲区；PWSTR 指向的缓冲
+        // 容量实时同步给 lpdwsize，API 按容量截断 / 回填所需长度，无越界写风险。
+        let result = unsafe {
+            QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut size,
+            )
+        };
+        match result {
+            Ok(()) => {
+                let len = (size as usize).min(buffer.len());
+                return Some(String::from_utf16_lossy(&buffer[..len]));
+            }
+            Err(err) => {
+                let code = (err.code().0 as u32) & 0xFFFF;
+                // 仅 `ERROR_INSUFFICIENT_BUFFER` 值得重试：按 API 回填的长度扩容
+                // （若回填长度不可用则翻倍），到上限即放弃。
+                if code != ERROR_INSUFFICIENT_BUFFER {
+                    return None;
+                }
+                let needed = size as usize;
+                let grown = if needed > capacity {
+                    needed
+                } else {
+                    capacity.saturating_mul(2)
+                };
+                if grown > IDENTITY_BUFFER_MAX || grown <= capacity {
+                    return None;
+                }
+                capacity = grown;
+            }
+        }
     }
 }
 
@@ -1124,6 +1244,112 @@ mod tests {
         }
     }
 
+    // ---- 原生表解析（v0.6.2 · §6.2 建议测试 #1 + L12 边界） ----
+
+    /// 行布局常量：TCP 行 6 个 DWORD（24B）、UDP 行 3 个 DWORD（12B）。
+    ///
+    /// 解析代码依赖这两个数字，锁住它们可让未来的结构体变更在编译期暴露。
+    #[test]
+    fn native_row_sizes_match_documented_layout() {
+        assert_eq!(std::mem::size_of::<MIB_TCPROW_OWNER_PID>(), 24);
+        assert_eq!(std::mem::size_of::<MIB_UDPROW_OWNER_PID>(), 12);
+    }
+
+    /// 构造 `MIB_TCPTABLE_OWNER_PID` 字节缓冲：头部 `count` + 若干 24B 行。
+    fn tcp_table_bytes(count: u32, rows: &[(u32, u16, u32, u32)]) -> Vec<u8> {
+        let mut buf = count.to_le_bytes().to_vec();
+        for (state, port, addr, pid) in rows {
+            for field in [*state, *addr, u16::to_be(*port) as u32, 0, 0, *pid] {
+                buf.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// 正常表：LISTEN 行被保留并按（端口 / 地址 / PID）正确还原。
+    #[test]
+    fn parses_well_formed_tcp_table() {
+        let buf = tcp_table_bytes(
+            2,
+            &[
+                (MIB_TCP_STATE_LISTEN.0 as u32, 8080, 0x7F00_0001, 1001),
+                (5 /* ESTABLISHED */, 9999, 0x7F00_0001, 1002),
+            ],
+        );
+        let rows = parse_tcp_table(&buf, true);
+        assert_eq!(rows.len(), 1, "仅 LISTEN 行应保留");
+        assert_eq!(rows[0].protocol, "TCP");
+        assert_eq!(rows[0].local_port, 8080);
+        assert_eq!(rows[0].local_addr, "127.0.0.1");
+        assert_eq!(rows[0].pid, 1001);
+    }
+
+    /// 空表（`dwNumEntries = 0`）：解析为空，不 panic。
+    #[test]
+    fn parses_empty_tables_without_panicking() {
+        assert!(parse_tcp_table(&tcp_table_bytes(0, &[]), true).is_empty());
+        // 头部不足 4 字节 / 全空缓冲：同样不得 panic。
+        assert!(parse_tcp_table(&[], true).is_empty());
+        assert!(parse_tcp_table(&[0x01, 0x02], true).is_empty());
+    }
+
+    /// **L12 核心**：`dwNumEntries` 大于实际缓冲可容纳的行数时，必须按缓冲长度截断
+    /// （而不是构造越界切片——那是未定义行为）。
+    #[test]
+    fn malformed_table_with_overcounted_entries_is_truncated() {
+        // 声明 5 行，实际只写了 1 行（24B）。
+        let buf = tcp_table_bytes(
+            5,
+            &[(MIB_TCP_STATE_LISTEN.0 as u32, 8080, 0x7F00_0001, 1001)],
+        );
+        assert_eq!(
+            bounded_row_count(&buf, std::mem::size_of::<MIB_TCPROW_OWNER_PID>()),
+            1,
+            "行数必须以缓冲实际长度封顶"
+        );
+        let rows = parse_tcp_table(&buf, true);
+        assert_eq!(rows.len(), 1, "应只解析出真实存在的那一行");
+        assert_eq!(rows[0].pid, 1001);
+    }
+
+    /// 头部声明 0 行但缓冲里有垃圾行：按声明解析为空（不猜测、不越界）。
+    #[test]
+    fn malformed_table_with_undercounted_entries_yields_declared_count() {
+        let buf = tcp_table_bytes(
+            0,
+            &[(MIB_TCP_STATE_LISTEN.0 as u32, 8080, 0x7F00_0001, 1001)],
+        );
+        assert!(parse_tcp_table(&buf, true).is_empty());
+    }
+
+    /// 极端声明值（`u32::MAX`）不得引发 panic 或越界读。
+    #[test]
+    fn absurd_entry_count_is_safely_bounded() {
+        let buf = tcp_table_bytes(
+            u32::MAX,
+            &[(MIB_TCP_STATE_LISTEN.0 as u32, 5173, 0x0000_0000, 2002)],
+        );
+        assert_eq!(
+            bounded_row_count(&buf, std::mem::size_of::<MIB_TCPROW_OWNER_PID>()),
+            1
+        );
+        assert_eq!(parse_tcp_table(&buf, true).len(), 1);
+    }
+
+    /// UDP 表同构验证：三段行布局、无状态概念，全部视为监听。
+    #[test]
+    fn parses_udp_table_rows() {
+        let mut buf = 1u32.to_le_bytes().to_vec();
+        for field in [0x0000_0000u32, u16::to_be(5353) as u32, 3003] {
+            buf.extend_from_slice(&field.to_le_bytes());
+        }
+        let rows = parse_udp_table(&buf, true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].protocol, "UDP");
+        assert_eq!(rows[0].local_port, 5353);
+        assert_eq!(rows[0].pid, 3003);
+    }
+
     /// Windows 集成冒烟：真实枚举本机监听表（无需网络；断言仅限调用成功与
     /// 结构合法性，不依赖机器上的具体端口）。
     ///
@@ -1159,5 +1385,43 @@ mod tests {
                 "物理阻断失效：即使显示系统服务，PID ≤ 4 也不得进入"
             );
         }
+    }
+
+    // ---- S3：端口持有者重枚举（"一键释放"前的新鲜度核验依据） ----
+
+    /// 自建一条真实 TCP 监听，`owner_of_port` 必须报告**本进程**为持有者。
+    ///
+    /// 这是 S3 第 3 道核验的端到端验证：端口 → 持有者 PID 的解析链路真实可用，
+    /// 且与 `netstat` 口径一致（仅 LISTEN 状态计入）。临时端口由 OS 分配，测试
+    /// 之间互不冲突；监听器随作用域结束自然释放。
+    #[cfg(windows)]
+    #[test]
+    fn owner_of_port_finds_self_bound_listener() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("应能绑定临时端口");
+        let port = listener.local_addr().expect("应能取到本地监听地址").port();
+        let owner = owner_of_port(port, "TCP").expect("监听表扫描应成功");
+        assert_eq!(
+            owner,
+            Some(std::process::id()),
+            "自建监听的持有者必须是当前进程（端口 {port}）"
+        );
+        // 协议名大小写不敏感（UI 传值形态与缓存形态可能不同）。
+        assert_eq!(
+            owner_of_port(port, "tcp").expect("扫描应成功"),
+            Some(std::process::id())
+        );
+    }
+
+    /// 无人监听的端口必须报告"无持有者"而非报错——S3 据此判定 `PortReleased`。
+    #[cfg(windows)]
+    #[test]
+    fn owner_of_port_reports_none_for_unlistened_port() {
+        // 先取一个由 OS 分配、随即释放的端口，保证"刚刚还在用、现在没人用"。
+        let port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("应能绑定临时端口");
+            listener.local_addr().expect("应能取到本地地址").port()
+        };
+        let owner = owner_of_port(port, "TCP").expect("监听表扫描应成功");
+        assert_eq!(owner, None, "已释放的端口不应报告持有者（端口 {port}）");
     }
 }

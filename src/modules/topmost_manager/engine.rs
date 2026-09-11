@@ -36,8 +36,8 @@
 //!
 //! 排序、锚定规划等算法全部为**无 FFI 的纯函数**（`order_entries` /
 //! [`plan_shield_refresh`] / [`chain_apply_plan`]），单元测试直接构造假窗口条目
-//! 验证；FFI 仅剩 `set_topmost` / `set_notopmost` / [`apply_chain`] / `is_window_alive`
-//! 四个薄封装。
+//! 验证；FFI 仅剩 `set_topmost` / `set_notopmost` / [`apply_chain`] /
+//! `is_window_alive` / [`is_topmost`] 五个薄封装（后两者各有真实窗口测试）。
 
 use crate::modules::topmost_manager::enum_windows::to_hwnd;
 
@@ -97,6 +97,39 @@ pub fn is_window_alive(hwnd: isize) -> bool {
     {
         // SAFETY: IsWindow 是文档化的只读校验，对任意值句柄均安全返回布尔。
         unsafe { IsWindow(to_hwnd(hwnd)).as_bool() }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
+    }
+}
+
+/// 读取窗口当前是否处于**系统级置顶**状态（`GWL_EXSTYLE & WS_EX_TOPMOST`）。
+///
+/// # 用途（v0.6.1 · M4①）
+/// 用户可经 Windows 原生窗口菜单（或「始终置顶」勾选）自行取消置顶。此前的实现
+/// 只在 `apply_unpin` 时移除受管条目，用户手动取消后条目仍留在 `entries`，下一次
+/// 前台切换事件就会把窗口**重新置顶**——用户无法真正关闭，且 UI 标记
+/// `topmost = true` 而系统实际已非置顶，**界面在撒谎**。
+///
+/// 纠偏路径据此校验真实状态：发现用户已取消则惰性移除条目并持久化。
+///
+/// 句柄失效（`IsWindow` 为假）返回 `false`——由 [`is_window_alive`] 的清理路径
+/// 负责移除条目，本函数只回答"是否置顶"。
+pub fn is_topmost(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, GWL_EXSTYLE, WS_EX_TOPMOST,
+        };
+        if !is_window_alive(hwnd) {
+            return false;
+        }
+        // SAFETY: GetWindowLongPtrW 为只读查询；对失效句柄返回 0（不会访问违规），
+        // 且已在前面用 IsWindow 收窄。
+        let ex_style = unsafe { GetWindowLongPtrW(to_hwnd(hwnd), GWL_EXSTYLE) } as u32;
+        ex_style & WS_EX_TOPMOST.0 != 0
     }
     #[cfg(not(windows))]
     {
@@ -480,5 +513,73 @@ mod tests {
             !shield.iter().any(|(hwnd, _)| *hwnd == 0x20),
             "纠偏规划不得包含已取消窗口"
         );
+    }
+
+    // ---- M4①：真实窗口的置顶状态读取（`is_topmost`） ----
+
+    /// 用一个真实的**隐藏顶层窗口**验证 `is_topmost` 能准确反映 `WS_EX_TOPMOST`：
+    /// 置顶后为真、取消后为假、句柄销毁后为假。这是「用户手动取消置顶」检测的事实
+    /// 依据，必须经真实 FFI 而非纯逻辑验证。
+    ///
+    /// 注意**不能**用 `HWND_MESSAGE`（消息专用窗口）：它不参与 Z 序，
+    /// `SetWindowPos(HWND_TOPMOST)` 不会落下 `WS_EX_TOPMOST`，会得到假阴性。
+    ///
+    /// 无窗口站 / 无法创建窗口的环境（部分 CI 服务账号）会打印跳过信息而不判失败。
+    #[cfg(windows)]
+    #[test]
+    fn is_topmost_reflects_real_window_ex_style() {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
+
+        // SAFETY: 以系统内置 "STATIC" 类创建**隐藏的顶层窗口**（WS_POPUP 且不带
+        // WS_VISIBLE → 不可见、不抢焦点、不进入任务栏）；无需自注册窗口类；
+        // 句柄在使用后显式 DestroyWindow 释放。
+        let created = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                windows::core::PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let hwnd = match created {
+            Ok(hwnd) if !hwnd.0.is_null() => hwnd,
+            _ => {
+                eprintln!("当前环境无法创建测试窗口，跳过 is_topmost 真实窗口回归");
+                return;
+            }
+        };
+        let value = hwnd.0 as isize;
+
+        // 1) 新建窗口尚未置顶。
+        assert!(!is_topmost(value), "新建窗口不应处于置顶状态");
+        assert!(is_window_alive(value));
+
+        // 2) 置顶 → 读取为真（这正是受管窗口被本模块置顶后的状态）。
+        set_topmost(value).expect("置顶应成功");
+        assert!(is_topmost(value), "置顶后 is_topmost 必须为真");
+
+        // 3) 用户手动取消（等价于原生菜单取消置顶）→ 读取为假，
+        //    模块据此判定「用户已取消」并移除受管条目（M4①）。
+        set_notopmost(value).expect("取消置顶应成功");
+        assert!(
+            !is_topmost(value),
+            "取消置顶后 is_topmost 必须为假——这是「界面不再撒谎」的判据"
+        );
+
+        // 4) 窗口销毁后恒为假（消亡条目由 sweep_dead 负责，不误判为用户取消）。
+        // SAFETY: hwnd 由本测试创建且仅销毁一次。
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        assert!(!is_topmost(value), "句柄失效后不得报告置顶");
     }
 }

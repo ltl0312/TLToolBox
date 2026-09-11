@@ -64,12 +64,53 @@ fn toast(state: &ModuleState, message: impl Into<String>) {
     }
 }
 
+/// 拓扑指纹匹配判定（v0.6.2 · P2-12 纯函数，供单测）。
+///
+/// 方案**只有**在「保存时的显示器拓扑 == 当前拓扑」时才允许自动还原——这正是
+/// 拓扑指纹字段的设计意图。旧实现从不校验：显示器拓扑变化后会把旧坐标刷到
+/// 当前桌面，**误移动用户图标**（指纹沦为死数据）。
+///
+/// 空指纹（异常 / 手工构造的方案）视为**不匹配**——宁可少还原一次，也不把
+/// 来源不明的坐标应用到当前桌面。
+fn profile_matches_topology(profile_fingerprint: &str, current: &str) -> bool {
+    !profile_fingerprint.is_empty() && profile_fingerprint == current
+}
+
 /// 执行自动还原（在独立 OS 线程内调用，见 [`explorer::spawn_com_thread`]；只依赖
 /// 状态快照，不触碰 UI）。
+///
+/// # 指纹校验（v0.6.2 · P2-12）
+/// 自动还原由 `WM_DISPLAYCHANGE` 触发，此时拓扑**可能**已变化。仅当活动（或最新）
+/// 方案的拓扑指纹与当前一致时才执行还原；不一致则跳过并 Toast 告知用户——图标
+/// 保持现状，绝不把旧坐标刷到不同的桌面上。手动还原（`restore_profile`）是用户的
+/// 显式请求，不受此限制。
 fn restore_active(state: &ModuleState) -> Result<(), ModuleError> {
     let profile = pick_auto_restore_profile(state).ok_or_else(|| -> ModuleError {
         "尚无已保存的布局方案，无法自动还原".into()
     })?;
+    let current = daemon::current_topology_fingerprint();
+    if !profile_matches_topology(&profile.topology_fingerprint, &current) {
+        tracing::info!(
+            target: "icon_locker",
+            saved = %profile.topology_fingerprint,
+            current = %current,
+            "显示器拓扑与方案 \"{}\" 不匹配，跳过自动还原（图标保持现状）",
+            profile.name
+        );
+        toast(
+            state,
+            format!(
+                "显示器拓扑与方案「{}」不一致，未自动还原（方案对应 {}）",
+                profile.name,
+                if profile.topology_fingerprint.is_empty() {
+                    "的拓扑信息缺失"
+                } else {
+                    "其他显示器布局"
+                }
+            ),
+        );
+        return Ok(());
+    }
     explorer::restore_layout(&explorer::DesktopLayout {
         positions: profile.icon_positions.clone(),
     })?;
@@ -355,5 +396,54 @@ mod tests {
         };
         let err = restore_active(&state).expect_err("无方案时应报错而非静默成功");
         assert!(err.to_string().contains("尚无已保存的布局方案"));
+    }
+
+    // ---- P2-12：拓扑指纹参与还原校验（v0.6.2） ----
+
+    /// 指纹判定真值表：仅「非空且逐字节相等」才允许自动还原。
+    ///
+    /// 这是"旧坐标刷到不同桌面"误伤问题的最后一道闸门——审计报告指出指纹字段
+    /// 在旧实现中从不参与校验，沦为死数据。
+    #[test]
+    fn topology_fingerprint_must_match_exactly() {
+        let saved = "P:0,0,2560x1440|S:-1920,0,1920x1080";
+        assert!(
+            profile_matches_topology(saved, saved),
+            "拓扑一致（如外接屏重新插回）应允许还原"
+        );
+        assert!(
+            !profile_matches_topology(saved, "P:0,0,1920x1080"),
+            "拓扑不一致（换了显示器 / 改了分辨率）必须跳过还原"
+        );
+        assert!(
+            !profile_matches_topology("", "P:0,0,1920x1080"),
+            "空指纹视为来源不明，不得应用"
+        );
+        assert!(!profile_matches_topology("", ""), "双方皆空同样视为不匹配");
+        // 大小写 / 空白差异即视为不同拓扑（指纹由本工具生成，不存在这些变体）。
+        assert!(!profile_matches_topology(
+            "P:0,0,2560x1440",
+            "p:0,0,2560x1440"
+        ));
+    }
+
+    /// 指纹不匹配时自动还原**不执行 COM 还原**且按设计成功返回（跳过 ≠ 失败）。
+    #[test]
+    fn restore_active_skips_on_topology_mismatch() {
+        // 用一个必然不等于当前拓扑的指纹构造方案。
+        let mut profile = sample_profile("mismatched", "外接屏方案");
+        profile.topology_fingerprint = "S:99999,99999,1x1".into();
+        let state = ModuleState {
+            profiles: StdMutex::new(vec![profile]),
+            active_profile: StdMutex::new(Some("mismatched".into())),
+            auto_restore: AtomicBool::new(true),
+            bus: StdMutex::new(None),
+        };
+        // 跳过路径返回 Ok（"按设计不还原"），不产生错误、不触碰 COM。
+        let outcome = restore_active(&state);
+        assert!(
+            outcome.is_ok(),
+            "拓扑不匹配应跳过而非报错，实际: {outcome:?}"
+        );
     }
 }

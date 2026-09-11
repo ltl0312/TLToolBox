@@ -18,6 +18,11 @@
 //! - [`killer`]：进程安全终止（`OpenProcess(PROCESS_TERMINATE)` +
 //!   `TerminateProcess`）、[`PortError`] 错误模型与 UIPI 防御（`ERROR_ACCESS_DENIED`
 //!   → Toast「需要管理员权限，请通过顶部盾牌提权运行」）、成功 Toast；
+//!   **终止入口内置三道闸门**：① 系统关键进程闸门（v0.6.1 · S2）——内核态 PID ≤ 4 /
+//!   系统服务镜像 / 系统保留端口一律拒绝，且与「显示系统服务」选项无关；
+//!   ② 身份复核（S3）——实时镜像名与扫描缓存名比对，不一致即判 PID 复用；
+//!   ③ 端口新鲜度复核（S3）——重新枚举监听表确认该 PID 此刻仍持有该端口。
+//!   任一不过即中止并要求刷新列表（[`killer::PortError::StaleTarget`]）。
 //! - [`logger`]：模块专属明细日志（`{log_dir}/port_hunter.log`，流式追加）——
 //!   与全局审计日志（`app_audit.log`）构成「全局审计 + 模块明细」双轨日志体系。
 //!
@@ -184,8 +189,11 @@ impl PortHunterModule {
         self.inner.logger.log_search(keyword, explicit);
     }
 
-    /// 执行一次「释放端口（终止进程）」：低层 Win32 动作 + 事件总线 Toast +
-    /// 模块明细日志，返回 [`KillReport`] 供装配层写审计。
+    /// 执行一次「释放端口（终止进程）」：系统关键进程闸门（S2）→ 低层 Win32
+    /// 动作 → 事件总线 Toast → 模块明细日志，返回 [`KillReport`] 供装配层写审计。
+    ///
+    /// 闸门命中（[`PortError::ProtectedProcess`]）时终止动作从未发起，成败均照常
+    /// 落模块日志与审计，UI 侧同一目标亦已降级为不可点。
     ///
     /// # 线程模型
     /// 同步 Win32 调用；UI 回调须经 `spawn_blocking` 使用（与 [`Self::scan`] 一致）。
@@ -322,7 +330,8 @@ mod tests {
         assert_eq!(module.process_name_of(1), scanner::UNKNOWN_PROCESS);
     }
 
-    /// KILL 报告结构：未命中 PID 的终止必然失败，且报告携带回退进程名与耗时。
+    /// KILL 报告结构：未命中 PID 的终止必然失败（S3 目标失效），且报告携带
+    /// 回退进程名与耗时。
     #[test]
     fn kill_report_never_panics_and_carries_context() {
         let module = PortHunterModule::default();
@@ -331,8 +340,8 @@ mod tests {
         assert_eq!(report.process_name, scanner::UNKNOWN_PROCESS);
         #[cfg(windows)]
         assert!(
-            report.outcome.as_ref().unwrap_err().code().is_some(),
-            "Windows 下应有错误码"
+            report.outcome.as_ref().unwrap_err().is_stale(),
+            "不存在的 PID 应被 S3 新鲜度核验拦下"
         );
         #[cfg(not(windows))]
         assert_eq!(

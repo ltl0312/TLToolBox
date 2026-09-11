@@ -1,0 +1,70 @@
+// —— 全局暗色主题令牌（zinc 底 + 翡翠强调；统一取色，避免魔法数字散落） ——
+export global Theme {
+    in-out property <color> window-bg: #18181b;       // 窗口底
+    in-out property <color> card-bg: #27272a;         // 卡片底
+    in-out property <color> card-bg-hover: #2e2e33;   // 卡片悬停底
+    in-out property <color> card-border: #34343a;     // 卡片描边
+    in-out property <color> card-border-hover: #4c4c55;
+    in-out property <color> divider: #26262b;         // 顶栏分隔线
+    in-out property <color> text-strong: #ffffff;     // 标题 / 模块名
+    in-out property <color> text-primary: #e4e4e7;    // 一般正文
+    in-out property <color> text-secondary: #a1a1aa;  // 描述
+    in-out property <color> text-muted: #71717a;      // 弱化辅助文字
+    in-out property <color> accent-strong: #34d399;   // 强调（运行态文字）
+    in-out property <color> running-dot: #4ade80;     // 运行中绿点
+    in-out property <color> stopped-dot: #52525b;     // 已停止灰点
+    in-out property <color> tool-dot: #71717a;        // 即开即用工具中性点（v0.5.0）
+    in-out property <color> pill-bg: #10b9811a;       // 版本徽标底
+    in-out property <color> pill-border: #10b98140;
+    in-out property <color> pill-text: #6ee7b7;
+    in-out property <color> btn-bg: #1d1d21;          // 轻量按钮底
+    in-out property <color> btn-bg-hover: #26262b;
+    in-out property <color> btn-bg-pressed: #323238;
+    in-out property <color> btn-border: #3f3f46;
+    in-out property <color> btn-border-hover: #62626b;
+
+    // —— 管理员徽标 / 提权盾牌按钮（UIPI 突围入口）专用令牌 ——
+    in-out property <color> admin-badge-bg: #10b98121;        // 管理员徽标底（翡翠淡底）
+    in-out property <color> admin-badge-border: #10b98159;    // 管理员徽标描边
+    in-out property <color> admin-badge-text: #6ee7b7;        // 管理员徽标文字（翡翠色）
+    in-out property <color> elevate-bg: #f59e0b1f;            // 盾牌按钮底（琥珀淡底，醒目）
+    in-out property <color> elevate-bg-hover: #f59e0b38;
+    in-out property <color> elevate-bg-pressed: #f59e0b52;
+    in-out property <color> elevate-border: #f59e0b80;
+    in-out property <color> elevate-border-hover: #fbbf24b3;
+    in-out property <color> elevate-icon: #fbbf24;            // 盾牌图形着色（琥珀金）
+
+    // —— 规则管理弹窗专用令牌 ——
+    in-out property <color> overlay-scrim: #0b0b0ecc;    // 遮罩半透明黑
+    in-out property <color> dialog-bg: #202024;          // 弹窗卡片底
+    in-out property <color> dialog-border: #3f3f46;      // 弹窗卡片描边
+    in-out property <color> row-bg-hover: #2b2b30;       // 规则行悬停底
+    in-out property <color> danger: #f87171;             // 删除红
+    in-out property <color> danger-hover-bg: #f8717126;
+    in-out property <color> danger-pressed-bg: #f8717140;
+    in-out property <color> accent-bg: #10b981;          // 「添加」实底按钮
+    in-out property <color> accent-bg-hover: #34d399;
+    in-out property <color> accent-bg-pressed: #059669;
+    in-out property <color> accent-fg: #06281a;          // 实底按钮上的文字
+    in-out property <color> accent-bg-disabled: #10b98133;
+    in-out property <color> accent-fg-disabled: #a1a1aa;
+
+    // —— Toast 轻量操作反馈专用令牌 ——
+    in-out property <color> toast-bg: #27272ae6;    // 胶囊底：zinc-800(#27272a) 派生，~90% 不透明（浮于内容上轻微透底）
+    in-out property <color> toast-border: #3f3f46;  // 胶囊细描边
+    in-out property <color> toast-text: #ffffff;    // 胶囊正文（纯白）
+
+    // —— 关于 / 设置 / 留痕区专用令牌 ——
+    in-out property <color> link-text: #6ee7b7;          // 可点击链接文字（翡翠）
+    in-out property <color> link-bg-hover: #10b98126;    // 链接悬停底
+    in-out property <color> update-badge-bg: #fbbf2426;  // “发现新版本”徽标底（琥珀淡底）
+    in-out property <color> update-badge-border: #fbbf2480;
+    in-out property <color> update-badge-text: #fcd34d;  // 琥珀强调文字
+
+    // —— 全局窗口置顶弹窗 · 模块停用警示条（v0.4.1）专用令牌 ——
+    // 模块主开关处于「已停止」时，弹窗顶部渲染琥珀警示条 + 列表控件全部禁用
+    //（Switch / 优先级步进器 enabled: false，禁止无效操作）。
+    in-out property <color> warn-bar-bg: #f59e0b1a;       // 警示条底（琥珀淡底）
+    in-out property <color> warn-bar-border: #f59e0b80;   // 警示条描边
+    in-out property <color> warn-bar-text: #fcd34d;       // 警示条文字（琥珀强调）
+}

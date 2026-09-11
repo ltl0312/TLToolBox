@@ -177,6 +177,16 @@ pub enum TerminalHookError {
         /// 底层 IO 错误。
         source: io::Error,
     },
+    /// 日志根路径无法安全内嵌进目标 Shell 的启动脚本（v0.6.1 · M6）。
+    ///
+    /// 命中即**拒绝挂载**并给出可读原因——比"挂上去但静默失效"或"挂上去却让
+    /// 用户每次开终端都看到一行报错"都好。
+    InvalidLogBase {
+        /// 被拒绝的日志根路径。
+        path: PathBuf,
+        /// 面向用户的原因与修复建议。
+        hint: &'static str,
+    },
 }
 
 impl fmt::Display for TerminalHookError {
@@ -191,6 +201,9 @@ impl fmt::Display for TerminalHookError {
             Self::Read { path, source } => write!(f, "读取失败 '{}': {source}", path.display()),
             Self::Decode { path, hint } => write!(f, "无法解码 '{}': {hint}", path.display()),
             Self::Write { path, source } => write!(f, "写入失败 '{}': {source}", path.display()),
+            Self::InvalidLogBase { path, hint } => {
+                write!(f, "日志目录 '{}' 不可用: {hint}", path.display())
+            }
         }
     }
 }
@@ -394,6 +407,13 @@ fn ps_single_quote_escape(raw: &str) -> String {
 
 /// bash 双引号字符串转义：`\` `"` `$` `` ` `` 前置反斜杠；其余字符（含空格、
 /// 单引号）在双引号内均为字面量。
+///
+/// # 为什么 `!` 不在这里转义（v0.6.1 · M6）
+/// `\!` 在交互式 bash 的双引号内确实是 `!` 的转义形态，但注入块整体写入
+/// `.bashrc` 后由**用户 shell 的任意上下文**消费，转义是否被正确解释取决于
+/// 消费时机（history expansion 在读取行时、而非解析时发生），可靠性不足。
+/// 因此 `!` 一律在**生成负载前**硬拒绝（见 [`bash_transcript_payload`]），
+/// 与 `cmd.rs` 对 `%` / `!` 的处理策略保持一致——「要么可用，要么明确报错」。
 fn bash_double_quote_escape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 8);
     for ch in raw.chars() {
@@ -590,13 +610,36 @@ fi"##;
 /// 函数自身名永不落盘）；`PROMPT_COMMAND` 已被用户占用时链式保留
 /// （`__tltb_on_prompt; <既有>`）。每条写日志命令自带 `2>/dev/null || true`——
 /// 记录失败永不打扰交互 shell。
-pub fn bash_transcript_payload(log_base: &Path) -> String {
-    debug_assert!(
-        !log_base.to_string_lossy().contains(['\n', '\r']),
-        "log_base 不得包含换行"
-    );
+///
+/// # 返回（v0.6.1 · M6）
+/// 日志根路径无法安全内嵌时返回 [`TerminalHookError::InvalidLogBase`]，**拒绝挂载**：
+/// - 含 `!`：注入块内 `__tltb_log_dir="…"` 的赋值行在交互式 Git Bash 中可能触发
+///   history expansion（`!xxx: event not found`），整行赋值被丢弃 → `__tltb_log_dir`
+///   为空、`mkdir` 静默失败（`2>/dev/null || true`），该会话 bash 日志**完全失效**
+///   且用户每次开终端都会看到报错。旧实现只转义 `\ " $ `` ` ``，漏掉 `!`，正是
+///   M6 的成因；与 `cmd.rs`（硬拒 `%` / `!`）对齐后三端策略一致；
+/// - 含换行 / NUL：无法内嵌进单行脚本（旧实现只有 `debug_assert!`，release 下形同
+///   虚设，现升级为运行期拒绝）。
+pub fn bash_transcript_payload(log_base: &Path) -> TerminalHookResult<String> {
+    let lossy = log_base.to_string_lossy();
+    if lossy.contains(['\n', '\r', '\0']) {
+        return Err(TerminalHookError::InvalidLogBase {
+            path: log_base.to_path_buf(),
+            hint: "路径不得包含换行或 NUL（无法内嵌进 shell 启动脚本）",
+        });
+    }
+    if lossy.contains('!') {
+        return Err(TerminalHookError::InvalidLogBase {
+            path: log_base.to_path_buf(),
+            hint: "路径不得包含 !（交互式 bash 会对该字符做历史展开，无法可靠转义）",
+        });
+    }
     let root = bash_double_quote_escape(&bash_posix_log_root(log_base));
-    fill_placeholder(BASH_PAYLOAD_TEMPLATE, LOG_BASE_PLACEHOLDER, &root)
+    Ok(fill_placeholder(
+        BASH_PAYLOAD_TEMPLATE,
+        LOG_BASE_PLACEHOLDER,
+        &root,
+    ))
 }
 
 /// 由既有配置内容生成「注入后」内容（纯函数：PowerShell 挂载的确定性核心）。
@@ -610,8 +653,14 @@ pub fn ps_removed_content(current: &str) -> String {
 }
 
 /// 由既有配置内容生成「注入后」内容（纯函数：Bash 挂载的确定性核心）。
-pub fn bash_injected_content(current: &str, log_base: &Path) -> String {
-    inject_block(current, BASH_TAG, &bash_transcript_payload(log_base))
+///
+/// v0.6.1（M6）：路径不安全（含 `!` / 换行 / NUL）时返回 `Err`，不产出半成品负载。
+pub fn bash_injected_content(current: &str, log_base: &Path) -> TerminalHookResult<String> {
+    Ok(inject_block(
+        current,
+        BASH_TAG,
+        &bash_transcript_payload(log_base)?,
+    ))
 }
 
 /// 由既有配置内容生成「卸载后」内容（纯函数：Bash 卸载的确定性核心）。
@@ -1031,8 +1080,12 @@ impl BashHook {
     }
 
     /// 注入 bash 会话记录钩子到全部目标（幂等；单目标失败不阻断其余）。
+    ///
+    /// v0.6.1（M6）：负载生成阶段即校验日志路径（含 `!` / 换行 / NUL 时直接返回
+    /// `Err`），**不写入任何目标文件**——避免"挂上去但每次开终端都报错且日志静默
+    /// 失效"的隐性故障。
     pub fn install(&self, log_base: &Path) -> TerminalHookResult<()> {
-        let payload = bash_transcript_payload(log_base);
+        let payload = bash_transcript_payload(log_base)?;
         let mut first_error: Option<TerminalHookError> = None;
         for target in self.targets() {
             if let Err(err) = mount_block(target, BASH_TAG, &payload, BASH_RC_FILE) {
@@ -1343,7 +1396,8 @@ mod tests {
     #[test]
     fn bash_payload_embeds_posix_log_root_and_recorder_logic() {
         let payload =
-            bash_transcript_payload(Path::new(r"C:\Program Files\TLToolBox\logs\terminals"));
+            bash_transcript_payload(Path::new(r"C:\Program Files\TLToolBox\logs\terminals"))
+                .expect("常规路径应可生成负载");
         // 仅交互终端 + 防递归检测（双入口 .bash_profile / .bashrc 只生效一次）。
         assert!(payload.contains(r#"if [ -z "$TLTB_BASH_LOGGED" ]"#));
         assert!(payload.contains("export TLTB_BASH_LOGGED=1"));
@@ -1382,23 +1436,90 @@ mod tests {
     #[test]
     fn bash_payload_escapes_dollar_backtick_quote_and_backslash() {
         // Windows 目录名可以含 $ 与反引号；转义必须保证双引号语境逐字可靠。
-        let payload = bash_transcript_payload(Path::new(r#"C:\we$ird\`tick\quo"te\base"#));
+        let payload = bash_transcript_payload(Path::new(r#"C:\we$ird\`tick\quo"te\base"#))
+            .expect("含 $ / 反引号 / 引号的路径应可生成负载");
         assert!(payload.contains(r#"/c/we\$ird"#), "`$` 应转义为 `\\$`");
         assert!(payload.contains(r#"/\`tick"#), "反引号应转义");
         assert!(payload.contains(r#"quo\"te"#), "双引号应转义");
         assert!(!payload.contains("we$ird/`tick"), "不得残留未转义形态");
     }
 
+    // ---- M6：bash 注入路径的 `!` / 换行 硬拒绝（v0.6.1 整改） ----
+
+    /// M6 核心契约：含 `!` 的日志路径**必须被拒绝挂载**。
+    ///
+    /// 旧实现只转义 `\ " $ ``` ` ```，漏掉 `!`：注入块里的
+    /// `__tltb_log_dir="…!…"` 在交互式 Git Bash 中触发 history expansion
+    /// （`!xxx: event not found`），整行赋值被丢弃 → `__tltb_log_dir` 为空、
+    /// `mkdir` 静默失败 → 该会话 bash 日志**完全失效且用户每次开终端都看到报错**。
+    ///
+    /// 修复策略与 `cmd.rs` 对齐：**在生成负载前硬拒绝**（要么可用，要么明确报错），
+    /// 而不是"挂上去但静默失效"。
+    #[test]
+    fn bash_payload_rejects_log_base_containing_history_expansion_char() {
+        for path in [
+            Path::new(r"D:\logs\!terminals"),
+            Path::new(r"D:\logs\terminals!"),
+            Path::new(r"D:\my!logs"),
+        ] {
+            let err = bash_transcript_payload(path).expect_err("含 ! 的路径必须被拒绝（M6）");
+            assert!(
+                matches!(err, TerminalHookError::InvalidLogBase { .. }),
+                "应返回 InvalidLogBase，实际: {err:?}"
+            );
+            let text = err.to_string();
+            assert!(text.contains('!'), "错误文案应点名该字符: {text}");
+            assert!(
+                text.contains(&path.to_string_lossy().to_string()),
+                "错误文案应回显被拒绝的路径: {text}"
+            );
+        }
+
+        // 注入内容生成同样拒绝，绝不产出半成品负载。
+        assert!(bash_injected_content("export A=1\n", Path::new(r"D:\logs!")).is_err());
+    }
+
+    /// 含换行 / NUL 的路径同样拒绝（旧实现只有 `debug_assert!`，release 下形同虚设）。
+    #[test]
+    fn bash_payload_rejects_log_base_with_control_characters() {
+        for path in [
+            Path::new("D:\\logs\nterminals"),
+            Path::new("D:\\logs\rterminals"),
+            Path::new("D:\\logs\0terminals"),
+        ] {
+            let err = bash_transcript_payload(path).expect_err("控制字符路径必须被拒绝");
+            assert!(
+                matches!(err, TerminalHookError::InvalidLogBase { .. }),
+                "应返回 InvalidLogBase，实际: {err:?}"
+            );
+        }
+    }
+
+    /// 三端一致性：bash 与 cmd 对 `!` 的处理策略必须相同（都硬拒绝）。
+    #[test]
+    fn bash_and_cmd_agree_on_rejecting_bang_in_log_base() {
+        let path = Path::new(r"D:\logs\!dir");
+        assert!(
+            bash_transcript_payload(path).is_err(),
+            "bash 应拒绝含 ! 的日志路径"
+        );
+        assert!(
+            super::super::cmd::capture_script_bytes(path).is_err(),
+            "cmd 应拒绝含 ! 的日志路径（三端策略一致）"
+        );
+    }
+
     #[test]
     fn bash_injected_content_preserves_user_content_and_is_reversible() {
         let original = "export EDITOR=vim\n\n# 我的别名\n";
-        let injected = bash_injected_content(original, Path::new(r"D:\logs"));
+        let injected =
+            bash_injected_content(original, Path::new(r"D:\logs")).expect("常规路径应可注入");
         assert!(injected.starts_with(original));
         assert_eq!(count_blocks(&injected, BASH_TAG), 1);
         assert_eq!(bash_removed_content(&injected), original);
         // 幂等：同参数重复注入逐字节一致。
         assert_eq!(
-            bash_injected_content(&injected, Path::new(r"D:\logs")),
+            bash_injected_content(&injected, Path::new(r"D:\logs")).expect("重复注入应成功"),
             injected
         );
     }

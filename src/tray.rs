@@ -522,47 +522,77 @@ mod platform {
             }
         }
 
+        /// 单次消息泵迭代。
+        ///
+        /// 返回 `false` 表示应停机（`WM_QUIT`、`TrayCommand::Shutdown` 或 `GetMessageW`
+        /// 失败）；`true` 表示继续下一轮。
+        ///
+        /// # FFI 边界（v0.6.1 · S5）
+        /// 本函数的调用方 [`Self::run`] 把它整体置于
+        /// [`crate::ffi_guard::guard_ffi`] 内：`DispatchMessageW` 会把 muda /
+        /// tray-icon 的第三方窗口过程在本线程展开执行，而 `drain_*` 会跑我方事件
+        /// 处理逻辑（`String` 分配、总线发布、菜单文案更新）——两者均可 panic，
+        /// panic 一旦跨 `extern "system"` 展开会让整个常驻进程直接 abort
+        /// （托盘图标、钩子、监听全部瞬间消失且无任何反馈）。
+        fn pump_once(
+            &mut self,
+            cmd_rx: &mpsc::Receiver<TrayCommand>,
+            wakeup_message_id: u32,
+        ) -> bool {
+            // 1) 控制指令（可被 WM_TRAY_CONTROL 唤醒后到达）。
+            if !self.drain_controls(cmd_rx) {
+                return false; // 收到 Shutdown
+            }
+            // 2) 菜单 / 图标事件（刚完成的 DispatchMessageW 可能已入队）。
+            self.drain_menu_events();
+            self.drain_tray_icon_events();
+
+            // 3) 阻塞泵取一条消息（含托盘隐藏窗口的 Shell_NotifyIcon 回调）。
+            let mut msg = MSG::default();
+            let ret = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
+            if ret.0 == 0 {
+                return false; // WM_QUIT（TrayControl::request_shutdown 定向投递）
+            }
+            if ret.0 == -1 {
+                tracing::warn!(target: "tray", "GetMessageW 失败，托盘消息泵退出");
+                return false;
+            }
+
+            if msg.message == WM_TRAY_CONTROL {
+                // 唤醒消息只用于跳出 GetMessageW，本身无载荷，无需分发。
+            } else if wakeup_message_id != 0 && msg.message == wakeup_message_id {
+                // 第二实例的唤醒广播（单实例守护）：把静默常驻的主窗口还原
+                // 前置。发布 AppEvent::TrayAction(ShowWindow)，由生命周期
+                // 控制器经 invoke_from_event_loop 在 UI 线程执行。
+                self.bus
+                    .publish(AppEvent::TrayAction(TrayAction::ShowWindow));
+            } else {
+                unsafe {
+                    let _ = TranslateMessage(&msg);
+                    let _ = DispatchMessageW(&msg);
+                }
+            }
+            true
+        }
+
         /// 运行 Win32 消息泵直至停机（消费本结构体，退出时自动释放图标）。
         ///
         /// `wakeup_message_id`：第二实例的唤醒广播编号（
         /// [`crate::single_instance::register_wakeup_message`]，`0` = 未注册成功）。
         /// 广播经 `HWND_BROADCAST` 投递到托盘线程创建的顶层隐藏窗口，泵在此
         /// 识别并发布 [`AppEvent::TrayAction(TrayAction::ShowWindow)`]。
+        ///
+        /// 每轮迭代都在 [`crate::ffi_guard::guard_ffi`] 内执行（见 [`Self::pump_once`]）：
+        /// panic 被就地截停后**继续下一轮**——最多丢一次菜单 / 图标事件，进程存活。
         fn run(mut self, cmd_rx: mpsc::Receiver<TrayCommand>, wakeup_message_id: u32) {
             tracing::debug!(target: "tray", "托盘消息泵已启动");
             loop {
-                // 1) 控制指令（可被 WM_TRAY_CONTROL 唤醒后到达）。
-                if !self.drain_controls(&cmd_rx) {
-                    break; // 收到 Shutdown
-                }
-                // 2) 菜单 / 图标事件（刚完成的 DispatchMessageW 可能已入队）。
-                self.drain_menu_events();
-                self.drain_tray_icon_events();
-
-                // 3) 阻塞泵取一条消息（含托盘隐藏窗口的 Shell_NotifyIcon 回调）。
-                let mut msg = MSG::default();
-                let ret = unsafe { GetMessageW(&mut msg, HWND::default(), 0, 0) };
-                if ret.0 == 0 {
-                    break; // WM_QUIT（TrayControl::request_shutdown 定向投递）
-                }
-                if ret.0 == -1 {
-                    tracing::warn!(target: "tray", "GetMessageW 失败，托盘消息泵退出");
-                    break;
-                }
-
-                if msg.message == WM_TRAY_CONTROL {
-                    // 唤醒消息只用于跳出 GetMessageW，本身无载荷，无需分发。
-                } else if wakeup_message_id != 0 && msg.message == wakeup_message_id {
-                    // 第二实例的唤醒广播（单实例守护）：把静默常驻的主窗口还原
-                    // 前置。发布 AppEvent::TrayAction(ShowWindow)，由生命周期
-                    // 控制器经 invoke_from_event_loop 在 UI 线程执行。
-                    self.bus
-                        .publish(AppEvent::TrayAction(TrayAction::ShowWindow));
-                } else {
-                    unsafe {
-                        let _ = TranslateMessage(&msg);
-                        let _ = DispatchMessageW(&msg);
-                    }
+                match crate::ffi_guard::guard_ffi("tray::message_pump", || {
+                    self.pump_once(&cmd_rx, wakeup_message_id)
+                }) {
+                    Some(true) => {}
+                    Some(false) => break,
+                    None => {} // panic 已截停：托盘与进程保持存活，继续泵消息
                 }
             }
             tracing::debug!(target: "tray", "托盘消息泵已退出，正在释放图标资源");
@@ -825,7 +855,10 @@ mod platform {
                 let _ = DeleteObject(info.hbmColor);
                 return None;
             }
-            SelectObject(dc, info.hbmColor);
+            // v0.6.2（L1）：保留旧位图句柄——`info.hbmColor` 在被选入 DC 的状态下
+            // 直接 DeleteObject 是未定义行为（GDI 拒绝删除仍被 DC 选中的对象），
+            // 必须先还原原位图再删除。
+            let old = SelectObject(dc, info.hbmColor);
             let mut color = vec![0u8; (w * h * 4) as usize];
             let mut bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -904,7 +937,9 @@ mod platform {
             // 6) 释放全部 GDI 资源（唯一释放点，与第 2) 步的 GetIconInfo 成对）：
             //    - HDC 由 CreateCompatibleDC 创建 → DeleteDC；
             //    - hbmMask / hbmColor 由 GetIconInfo 创建 → DeleteObject（两次）。
-            //    顺序不可颠倒：先删 DC（解除位图在 DC 中的选中），再删位图本身。
+            //    v0.6.2（L1）：删除位图前先用 `old` 还原 DC 的原位图——位图在选中
+            //    状态下被 DeleteObject 属未定义行为（GDI 会拒绝并泄漏对象）。
+            let _ = SelectObject(dc, old);
             let _ = DeleteDC(dc);
             let _ = DeleteObject(info.hbmMask);
             let _ = DeleteObject(info.hbmColor);

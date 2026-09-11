@@ -51,7 +51,7 @@ use windows::Win32::{
     Foundation::{BOOL, HWND, LPARAM},
     Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
     System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::WindowsAndMessaging::{
@@ -117,12 +117,26 @@ pub fn hwnd_value(hwnd: HWND) -> isize {
 /// 本进程（TLToolBox）自身主窗口的类名排除名单——由 [`is_self_window`] 消费。
 ///
 /// 弹窗遮罩层的 Slint 窗口通常以 `slint` 前缀注册（winit 后端把每条顶层窗口
-/// 挂到该类别下）；UI 主窗口标题固定为 `TLToolBox - 桌面实用工具箱`。为避免把
-/// 工具本体自身纳入可置顶列表，两条判据任一命中即判定为自身窗口。
+/// 挂到该类别下）；UI 主窗口标题固定为 `TLToolBox - 桌面实用工具箱`。
 const OWN_TITLE_MARKER: &str = "TLToolBox";
 
-/// 判定窗口是否属于 TLToolBox 自身（标题以产品名开头 / 类名含 slint 标记）。
-fn is_self_window(title: &str, class_name: &str) -> bool {
+/// 判定窗口是否属于 TLToolBox 自身。
+///
+/// v0.6.2（L8）：**首要判据改为进程 PID 比对**——旧实现靠 `class_name.contains("slint")`
+/// 与标题前缀，会把其他 Slint 应用 / 标题以 "TLToolBox" 开头的第三方窗口一并误排。
+/// PID 由 `GetWindowThreadProcessId` 现场查询，与自身 PID 相等即判定为自身窗口，
+/// 精确无歧义；标题 / 类名判据降级为兜底（供 PID 查询失败时的保守排除）。
+fn is_self_window(hwnd: HWND, title: &str, class_name: &str) -> bool {
+    // SAFETY: GetWindowThreadProcessId 为只读查询，对失效句柄返回 0。
+    let mut pid = 0u32;
+    let owned = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) } != 0
+        && pid != 0
+        && pid == unsafe { GetCurrentProcessId() };
+    owned || is_self_window_by_text(title, class_name)
+}
+
+/// 文本形态的兜底判据（仅在 PID 查询失败时可能起作用，见 [`is_self_window`]）。
+fn is_self_window_by_text(title: &str, class_name: &str) -> bool {
     title.starts_with(OWN_TITLE_MARKER) || class_name.to_ascii_lowercase().contains("slint")
 }
 
@@ -270,8 +284,9 @@ pub fn passes_visible_filter(
     if is_tool_window {
         return false;
     }
-    // 规则 5：自身剥离。
-    if is_self_window(title, class_name)
+    // 规则 5：自身剥离（纯函数路径无句柄可用，走文本兜底判据；
+    // 真实枚举路径已在 `enum_proc` 以 PID 精确比对先行剔除——v0.6.2 · L8）。
+    if is_self_window_by_text(title, class_name)
         || (title == own_title && class_name == own_class && !own_title.is_empty())
     {
         return false;
@@ -336,49 +351,64 @@ pub unsafe fn process_name_raw(hwnd: HWND) -> String {
 }
 
 /// `EnumWindows` 同步回调：逐窗口完成采集与过滤后推入线程局部槽位。
+///
+/// # panic 边界（v0.6.1 · S5）
+/// 回调体整体置于 [`crate::ffi_guard::guard_ffi`] 内：内部的 `String` 分配、
+/// `OpenProcess` 包装、`tracing!` 宏均可 panic，panic 跨 `extern "system"` 展开会
+/// 直接 abort 常驻进程。截停后返回 `TRUE` **继续枚举**——最多丢失这一条候选窗口，
+/// 不中断整轮枚举，更不终止进程。
 #[cfg(windows)]
 unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-    // 可见性 + 标题长度前置校验（规则 1）：不满足则跳过全部后续查询
-    //（GetWindowTextW / OpenProcess 对无效候选是无谓开销）。
-    if !IsWindowVisible(hwnd).as_bool() {
-        return true.into();
-    }
-    // 最小化剥离（规则 4，v0.4.1）：最小化到任务栏的窗口一律不在列表中展示。
-    if IsIconic(hwnd).as_bool() {
-        return true.into();
-    }
-    let title_len = GetWindowTextLengthW(hwnd);
-    if title_len <= 0 {
-        return true.into();
-    }
+    crate::ffi_guard::guard_ffi("topmost_manager::enum_proc", || {
+        // 可见性 + 标题长度前置校验（规则 1）：不满足则跳过全部后续查询
+        //（GetWindowTextW / OpenProcess 对无效候选是无谓开销）。
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        // 最小化剥离（规则 4，v0.4.1）：最小化到任务栏的窗口一律不在列表中展示。
+        if IsIconic(hwnd).as_bool() {
+            return true.into();
+        }
+        let title_len = GetWindowTextLengthW(hwnd);
+        if title_len <= 0 {
+            return true.into();
+        }
 
-    let title = title_of(hwnd);
-    if title.trim().is_empty() {
-        return true.into();
-    }
-    let class_name = class_name_of(hwnd);
+        let title = title_of(hwnd);
+        if title.trim().is_empty() {
+            return true.into();
+        }
+        let class_name = class_name_of(hwnd);
 
-    // DWM cloak 校验（规则 3）：被 DWM 隐藏者不入列。
-    if is_cloaked(hwnd) {
-        return true.into();
-    }
+        // DWM cloak 校验（规则 3）：被 DWM 隐藏者不入列。
+        if is_cloaked(hwnd) {
+            return true.into();
+        }
 
-    let ex_style = get_ex_style(hwnd);
-    if !passes_visible_filter(ex_style, &title, &class_name, "", "", false) {
-        return true.into();
-    }
+        // 规则 5 前置（v0.6.2 · L8）：**PID 精确比对**剔除自身窗口——在本进程
+        // 内即可判定，无需进入文本兜底判据。
+        if is_self_window(hwnd, &title, &class_name) {
+            return true.into();
+        }
 
-    let topmost = ex_style & WS_EX_TOPMOST.0 != 0;
-    ENUM_BUCKET.with(|bucket| {
-        bucket.borrow_mut().push(WindowInfo {
-            hwnd: hwnd_value(hwnd),
-            process_name: process_name_of(hwnd),
-            title,
-            class_name,
-            topmost,
+        let ex_style = get_ex_style(hwnd);
+        if !passes_visible_filter(ex_style, &title, &class_name, "", "", false) {
+            return true.into();
+        }
+
+        let topmost = ex_style & WS_EX_TOPMOST.0 != 0;
+        ENUM_BUCKET.with(|bucket| {
+            bucket.borrow_mut().push(WindowInfo {
+                hwnd: hwnd_value(hwnd),
+                process_name: process_name_of(hwnd),
+                title,
+                class_name,
+                topmost,
+            });
         });
-    });
-    true.into()
+        true.into()
+    })
+    .unwrap_or_else(|| true.into()) // panic 降级：跳过该窗口，继续枚举
 }
 
 /// 单测只读校验用的守卫常量：确认编译期过滤器名单不被误删（配合纯函数测试）。

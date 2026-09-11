@@ -285,6 +285,29 @@ mod win32 {
             });
         }
 
+        // v0.6.2（L16）：**类型校验**——本键只应承载 REG_SZ 文本。若被外部改成
+        // REG_DWORD / REG_BINARY 等，按 UTF-16 解析会得到无意义文本（甚至影响
+        // 自启命令行的判等），此处显式拒绝并按"值不存在"处理（随后会被正确
+        // 重写为 REG_SZ）。
+        if value_type != REG_SZ {
+            tracing::warn!(
+                target: "autostart",
+                "自启注册表值类型异常（{:?} 而非 REG_SZ），将按无值处理并重写",
+                value_type.0
+            );
+            return Ok(None);
+        }
+        // v0.6.2（L16）：**长度上限**——防御异常/被篡改的超大值。自启命令行
+        // 合理长度远小于 4 KiB；超出即按无值处理（随后重写）。
+        const MAX_RUN_VALUE_BYTES: u32 = 4096;
+        if size > MAX_RUN_VALUE_BYTES {
+            tracing::warn!(
+                target: "autostart",
+                "自启注册表值过大（{size} 字节 > {MAX_RUN_VALUE_BYTES}），将按无值处理并重写"
+            );
+            return Ok(None);
+        }
+
         // 第二趟：按探测长度读取完整数据。
         let mut buf = vec![0u8; size as usize];
         // SAFETY: buf 长度即 size（探测返回值），写入不会越界；value_type 指向

@@ -477,7 +477,9 @@ mod imp {
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS, PW_CLIENTONLY};
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW};
+    use windows::Win32::UI::Shell::{
+        SHBrowseForFolderW, SHGetPathFromIDListEx, ShellExecuteW, GPFIDL_DEFAULT,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SW_SHOWNORMAL};
 
     /// UAC 确认框被用户取消时 `ShellExecuteW` 返回的错误码（`ERROR_CANCELLED`）。
@@ -699,7 +701,9 @@ mod imp {
         // BROWSEINFOW 中 pszDisplayName 为调用方提供的接收缓冲（MAX_PATH）；
         // lpszTitle 指向的 UTF-16 缓冲由局部变量持有至对话框关闭（防悬垂）。
         let title_wide = to_wide_units(title);
-        let mut display_buf = [0u16; 260];
+        // v0.6.2（L3）：目录缓冲由 260（MAX_PATH）扩至 [`FOLDER_BUFFER_CHARS`]，
+        // 支持长路径目录的选择；SHGetPathFromIDListW 的接收缓冲同步扩容。
+        let mut display_buf = [0u16; FOLDER_BUFFER_CHARS];
         let browse_info = windows::Win32::UI::Shell::BROWSEINFOW {
             hwndOwner: HWND::default(),
             pidlRoot: std::ptr::null_mut(),
@@ -719,10 +723,13 @@ mod imp {
             return Ok(None); // 用户取消：常见路径，非错误
         }
 
-        // SAFETY: pidl 非空（上一分支已排除）；SHGetPathFromIDListW 只写 pszpath
-        // 缓冲（260 个 u16 = MAX_PATH），不会越界。
-        let mut path_buf = [0u16; 260];
-        let ok = unsafe { SHGetPathFromIDListW(pidl, &mut path_buf) };
+        // SAFETY: pidl 非空（上一分支已排除）；SHGetPathFromIDListEx 只写 pszpath
+        // 缓冲（容量 = FOLDER_BUFFER_CHARS，作为 cchPath 传入），不会越界。
+        // v0.6.2（L3）：改用 **Ex 版本**——`SHGetPathFromIDListW` 的包装层把接收
+        // 缓冲硬编码为 260 宽字符，长路径目录即便选中也解析不出；Ex 版本按
+        // 调用方容量写入。
+        let mut path_buf = [0u16; FOLDER_BUFFER_CHARS];
+        let ok = unsafe { SHGetPathFromIDListEx(pidl, &mut path_buf, GPFIDL_DEFAULT) };
 
         // SAFETY: pidl 由 SHBrowseForFolderW 分配（CoTaskMemAlloc），须由调用方
         // 以 CoTaskMemFree 释放。
@@ -763,7 +770,19 @@ mod imp {
     /// 截图尺寸的防御上限（避免对异常窗口发起荒谬的内存分配）。
     const MAX_CAPTURE_DIMENSION: i32 = 4096;
 
+    /// 文件夹选择对话框的路径缓冲容量（v0.6.2 · L3：宽字符数）。
+    ///
+    /// 32768 对应 Windows 长路径 API 的字符上限；`SHBrowseForFolderW` /
+    /// `SHGetPathFromIDListW` 都以「调用方提供缓冲」为界写入，扩容即可承载长路径
+    /// 目录（旧实现固定 260 = MAX_PATH，超长目录无法选择）。
+    const FOLDER_BUFFER_CHARS: usize = 32768;
+
     /// GDI+ 会话令牌（进程级一次性初始化；`0` = 初始化失败）。
+    ///
+    /// v0.6.2（L2 说明）：刻意**不**调用 `GdiplusShutdown`——本令牌随进程存活到
+    /// 退出，GDI+ 资源由操作系统回收，常规退出路径无任何影响；而截图留痕在进程
+    /// 生命周期内随时可能被再次触发，缺少"引用计数式的安全关停"时机，强行在
+    /// 收尾路径关停反而可能与在途截图竞争。若未来需要热重载再补显式关停。
     static GDI_PLUS_TOKEN: OnceLock<usize> = OnceLock::new();
 
     /// 懒初始化 GDI+（线程安全，进程内仅一次）。返回令牌；`0` 表示不可用。
@@ -881,20 +900,25 @@ mod imp {
         // SAFETY: bitmap 已被选入 mem_dc（SelectObject 返回旧对象由下方还原）；
         // PrintWindow 对失效窗口返回 FALSE，无未定义行为。
         let result = unsafe {
-            let _old = SelectObject(mem_dc, bitmap);
+            // v0.6.2（L1）：保留旧位图句柄——位图在选中状态下即被 DeleteObject 是
+            // 未定义行为（GDI 会拒绝删除仍被 DC 选中的对象），必须先还原再删。
+            let old = SelectObject(mem_dc, bitmap);
             // 先尝试完整内容渲染（DirectComposition 等现代内容路径），失败兜底
             // 仅客户区渲染——两次失败才真正放弃。
             let mut rendered = PrintWindow(hwnd, mem_dc, PW_RENDERFULLCONTENT_CLIENTONLY);
             if !rendered.as_bool() {
                 rendered = PrintWindow(hwnd, mem_dc, PW_CLIENTONLY);
             }
-            if rendered.as_bool() {
+            let png = if rendered.as_bool() {
                 encode_hbitmap_png(bitmap, dest)
             } else {
                 Err(std::io::Error::other(
                     "PrintWindow 渲染失败（目标窗口可能已销毁或无响应）",
                 ))
-            }
+            };
+            // 先还原原位图，再执行删除（顺序不可颠倒）。
+            let _ = SelectObject(mem_dc, old);
+            png
         };
 
         // 4) 清理 GDI 对象（顺序与创建相反；DeleteObject 用 HGDIOBJ 泛型参数）。

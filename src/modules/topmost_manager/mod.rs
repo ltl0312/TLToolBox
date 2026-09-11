@@ -100,6 +100,15 @@ const FOREGROUND_DEBOUNCE_MS: u32 = 15;
 /// 防抖一次性计时器 ID（`SetTimer` / `WM_TIMER` 载荷；'TL' 占位）。
 #[cfg(windows)]
 const SHIELD_TIMER_ID: usize = 0x544C;
+/// 「用户手动取消置顶」兜底对账计时器 ID（v0.6.1 · M4①；与防抖计时器不同 ID）。
+#[cfg(windows)]
+const UNPIN_RECONCILE_TIMER_ID: usize = 0x544D;
+/// 兜底对账周期（8s）：用户取消置顶后，最迟在此时长内被识别并持久化。
+///
+/// 取值权衡：前台切换纠偏已覆盖绝大多数场景，本计时器只是"用户取消后长时间不切
+/// 前台"的兜底；8s 的唤醒成本可忽略（一次只读的 `GetWindowLongPtrW` 查询）。
+#[cfg(windows)]
+const UNPIN_RECONCILE_MS: u32 = 8_000;
 /// 停机协议中 Join 原生泵线程的等待上限（与弹窗拦截模块同一纪律）。
 #[cfg(windows)]
 const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -150,6 +159,15 @@ impl ActivePinnedWindow {
 // ---------------------------------------------------------------------------
 // 状态容器（受管条目 + 守护失败一次性标志）
 // ---------------------------------------------------------------------------
+
+/// 「用户已手动取消置顶」的移除判定（纯逻辑，可离线单测）。
+///
+/// - 窗口**存活**但不再置顶 → 移除（用户经原生菜单取消了置顶；M4①）；
+/// - 仍置顶 → 保留；
+/// - 窗口已消亡 → **不移除**（由 `sweep_dead` 统一负责，避免两处清理互相掩盖）。
+fn should_drop_user_unpinned(alive: bool, topmost: bool) -> bool {
+    alive && !topmost
+}
 
 /// 模块并发状态：受管条目（短临界 std Mutex 保护）。
 struct TopmostState {
@@ -216,6 +234,30 @@ impl TopmostState {
         let before = guard.len();
         guard.retain(|entry| engine::is_window_alive(entry.hwnd));
         guard.len() != before
+    }
+
+    /// 批量移除**用户已手动取消置顶**的窗口条目（v0.6.1 · M4①）。
+    ///
+    /// 判定：窗口仍存活（消亡条目归 [`Self::sweep_dead`] 管），但
+    /// [`engine::is_topmost`] 已为假——说明用户在 Windows 原生窗口菜单里取消过置顶。
+    /// 返回被移除的 `(hwnd, 进程名)` 列表（供审计 / Toast 回显）。
+    ///
+    /// 若不清除，下一次前台切换事件的纠偏路径会把该窗口重新置顶：用户**无法真正
+    /// 关闭**置顶，且 UI 仍标记 `topmost = true` 而系统实际已非置顶——界面在撒谎。
+    fn sweep_user_unpinned(&self) -> Vec<(isize, String)> {
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut removed = Vec::new();
+        guard.retain(|entry| {
+            let alive = engine::is_window_alive(entry.hwnd);
+            let still_topmost = alive && engine::is_topmost(entry.hwnd);
+            if should_drop_user_unpinned(alive, still_topmost) {
+                removed.push((entry.hwnd, entry.process_name.clone()));
+                return false;
+            }
+            // 保留：仍存活且仍置顶的条目；消亡条目交给 sweep_dead 处理（本函数不动）。
+            true
+        });
+        removed
     }
 
     fn note_guard_failure(&self) {
@@ -292,11 +334,12 @@ impl TopmostManagerModule {
     pub fn with_rules(rules: impl IntoIterator<Item = PinnedRule>) -> Self {
         let rules: Vec<PinnedRule> = rules.into_iter().collect();
         // 同进程多条规则时后者覆盖前者（collect 语义：后写先得，迭代序稳定）。
+        // v0.6.2（L9）：键统一小写（与运行期写入 / 查询一致）。
         let memorized: HashMap<String, u8> = rules
             .iter()
             .map(|rule| {
                 (
-                    rule.process_name.clone(),
+                    rule.process_name.to_ascii_lowercase(),
                     engine::clamp_priority(rule.priority),
                 )
             })
@@ -348,11 +391,14 @@ impl TopmostManagerModule {
     /// 规则）与运行期每次置顶 / 改级的落定写入；装配层在枚举弹窗行时对未受管
     /// 窗口调用本方法回填历史设定值（受管窗口直接取条目的实时优先级）。
     pub fn remembered_priority(&self, process_name: &str) -> Option<u8> {
+        // v0.6.2（L9）：键统一小写——写入侧（`memorize_priority` / `with_rules`）
+        // 同样小写化，保证与规则匹配的大小写不敏感语义一致。
+        let key = process_name.to_ascii_lowercase();
         self.inner
             .memorized
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(process_name)
+            .get(&key)
             .copied()
     }
 
@@ -460,12 +506,17 @@ impl TopmostManagerModule {
     }
 
     /// 写入进程级优先级记忆（v0.4.1；不触发持久化，由随后的 persist 一并落盘）。
+    ///
+    /// v0.6.2（L9）：键统一小写，与 [`Self::remembered_priority`] 的读取语义一致。
     fn memorize_priority(&self, process_name: &str, priority: u8) {
         self.inner
             .memorized
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(process_name.to_string(), engine::clamp_priority(priority));
+            .insert(
+                process_name.to_ascii_lowercase(),
+                engine::clamp_priority(priority),
+            );
     }
 
     /// 由「受管条目 + 进程级记忆」收敛出完整规则列表（v0.4.1 语义）。
@@ -510,7 +561,14 @@ impl TopmostManagerModule {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(tx) = tx {
-            let _ = tx.send(rules);
+            // v0.6.2（L10）：持久化失败不再静默——发送端被丢弃 / 接收端已关闭时
+            // 至少留痕，否则"置顶规则未落盘"这一事实用户无从得知（下次启动丢失）。
+            if tx.send(rules).is_err() {
+                tracing::warn!(
+                    target: "topmost_manager",
+                    "置顶规则持久化失败：单写者通道已关闭（规则仅保留在内存态）"
+                );
+            }
         }
     }
 
@@ -542,7 +600,15 @@ impl TopmostManagerModule {
     }
 
     /// 前台抢占纠偏：用户激活受管窗口后，重刷其前方 1 / 2 级窗口（泵线程调用）。
+    ///
+    /// # M4①：纠偏前的「用户已取消置顶」对账
+    /// 用户可经 Windows 原生窗口菜单自行取消置顶。若不先对账，本方法会立刻把窗口
+    /// **重新置顶**（用户无法真正关闭），且 UI 仍标记为已置顶（界面撒谎）。因此每次
+    /// 纠偏前先扫一遍受管条目：窗口存活但 `WS_EX_TOPMOST` 已不置位者，判定为「用户
+    /// 手动取消」→ 惰性移除条目 + 持久化规则快照（配置与 UI 随即收敛到事实）。
     fn shield_refresh(&self, activated: isize) {
+        self.reconcile_user_unpin();
+
         let entries = self.inner.state.sorted_snapshot();
         let chain = to_chain_entries(&entries);
         let Some(plan) = engine::plan_shield_refresh(&chain, activated) else {
@@ -550,6 +616,25 @@ impl TopmostManagerModule {
         };
         let stats = engine::apply_plan(&plan);
         self.handle_chain_stats(&stats);
+    }
+
+    /// 受管条目与系统真实置顶状态的惰性对账（M4①）。
+    ///
+    /// 返回本次移除的条目数；发生移除时持久化规则并写审计 / 日志，让「配置事实源」
+    /// 与「UI 列表」同一步收敛（否则下次启动会按旧规则重新置顶）。
+    fn reconcile_user_unpin(&self) -> usize {
+        let removed = self.inner.state.sweep_user_unpinned();
+        if removed.is_empty() {
+            return 0;
+        }
+        self.persist_rules();
+        for (hwnd, process_name) in &removed {
+            tracing::info!(
+                target: "topmost_manager",
+                "检测到用户已手动取消置顶（HWND: 0x{hwnd:X} 进程: {process_name}），已移除受管条目并持久化规则"
+            );
+        }
+        removed.len()
     }
 
     /// 统一次链式重刷结果的统计处理：消亡清理 + 失败上报。
@@ -742,13 +827,13 @@ impl TopmostManagerModule {
             return Ok(()); // 幂等
         }
 
-        let run = self
+        let Some(mut run) = self
             .inner
             .active
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let Some(run) = run else {
+            .take()
+        else {
             self.inner.running.store(false, Ordering::Release);
             return Ok(());
         };
@@ -763,7 +848,8 @@ impl TopmostManagerModule {
             let _ = unsafe { PostThreadMessageW(run.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
 
             // 3) 超时 Join：确保 UnhookWinEvent / KillTimer 已在安装线程执行完毕。
-            if let Some(thread) = run.thread {
+            //    （`take()` 而非移动：超时路径要把 `run` 放回 `active` 槽位。）
+            if let Some(thread) = run.thread.take() {
                 let join_result = tokio::time::timeout(
                     PUMP_JOIN_TIMEOUT,
                     tokio::task::spawn_blocking(move || thread.join()),
@@ -785,12 +871,31 @@ impl TopmostManagerModule {
                     }
                     Ok(Err(task_err)) => {
                         tracing::error!(target: "topmost_manager", "Join 阻塞任务异常终止: {task_err}");
+                        // Join 任务自身异常（理论不可达）：同样按"停止未完成"处理，
+                        // 不翻转 running（M4②）。
+                        return Err(format!("窗口置顶泵线程收尾任务异常: {task_err}").into());
                     }
                     Err(_elapsed) => {
+                        // M4②：超时后**不得**置 `running = false`。旧实现在此仅记
+                        // 日志便继续把标志清零，而旧泵线程尚未退出、WinEvent 钩子
+                        // 与对账计时器仍在生效——再次 `start` 会安装第二套
+                        // `SetWinEventHook` + 计时器，造成钩子泄漏与重复纠偏。
+                        // 现保持「停止中」语义：返回错误并保留 `running = true`，
+                        // 由调用方提示重试；`active` 槽位已被 `take()` 清空，但
+                        // 旧线程仍在运行，故把句柄**放回**以维持可再次停止。
                         tracing::error!(
                             target: "topmost_manager",
-                            "泵线程未在 {PUMP_JOIN_TIMEOUT:?} 内退出，已转入分离式收尾"
+                            "泵线程未在 {PUMP_JOIN_TIMEOUT:?} 内退出：保持运行标志（停止未完成），可重试停止"
                         );
+                        *self
+                            .inner
+                            .active
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(run);
+                        return Err(format!(
+                            "窗口置顶守护停止超时（泵线程 {PUMP_JOIN_TIMEOUT:?} 内未退出），请稍后重试"
+                        )
+                        .into());
                     }
                 }
             }
@@ -891,8 +996,16 @@ pub fn rule_matches_window(
         // 空标题窗口在枚举期已被过滤；此处防御性拒绝（无法子串匹配）。
         return false;
     }
-    // 双向子串：窗口标题可能随会话上下文增删前后缀。
-    title.contains(&needle) || needle.contains(&title)
+    // 正向子串：窗口标题可能随会话上下文增删前后缀（`- 已保存`、`* 未保存` 等）。
+    if title.contains(&needle) {
+        return true;
+    }
+    // v0.6.2（L11）：反向匹配从「双向任意子串」收紧为**前缀关系**且要求标题具备
+    // 最低信息量（≥ 4 字符）。旧实现 `needle.contains(&title)` 会让标题极短（如
+    // "OK"、"1"）的窗口命中一条毫不相关的长模式——恢复阶段据此置顶错误窗口。
+    // 前缀关系仍保留原意图（记忆的模式含当前标题为前缀的更短形态）。
+    const MIN_REVERSE_TITLE_CHARS: usize = 4;
+    title.chars().count() >= MIN_REVERSE_TITLE_CHARS && needle.starts_with(&title)
 }
 
 /// 进程名 + 标题（标题允许空）是否构成有效恢复匹配。
@@ -984,13 +1097,27 @@ fn pump_thread_main(
         }
         tracing::info!(target: "topmost_manager", "前台 / 最小化事件钩子已就绪（泵线程 {thread_id}）");
 
+        // v0.6.1（M4①）兜底对账计时器：前台纠偏只在切换前台时触发，若用户取消
+        // 置顶后长时间不切前台，UI 会一直显示"已置顶"。以固定周期做一次 Z-Order
+        // 对账，保证「用户手动取消」最迟在一个周期内被识别并持久化。
+        let _ = SetTimer(None, UNPIN_RECONCILE_TIMER_ID, UNPIN_RECONCILE_MS, None);
+
         // 消息泵：WM_QUIT → 退出；WM_TIMER(防抖) → 前台抢占纠偏；
-        // MSG_MINIMIZE_UNPIN → 受管窗口最小化自动解置顶；其余消息
-        //（含 WinEvent 回调的派发）走 Translate + Dispatch。
+        // WM_TIMER(对账) → 用户手动取消置顶的兜底检测；MSG_MINIMIZE_UNPIN →
+        // 受管窗口最小化自动解置顶；其余消息（含 WinEvent 回调的派发）走
+        // Translate + Dispatch。
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_QUIT {
                 break;
+            }
+            if msg.message == WM_TIMER && msg.wParam.0 == UNPIN_RECONCILE_TIMER_ID {
+                // 周期性对账：识别用户经原生菜单取消置顶的窗口并移除条目（M4①）。
+                let module = TopmostManagerModule {
+                    inner: Arc::clone(&inner),
+                };
+                module.reconcile_user_unpin();
+                continue;
             }
             if msg.message == WM_TIMER && msg.wParam.0 == SHIELD_TIMER_ID {
                 // 防抖到期：读取回调记录的“最近激活窗口”并执行纠偏。
@@ -1019,8 +1146,9 @@ fn pump_thread_main(
             let _ = DispatchMessageW(&msg);
         }
 
-        // 泵退出：先 KillTimer 再卸载钩子（同一线程）。
+        // 泵退出：先 KillTimer（两个计时器）再卸载钩子（同一线程）。
         let _ = KillTimer(None, SHIELD_TIMER_ID);
+        let _ = KillTimer(None, UNPIN_RECONCILE_TIMER_ID);
         let _ = UnhookWinEvent(hook);
         tracing::info!(target: "topmost_manager", "前台 / 最小化事件钩子已安全卸载，泵线程退出");
     }
@@ -1043,7 +1171,12 @@ type WinEventCallback = unsafe extern "system" fn(HWINEVENTHOOK, u32, HWND, i32,
 /// - 回调内严禁重活 / 异步操作：前台路径只做一次线程局部写 + 武装计时器，
 ///   最小化路径只做一次 `PostMessageW` 投递；
 /// - `SetTimer(None, …)` / `PostMessageW(None, …)` 均要求调用线程已建消息队列
-///   （泵线程满足）。
+///   （泵线程满足）；
+/// - **panic 边界（v0.6.1 · S5）**：回调体整体置于
+///   [`crate::ffi_guard::guard_ffi`] 内。回调内的 `tracing!` 宏、线程局部访问与
+///   Win32 调用包装均可 panic，而 panic 一旦跨 `extern "system"` 展开会让整个
+///   常驻进程直接 abort（前台钩子 / 最小化钩子 / 托盘全部随之失效且无任何反馈）。
+///   截停后本次事件被放弃——丢失一次前台纠偏机会，进程与钩子保持存活。
 #[cfg(windows)]
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
@@ -1054,20 +1187,22 @@ unsafe extern "system" fn win_event_proc(
     _event_thread: u32,
     _event_time: u32,
 ) {
-    if hwnd.0.is_null() {
-        return;
-    }
-    if event == EVENT_SYSTEM_FOREGROUND {
-        // 记录激活窗口（本线程 Cell；泵线程在防抖到期后消费）。
-        RECENT_FOREGROUND.with(|cell| cell.set(hwnd.0 as usize));
-        // (重新)武装 15ms 一次性防抖计时器：连续前台事件自动合并为一次纠偏。
-        let _ = SetTimer(None, SHIELD_TIMER_ID, FOREGROUND_DEBOUNCE_MS, None);
-    } else if event == EVENT_SYSTEM_MINIMIZESTART {
-        // 最小化开始：把事件翻译成泵线程定制消息（wParam 携带窗口句柄）。
-        // SAFETY: PostMessageW(None, …) 把消息投递到调用线程（泵线程）自己的
-        // 队列；失败仅返回错误码，无未定义行为。
-        let _ = PostMessageW(None, MSG_MINIMIZE_UNPIN, WPARAM(hwnd.0 as usize), LPARAM(0));
-    }
+    let _ = crate::ffi_guard::guard_ffi("topmost_manager::win_event_proc", || {
+        if hwnd.0.is_null() {
+            return;
+        }
+        if event == EVENT_SYSTEM_FOREGROUND {
+            // 记录激活窗口（本线程 Cell；泵线程在防抖到期后消费）。
+            RECENT_FOREGROUND.with(|cell| cell.set(hwnd.0 as usize));
+            // (重新)武装 15ms 一次性防抖计时器：连续前台事件自动合并为一次纠偏。
+            let _ = SetTimer(None, SHIELD_TIMER_ID, FOREGROUND_DEBOUNCE_MS, None);
+        } else if event == EVENT_SYSTEM_MINIMIZESTART {
+            // 最小化开始：把事件翻译成泵线程定制消息（wParam 携带窗口句柄）。
+            // SAFETY: PostMessageW(None, …) 把消息投递到调用线程（泵线程）自己的
+            // 队列；失败仅返回错误码，无未定义行为。
+            let _ = PostMessageW(None, MSG_MINIMIZE_UNPIN, WPARAM(hwnd.0 as usize), LPARAM(0));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,6 +1240,41 @@ mod tests {
         assert_eq!(window.to_rule().priority, engine::PRIORITY_MAX);
         let window = entry(0x5678, "cmd.exe", "命令提示符", 0);
         assert_eq!(window.to_rule().priority, engine::PRIORITY_MIN);
+    }
+
+    // ---- M4①：用户手动取消置顶的检测（v0.6.1 整改） ----
+
+    /// 移除判定的真值表：只有「窗口存活 + 已不置顶」才判为用户手动取消。
+    #[test]
+    fn user_unpin_detection_truth_table() {
+        assert!(
+            should_drop_user_unpinned(true, false),
+            "窗口存活但已非置顶 = 用户手动取消 → 必须移除条目（否则会被重新置顶）"
+        );
+        assert!(
+            !should_drop_user_unpinned(true, true),
+            "仍处于置顶状态 → 保留"
+        );
+        assert!(
+            !should_drop_user_unpinned(false, false),
+            "窗口已消亡 → 交由 sweep_dead 统一清理，本判定不越权"
+        );
+        assert!(
+            !should_drop_user_unpinned(false, true),
+            "不可能组合（句柄失效时 is_topmost 恒为 false）→ 保守保留"
+        );
+    }
+
+    /// 状态容器的对账入口：空条目集合下不得产生任何移除（幂等、无副作用）。
+    ///
+    /// 真实窗口的「用户取消」端到端验证由 `engine::is_topmost` 的真实窗口测试覆盖
+    /// （见 `engine` 模块单测）；此处只锁住容器层契约。
+    #[test]
+    fn reconcile_on_empty_state_is_noop() {
+        let module = TopmostManagerModule::with_rules(Vec::new());
+        assert_eq!(module.reconcile_user_unpin(), 0, "空状态对账应无移除");
+        assert_eq!(module.reconcile_user_unpin(), 0, "重复对账应幂等");
+        assert!(module.pinned().is_empty());
     }
 
     /// 受管条目与配置节双向互转的端到端往返（结构体序列化测试之一）。
@@ -1386,9 +1556,13 @@ mod tests {
         let module = TopmostManagerModule::with_rules(rules);
         assert_eq!(module.remembered_priority("notepad.exe"), Some(5));
         assert_eq!(module.remembered_priority("chrome.exe"), Some(8));
-        // 无记忆进程 / 大小写敏感主键无匹配。
+        // 无记忆进程无匹配；v0.6.2（L9）：主键已统一小写，大小写变体同样命中。
         assert_eq!(module.remembered_priority("calc.exe"), None);
-        assert_eq!(module.remembered_priority("NOTEPAD.EXE"), None);
+        assert_eq!(
+            module.remembered_priority("NOTEPAD.EXE"),
+            Some(5),
+            "记忆键应为大小写不敏感（与规则匹配语义一致）"
+        );
     }
 
     /// 优先级记忆持久化形态：受管条目收敛为 `enabled = true` 规则，无受管窗口

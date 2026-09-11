@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -525,6 +526,25 @@ where
     }
 }
 
+/// 一次「带自愈」的配置加载结果（v0.6.1 · M1）。
+#[derive(Debug, Clone)]
+pub struct ConfigLoad {
+    /// 生效配置（正常路径为磁盘内容；自愈路径为默认值）。
+    pub config: AppConfig,
+    /// `Some` 表示本次启动对**损坏**的配置文件做了自愈处理（已备份 + 回落默认值），
+    /// 供装配层写审计 / 弹 Toast；`None` 表示一切正常。
+    pub recovery: Option<ConfigRecovery>,
+}
+
+/// 配置自愈记录（损坏文件已备份的路径 + 失败原因）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRecovery {
+    /// 损坏文件的备份路径：`<原文件>.bak.<yyyyMMdd-HHmmss>`（原内容一字不丢）。
+    pub backup_path: PathBuf,
+    /// 解析失败原因（面向用户 / 审计的摘要）。
+    pub reason: String,
+}
+
 /// 配置管理器：负责单个配置文件的异步加载与原子持久化。
 ///
 /// 全部方法均为 `&self` 异步调用，内部状态仅含目标路径与写锁，可在任务间以
@@ -562,6 +582,25 @@ impl ConfigManager {
     /// 应在返回值到手后调用 [`crate::autostart::synchronize_autostart`]
     /// （见模块文档与 `crate::main` 的装配示例）。
     pub async fn load(&self) -> Result<AppConfig, ConfigError> {
+        // v0.6.2（L16）：整文件读入前先校验大小上限——配置文件是本工具自己生成的
+        // TOML（数 KB 量级），异常巨大意味着配置目录被误配 / 磁盘异常；为其分配
+        // 数百 MB 内存既无意义也放大了错误的影响面。
+        const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
+        match fs::metadata(&self.file_path).await {
+            Ok(meta) if meta.len() > MAX_CONFIG_FILE_BYTES => {
+                return Err(ConfigError::Io {
+                    path: self.file_path.clone(),
+                    source: std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "配置文件过大（{} 字节 > {MAX_CONFIG_FILE_BYTES} 上限），拒绝整读",
+                            meta.len()
+                        ),
+                    ),
+                });
+            }
+            _ => {}
+        }
         match fs::read_to_string(&self.file_path).await {
             Ok(content) => toml::from_str(&content).map_err(|source| ConfigError::Parse {
                 path: self.file_path.clone(),
@@ -584,6 +623,96 @@ impl ConfigManager {
                 path: self.file_path.clone(),
                 source,
             }),
+        }
+    }
+
+    /// 带**自愈**的配置加载（v0.6.1 · M1）：装配层（`main`）的推荐入口。
+    ///
+    /// # 为什么需要它
+    /// 旧行为是「配置文件解析失败 → `main` 直接 `return Err` 退出」。release 构建
+    /// 无控制台，用户只看到「双击程序没反应」，且没有任何应用内手段修复——必须手工
+    /// 定位并删掉配置文件。一个手改坏了的 TOML 不该让整个工具不可用。
+    ///
+    /// # 自愈语义
+    ///
+    /// 1. 正常路径与 [`Self::load`] 完全一致（含首次运行落盘默认配置）；
+    /// 2. 命中 [`ConfigError::Parse`]（文件**存在**但内容非法）时：
+    ///    1. 先把原文件**备份**为 `<原文件>.bak.<yyyyMMdd-HHmmss>`（先 `rename`，
+    ///       失败退回 `copy`）——原内容一字不丢；
+    ///    2. 以 [`AppConfig::default`] 落盘并继续启动；
+    ///    3. 返回 [`ConfigLoad::recovery`] 供装配层写审计 + 弹 Toast 告知用户；
+    /// 3. 仅当「连坏文件都无法备份」时才返回 `Err` 终止启动——此时若继续走到
+    ///    任何 `save`，原子替换会直接覆盖用户内容，等于静默销毁数据；
+    /// 4. 其他 IO 错误（磁盘故障等）原样上抛，不做掩盖。
+    pub async fn load_or_recover(&self) -> Result<ConfigLoad, ConfigError> {
+        match self.load().await {
+            Ok(config) => Ok(ConfigLoad {
+                config,
+                recovery: None,
+            }),
+            Err(ConfigError::Parse { source, .. }) => self.recover_from_parse_error(&source).await,
+            Err(err) => Err(err),
+        }
+    }
+
+    /// 解析失败后的自愈主体：备份坏文件 → 落盘默认配置 → 返回自愈记录。
+    async fn recover_from_parse_error(
+        &self,
+        source: &toml::de::Error,
+    ) -> Result<ConfigLoad, ConfigError> {
+        let backup_path = self.backup_path();
+        let reason = source.to_string();
+
+        // 1) 备份原文件：优先 rename（同目录、原子、零拷贝）；目标已存在（同一秒内
+        //    二次自愈）或跨设备失败时退回 copy（覆盖式写入）。
+        if let Err(rename_err) = fs::rename(&self.file_path, &backup_path).await {
+            if let Err(copy_err) = fs::copy(&self.file_path, &backup_path).await {
+                return Err(ConfigError::Io {
+                    path: self.file_path.clone(),
+                    source: std::io::Error::new(
+                        copy_err.kind(),
+                        format!(
+                            "配置文件 '{}' 解析失败且无法备份（rename: {rename_err}；copy: {copy_err}）——\
+                             为避免随后的写入销毁用户内容，本次终止启动",
+                            self.file_path.display()
+                        ),
+                    ),
+                });
+            }
+        }
+
+        // 2) 落盘默认配置。落盘失败不阻断启动：内存默认值完全可用，等待后续某次
+        //    save 成功时再补写（与「首次运行引导」分支同一策略）。
+        let default_cfg = AppConfig::default();
+        if let Err(save_err) = self.save(&default_cfg).await {
+            tracing::warn!(
+                target: "config",
+                "配置自愈：默认配置落盘失败 '{}': {save_err}（本次以内存默认值运行）",
+                self.file_path.display()
+            );
+        }
+
+        Ok(ConfigLoad {
+            config: default_cfg,
+            recovery: Some(ConfigRecovery {
+                backup_path,
+                reason,
+            }),
+        })
+    }
+
+    /// 损坏配置的备份路径：`<原文件>.bak.<本地时间 yyyyMMdd-HHmmss>`。
+    fn backup_path(&self) -> PathBuf {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let mut name = self
+            .file_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "tltoolbox.toml".to_string());
+        name.push_str(&format!(".bak.{stamp}"));
+        match self.file_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+            _ => PathBuf::from(name),
         }
     }
 
@@ -1007,6 +1136,101 @@ mod tests {
         assert_eq!(after, original, "解析失败时不得改动用户文件");
 
         remove_if_exists(&path).await;
+    }
+
+    // ---- M1：配置自愈（v0.6.1 整改） ----
+
+    /// 核心契约：坏配置 → **备份原文件 + 回落默认值 + 返回自愈记录**，绝不阻断启动。
+    #[tokio::test]
+    async fn load_or_recover_backs_up_broken_config_and_falls_back_to_defaults() {
+        let path = temp_cfg_path("recover");
+        remove_if_exists(&path).await;
+        let broken = "这不是合法 TOML = [\n";
+        fs::write(&path, broken).await.unwrap();
+
+        let mgr = ConfigManager::new(&path);
+        let loaded = mgr
+            .load_or_recover()
+            .await
+            .expect("坏配置不得阻断启动（应自愈）");
+
+        // 1) 生效配置 = 默认值（可继续启动）。
+        assert_eq!(loaded.config, AppConfig::default(), "应回落内存默认值");
+
+        // 2) 自愈记录存在且指向真实备份文件。
+        let recovery = loaded.recovery.expect("应带自愈记录");
+        assert!(
+            recovery.backup_path.exists(),
+            "备份文件应真实落盘: {}",
+            recovery.backup_path.display()
+        );
+        assert!(!recovery.reason.is_empty(), "应携带可读的失败原因");
+
+        // 3) 用户内容**一字不丢**（这是自愈的前提）。
+        let backed_up = fs::read_to_string(&recovery.backup_path).await.unwrap();
+        assert_eq!(backed_up, broken, "备份内容必须与原始坏的配置逐字节一致");
+
+        // 4) 目标路径已被默认配置重新落盘（可正常读写）。
+        let reloaded = mgr.load().await.expect("自愈后应可正常加载");
+        assert_eq!(reloaded, AppConfig::default());
+
+        // 5) 备份路径命名符合约定（同目录 + `<原文件名>.bak.<时间戳>`）。
+        let original_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let backup_name = recovery
+            .backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            backup_name.starts_with(&format!("{original_name}.bak.")),
+            "备份命名应=<原文件名>.bak.<时间戳>，实际: {backup_name}"
+        );
+        // 时间戳段非空（形如 20260910-233328）。
+        let stamp = backup_name
+            .rsplit_once(".bak.")
+            .map(|(_, stamp)| stamp)
+            .unwrap_or_default();
+        assert!(
+            stamp.len() == 15 && stamp.as_bytes()[8] == b'-',
+            "时间戳段应为 yyyyMMdd-HHmmss 形态，实际: {stamp}"
+        );
+
+        remove_if_exists(&path).await;
+        remove_if_exists(&recovery.backup_path).await;
+    }
+
+    /// 正常路径不得产生自愈记录（`recovery` 必须为 `None`）。
+    #[tokio::test]
+    async fn load_or_recover_reports_nothing_for_healthy_config() {
+        let path = temp_cfg_path("healthy");
+        remove_if_exists(&path).await;
+
+        let mgr = ConfigManager::new(&path);
+        let loaded = mgr.load_or_recover().await.expect("正常加载应成功");
+        assert!(loaded.recovery.is_none(), "健康配置不应产生自愈记录");
+        assert_eq!(loaded.config, AppConfig::default());
+
+        remove_if_exists(&path).await;
+    }
+
+    /// 备份路径必须落在同目录且带时间戳后缀（含秒级时间戳，可多次自愈不互相覆盖）。
+    #[test]
+    fn backup_path_is_sibling_with_timestamp_suffix() {
+        let base = std::env::temp_dir()
+            .join("tltoolbox-bk")
+            .join("tltoolbox.toml");
+        let mgr = ConfigManager::new(&base);
+        let backup = mgr.backup_path();
+
+        assert_eq!(
+            backup.parent(),
+            base.parent(),
+            "备份必须与原文件同目录（保证 rename 原子且用户易寻）"
+        );
+        let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("tltoolbox.toml.bak."), "命名: {name}");
+        assert_ne!(backup, base, "备份路径不得与原文件相同");
     }
 
     #[tokio::test]

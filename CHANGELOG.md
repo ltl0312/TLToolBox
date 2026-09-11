@@ -11,7 +11,109 @@
 
 ## [Unreleased]
 
-（当前无未发布变更。）
+### Fixed
+
+- **M5 · 监听表扫描偶发失败（`port_hunter/scanner`）**：TCP / UDP 二段式枚举收敛为
+  `enumerate_table` 通用骨架，对 `ERROR_INSUFFICIENT_BUFFER` 循环重试（上限 5 次、
+  每次按 API 回填尺寸重新分配），消除连接频繁变动时"扫描无结果"；
+- **M8 · 更新请求边界（`update`）**：响应体读取加 1 MiB 上限（超限中止并按"无法获取
+  版本信息"处理，杜绝内存无界增长）；请求设置 `WINHTTP_OPTION_REDIRECT_POLICY_NEVER`
+  收紧信任边界（联网回归实测通过）；
+- **M10 · 卸载失败残留（`terminal_logger`）**：卸载自动重试（3 次 × 150ms）；
+  新增 `needs_repair` / `last_stop_error` 残留可见；新增 `force_cleanup_hooks` 强制清理
+  入口并接入终端设置弹窗按钮；`set_all_modules` 与收尾路径的失败补写审计；
+- **M3 · 弹窗黑名单匹配过宽 / 漏拦（`popup_blocker`）**：关键词支持 `exact:` / `prefix:` /
+  `word:`（ASCII 词边界）显式收窄前缀（无前缀保持既有子串语义，旧配置零迁移）；
+  标题 / 类名改动态缓冲（4096 字符封顶），超长标题尾部关键词不再漏拦；
+- **M4② · 置顶 stop 超时双钩子（`topmost_manager`）**：泵线程未按期退出时保持
+  「停止未完成」并放回运行句柄，不再错误置 `running = false` 导致重复装钩；
+- **P2-12 · 图标锁拓扑指纹生效（`icon_locker`）**：自动还原前校验方案拓扑指纹与当前
+  拓扑一致性，不匹配即跳过 + Toast，修复"旧坐标刷到不同桌面、误移动用户图标"；
+- **L 级项全量（18 项）**：GDI 位图先还原再删除（L1，截图 / 托盘两处）、文件夹选择改用
+  `SHGetPathFromIDListEx` 支持长路径（L3）、审计日志句柄复用（L4）、终端日志钩子安装 /
+  卸载 IO 移出 Tokio 工作线程（L6）、cmd 会话日志名追加熵段防碰撞（L7）、自身窗口按 PID
+  精确识别（L8）、优先级记忆键大小写不敏感（L9）、规则持久化失败告警（L10）、恢复匹配
+  反向子串收紧为前缀关系（L11）、原生表行数按缓冲长度封顶（L12）、扫描身份查询按 PID
+  复用（L13）、剪贴板溢出 `.expect` 结构化降级（L14）、剪贴板格式注册失败告警（L15）、
+  配置整读大小上限 + 自启注册表 `REG_SZ` 类型校验（L16）、窗口类 atom 成对注销（L17）、
+  图标显示名缓冲扩容 + 触顶跳过（L18）；L2 / L5 按审计给出的替代方案以文档固化取舍。
+- **S3 · 端口终止的 PID 复用 TOCTOU（`port_hunter`）**：`kill_process_and_release_port`
+  在系统关键进程闸门之后追加**两道新鲜度核验**——① 实时镜像名与扫描缓存名比对，
+  不一致即判 PID 已被复用；② 重新枚举监听表确认该 PID 此刻仍持有该端口。任一不过即
+  `Err(StaleTarget)` 并**不发起终止**，提示「请刷新列表后重试」；
+- **M9 · 长路径下进程身份退化 + 非 UIPI 失败静默（`port_hunter`）**：
+  `query_process_identity` 的镜像路径缓冲由固定 1024 宽字符改为按
+  `ERROR_INSUFFICIENT_BUFFER` 扩容重试（上限 32768）；`kill_process_with_events`
+  对非 UIPI 失败补 `warn` 日志，消除"失败静默"；
+- **S6 · 提权重启后单实例守护空窗（`single_instance`）**：新增
+  `acquire_after_handoff`——交接期以 100ms 退避**持续询位**（不广播唤醒消息），直到旧实例
+  释放互斥后**重新持有**守卫，单实例保证全程连续；超时（15s）才降级并如实告警。此前该分支
+  降级为无守卫，提权执行期间可并存多实例（托盘双图标、钩子重复注册、日志跨进程竞争）；
+- **M2 · 日志二次初始化 panic（`logging`）**：三处全局订阅者装配点由 `init()` 改为
+  `try_init()`，重复装配降级为可观测告警 + 保留既有订阅者，不再把"日志配置问题"升级为
+  进程崩溃；
+- **M1 · 配置损坏导致应用无法启动（`config` / `main`）**：新增
+  `ConfigManager::load_or_recover`——解析失败时先把原文件备份为
+  `<原文件名>.bak.<yyyyMMdd-HHmmss>`（rename 失败退回 copy，内容一字不丢），再以默认配置
+  继续启动，并写 `[配置自愈]` 审计 + Toast 告知备份位置；仅当连备份都失败才终止启动；
+- **M4① · 置顶窗口"用户手动取消"后被自动置回（`topmost_manager`）**：新增
+  `engine::is_topmost`（读 `WS_EX_TOPMOST`）与 `sweep_user_unpinned` 对账——纠偏路径
+  **前置对账** + 8s 兜底周期计时器，发现用户已取消即移除受管条目并持久化规则，
+  消除「用户关不掉置顶」与「UI 状态撒谎」；
+- **M6 · bash 日志路径含 `!` 导致会话日志静默失效（`terminal_logger`）**：
+  `bash_transcript_payload` 硬拒绝 `!` / 换行 / NUL（`TerminalHookError::InvalidLogBase`），
+  在写入任何目标文件之前中止；与 `cmd.rs` 对 `%` / `!` 的策略对齐，三端一致；
+- **M7 · 终端日志清理范围过宽、存在误删用户数据风险（`terminal_logger/retention`）**：
+  从"递归删任意 `.log`"收敛为三道白名单——目录范围（根 + `powershell`/`bash`/`cmd`，
+  深度上限 1）、文件名形态（`<yyyy-MM-dd_HH-mm-ss>_…` 或 `cmd_…`）、仅普通文件。
+  用户自建目录 / 深层嵌套 / 根目录内非受管命名一律不触碰。
+
+**同批次 P0（S1 / S2 / S4 / S5）**
+
+- **S1 · 检查更新永久失效（`update`）**：`WinHttpQueryHeaders` 补 `WINHTTP_QUERY_FLAG_NUMBER`
+  ——缺失该标志位时 WinHttp 按 ASCII 字符串写回状态码，`"200"` 被小端误读为 `3158066`，
+  导致 `Some(200)` 永不命中、检查更新 100% 不可用；
+- **S1-b · 更新请求根本发不出去（`update`）**：`WinHttpSendRequest` 的头块切片此前带
+  NUL 终止符，WinHttp 判定 `dwHeadersLength` 区间内出现 NUL 直接返回 `E_INVALIDARG`
+  （`0x80070057`）。现统一剥离终止符（本缺陷为整改实测新发现，与 S1 叠加存在）；
+- **S2 · 一键释放端口可终止系统关键进程**：`kill_process_and_release_port` 入口新增
+  **无条件系统关键进程闸门**（内核态 PID ≤ 4 / 系统服务镜像 / 系统保留端口），命中即
+  `Err(ProtectedProcess)` 且**永不触碰**终止 API；判定与「显示系统服务」选项彻底解耦，
+  镜像名取终止时刻实时查询结果。UI 侧受保护行不再渲染释放按钮（降级为「系统进程」标签）；
+- **S4 · 图标锁守护线程创建失败导致停机永久挂死**：`CreateWindowExW` 失败即经就绪通道
+  回传错误并返回（不进入消息泵），`spawn` 向上返回 `Err` 而非静默降级为「运行中」；
+  `Drop` 改为**带 2s 超时的 join**，`stop()` 不再可能永久阻塞 Tokio worker 与应用收尾；
+- **S5 · FFI 回调缺少 panic 边界**：新增 `src/ffi_guard.rs`（`guard_ffi`），为 5 处
+  `extern "system"` 回调入口统一包裹 `catch_unwind`——此前回调内任意 panic 都会跨 FFI
+  展开直接 abort 整个常驻进程（托盘、钩子、监听全部瞬失且无任何反馈）。托盘消息泵
+  单轮迭代亦整体入界，覆盖 muda / tray-icon 的第三方窗口过程。
+
+### Added
+
+- **P2 · 线程铁律类型化（`thread_rules`）**：新增 `UiThreadToken`（UI 线程唯一令牌，
+  main 装配期领取）与 `UiDeliver<T>`（凭令牌构造的 UI 交付通道），铁律①获得构造期守卫；
+- **P2 · UI 拆分第一步**：`Theme` 主题令牌与 6 个共享控件外移至 `ui/theme.slint` /
+  `ui/components.slint`，`app.slint` 3158 → 2860 行；
+- **P2 · 原生测试 46 项**（293 → 318）：覆盖监听表解析与畸形表、弹窗匹配模式、
+  更新上限 / 策略守卫、终端日志钩子清理与重试、图标锁指纹校验、模块 50 轮启停压测等；
+- **CI 质量闸门（`.github/workflows/release.yml`）**：新增 `cargo fmt --all -- --check`
+  与 `cargo clippy --all-targets -- -D warnings`，先于测试与编译执行、失败即终止流水线；
+  工具链步骤补 `rustfmt` / `clippy` 组件。本仓库 clippy 长期零告警，闸门即时成本为零；
+- **P1 回归测试 21 项**（272 → 293）：覆盖 PID 复用判定、端口持有者重枚举、提权互斥交接、
+  配置自愈、用户取消置顶判定与真实窗口 `WS_EX_TOPMOST` 读取、bash `!` 拒绝、清理范围越界
+  保留等；
+- **可测性重构（`update`）**：`interpret_response` 纯函数抽出，WinHttp 管线收敛为单一
+  `run_pipeline`，新增 2 条 `#[ignore]` 联网回归测试（`cargo test -- --ignored` 手动触发）
+  与 4 条离线回归守卫；`ffi_guard` 自身 4 个单测。
+
+### Docs
+
+- 新增 `docs/P2_FIX_REPORT_2026-09-11.md`：P2 五项进度（M5/M8/M10 + L 全量、指纹生效、
+  线程铁律类型化、UI 拆分第一步、原生测试）、§6.3 lint 评估结论与未完成事项；
+- 新增 `docs/P1_FIX_REPORT_2026-09-10.md`：P1 六项（S3 + M9、S6、M2 + M1、M4①、M6 + M7、
+  CI 闸门）逐项整改记录、验证证据，以及尚未完成的 P2 子项清单与进度；
+- 新增 `docs/P0_FIX_REPORT_2026-09-10.md`：逐项记录 P0（S1 / S2 / S4 / S5）的整改内容、
+  验证证据与未闭环项（其中 S3 已在本次 P1 迭代闭环）。
 
 ## [0.6.0] - 2026-09-10
 

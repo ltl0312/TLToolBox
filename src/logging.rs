@@ -155,10 +155,15 @@ pub fn init_in_dir(directory: &Path) -> LoggingGuard {
 
 /// 在指定目录装配日志订阅者（内部实现；`init()` 指向默认 exe 锚定目录）。
 ///
-/// # 全局单例约束
-/// 底层调用 `tracing_subscriber` 的全局 `init()`，同一进程内重复调用会 panic。
-/// 本函数仅供 `main()` 入口调用一次；测试如需驱动完整链路，必须在测试进程中
-/// 保持“只初始化一次”的纪律（见 `tests` 中的说明）。
+/// # 全局单例约束与降级（v0.6.1 · M2 整改）
+/// 底层 `tracing_subscriber` 的全局 `set_global_default` **第二次调用即 panic**。
+/// 旧实现使用 `SubscriberInitExt::init()`（失败即 panic），仅靠文档口头约定
+/// 「只调用一次」——`main` 当前两处调用（正常路径 / 配置失败兜底）互斥，逻辑上成立
+/// 但极其脆弱：任何未来的重复装配都会把"日志配置问题"升级为"进程崩溃"。
+///
+/// 现统一改用 `try_init()`：重复装配成为一种**可观测的降级**——告警留痕后返回
+/// 不含文件写线程的 guard（`is_file_logging_active()` 为 `false`），已安装的
+/// 订阅者继续生效，进程照常启动。
 fn init_to(directory: &Path) -> LoggingGuard {
     match build_file_writer(directory) {
         Ok((non_blocking, worker_guard)) => {
@@ -182,7 +187,14 @@ fn init_to(directory: &Path) -> LoggingGuard {
                 subscriber.with(console_layer)
             };
 
-            subscriber.init();
+            // try_init：重复装配不再 panic（M2）——降级为"保留既有订阅者"。
+            if let Err(err) = subscriber.try_init() {
+                eprintln!(
+                    "[tltoolbox] 日志订阅者装配失败（全局订阅者已存在？），本次降级为沿用既有日志装配: {err}"
+                );
+                // worker_guard 在此析构：非阻塞写线程收尾刷盘后退出，不留悬挂线程。
+                return LoggingGuard { _worker: None };
+            }
             LoggingGuard {
                 _worker: Some(worker_guard),
             }
@@ -204,11 +216,28 @@ fn init_to(directory: &Path) -> LoggingGuard {
                 let console_layer = fmt::layer()
                     .with_writer(io::stdout)
                     .with_filter(LevelFilter::from_level(CONSOLE_MAX_LEVEL));
-                tracing_subscriber::registry().with(console_layer).init();
+                // 同样用 try_init：兜底路径也不得因"已有订阅者"而 panic（M2）。
+                if let Err(init_err) = tracing_subscriber::registry()
+                    .with(console_layer)
+                    .try_init()
+                {
+                    eprintln!(
+                        "[tltoolbox] 控制台日志兜底装配失败（全局订阅者已存在？）: {init_err}"
+                    );
+                }
             }
             LoggingGuard { _worker: None }
         }
     }
+}
+
+/// 以追加模式打开审计日志文件（句柄复用的自愈路径，v0.6.2 · L4）。
+fn open_append(file_path: &Path) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file_path)
+        .ok()
 }
 
 /// 构建「非阻塞写线程 → 按天滚动文件」写出管线。
@@ -217,6 +246,11 @@ fn init_to(directory: &Path) -> LoggingGuard {
 /// `filename_prefix`/`filename_suffix` → `tltoolbox.<YYYY-MM-DD>.log`；
 /// `max_log_files` 提供滚动期自动清理）。文件层接入 `NonBlocking` 专用写线程，
 /// 返回其 [`WorkerGuard`] 供进程退出刷盘。
+///
+/// v0.6.2（L5 说明）：**刻意不**在文件名中追加 PID——审计报告指出该仅存的
+/// 跨进程写入风险由「提权重启交接期无互斥空窗」（S6，已在 v0.6.1 修复）激活；
+/// 单实例保证恢复连续后，同一日志文件恒只有一个进程写入。保持稳定文件名使
+/// 用户脚本与排障流程（如 `logs/tltoolbox.<date>.log`）不被破坏。
 fn build_file_writer(directory: &Path) -> io::Result<(NonBlocking, WorkerGuard)> {
     // 1) 目录预检：不可创建（父级只读 / 路径被文件占用等）→ 立即返回可读错误。
     std::fs::create_dir_all(directory).map_err(|source| {
@@ -290,18 +324,28 @@ impl AuditSink {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             let mut reported = false;
+            // v0.6.2（L4）：**复用文件句柄**——旧实现每条记录都重新 `open` 一次，
+            // 高频操作（模块启停、端口释放）会把一次写入放大成两次系统调用，且
+            // 关闭时机不受控。现持有句柄到落盘任务退出；失败（文件被外部删除 /
+            // 锁定）时重开一次，兼顾"句柄失效自愈"。
+            let mut file: Option<std::fs::File> = open_append(&file_path);
             while let Some(line) = rx.recv().await {
                 let text = line + "\n";
-                let write_result = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&file_path)
-                    .and_then(|mut file| {
-                        use std::io::Write;
-                        file.write_all(text.as_bytes())
-                    });
+                // 无句柄（首次 / 上次写入失败自愈）时重开一次再写。
+                use std::io::Write as _;
+                let write_result = match file.as_mut() {
+                    Some(handle) => handle.write_all(text.as_bytes()),
+                    None => {
+                        file = open_append(&file_path);
+                        match file.as_mut() {
+                            Some(handle) => handle.write_all(text.as_bytes()),
+                            None => Err(io::Error::other("无法重新打开审计日志文件")),
+                        }
+                    }
+                };
                 if let Err(err) = write_result {
-                    // 首次失败告警一次即可（后续持续失败不刷屏）。
+                    // 写入失败：丢弃句柄强制下一条重开（自愈），并告警一次。
+                    file = None;
                     if !reported {
                         reported = true;
                         tracing::warn!(

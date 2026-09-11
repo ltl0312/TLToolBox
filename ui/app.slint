@@ -66,6 +66,8 @@
 // 注：随双栏日志控制台退役，LogEntry 已从本文件移除；运行日志改由 tracing 承载。
 
 import { Switch, ScrollView, VerticalBox, HorizontalBox, LineEdit, CheckBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { GhostButton, ElevateButton, AdminBadge, GhostIconButton, PrimaryButton, TextButton } from "components.slint";
 
 // —— 模块列表条目：与调度层 ModuleMeta 一一对应 ——
 export struct ModuleItem {
@@ -128,6 +130,11 @@ export struct PortEntryItem {
     process_name: string,
     // 可执行文件绝对路径（悬停提示展示；失败为空串）
     process_path: string,
+    // 是否命中「系统关键进程保护清单」（v0.6.1 · S2）：
+    // 内核态 PID ≤ 4 / 系统服务镜像 / 系统保留端口 → true。
+    // 为 true 时该行**不可释放**（按钮降级为「系统进程」静态标签），
+    // 与终止入口的闸门判定同源（scanner::is_system_service_entry）。
+    protected: bool,
 }
 
 // —— 桌面图标布局锁方案行（与 icon_locker::IconLayoutProfile 对应） ——
@@ -142,268 +149,7 @@ export struct IconLockerProfileItem {
     fingerprint: string,
 }
 
-// —— 全局暗色主题令牌（zinc 底 + 翡翠强调；统一取色，避免魔法数字散落） ——
-export global Theme {
-    in-out property <color> window-bg: #18181b;       // 窗口底
-    in-out property <color> card-bg: #27272a;         // 卡片底
-    in-out property <color> card-bg-hover: #2e2e33;   // 卡片悬停底
-    in-out property <color> card-border: #34343a;     // 卡片描边
-    in-out property <color> card-border-hover: #4c4c55;
-    in-out property <color> divider: #26262b;         // 顶栏分隔线
-    in-out property <color> text-strong: #ffffff;     // 标题 / 模块名
-    in-out property <color> text-primary: #e4e4e7;    // 一般正文
-    in-out property <color> text-secondary: #a1a1aa;  // 描述
-    in-out property <color> text-muted: #71717a;      // 弱化辅助文字
-    in-out property <color> accent-strong: #34d399;   // 强调（运行态文字）
-    in-out property <color> running-dot: #4ade80;     // 运行中绿点
-    in-out property <color> stopped-dot: #52525b;     // 已停止灰点
-    in-out property <color> tool-dot: #71717a;        // 即开即用工具中性点（v0.5.0）
-    in-out property <color> pill-bg: #10b9811a;       // 版本徽标底
-    in-out property <color> pill-border: #10b98140;
-    in-out property <color> pill-text: #6ee7b7;
-    in-out property <color> btn-bg: #1d1d21;          // 轻量按钮底
-    in-out property <color> btn-bg-hover: #26262b;
-    in-out property <color> btn-bg-pressed: #323238;
-    in-out property <color> btn-border: #3f3f46;
-    in-out property <color> btn-border-hover: #62626b;
 
-    // —— 管理员徽标 / 提权盾牌按钮（UIPI 突围入口）专用令牌 ——
-    in-out property <color> admin-badge-bg: #10b98121;        // 管理员徽标底（翡翠淡底）
-    in-out property <color> admin-badge-border: #10b98159;    // 管理员徽标描边
-    in-out property <color> admin-badge-text: #6ee7b7;        // 管理员徽标文字（翡翠色）
-    in-out property <color> elevate-bg: #f59e0b1f;            // 盾牌按钮底（琥珀淡底，醒目）
-    in-out property <color> elevate-bg-hover: #f59e0b38;
-    in-out property <color> elevate-bg-pressed: #f59e0b52;
-    in-out property <color> elevate-border: #f59e0b80;
-    in-out property <color> elevate-border-hover: #fbbf24b3;
-    in-out property <color> elevate-icon: #fbbf24;            // 盾牌图形着色（琥珀金）
-
-    // —— 规则管理弹窗专用令牌 ——
-    in-out property <color> overlay-scrim: #0b0b0ecc;    // 遮罩半透明黑
-    in-out property <color> dialog-bg: #202024;          // 弹窗卡片底
-    in-out property <color> dialog-border: #3f3f46;      // 弹窗卡片描边
-    in-out property <color> row-bg-hover: #2b2b30;       // 规则行悬停底
-    in-out property <color> danger: #f87171;             // 删除红
-    in-out property <color> danger-hover-bg: #f8717126;
-    in-out property <color> danger-pressed-bg: #f8717140;
-    in-out property <color> accent-bg: #10b981;          // 「添加」实底按钮
-    in-out property <color> accent-bg-hover: #34d399;
-    in-out property <color> accent-bg-pressed: #059669;
-    in-out property <color> accent-fg: #06281a;          // 实底按钮上的文字
-    in-out property <color> accent-bg-disabled: #10b98133;
-    in-out property <color> accent-fg-disabled: #a1a1aa;
-
-    // —— Toast 轻量操作反馈专用令牌 ——
-    in-out property <color> toast-bg: #27272ae6;    // 胶囊底：zinc-800(#27272a) 派生，~90% 不透明（浮于内容上轻微透底）
-    in-out property <color> toast-border: #3f3f46;  // 胶囊细描边
-    in-out property <color> toast-text: #ffffff;    // 胶囊正文（纯白）
-
-    // —— 关于 / 设置 / 留痕区专用令牌 ——
-    in-out property <color> link-text: #6ee7b7;          // 可点击链接文字（翡翠）
-    in-out property <color> link-bg-hover: #10b98126;    // 链接悬停底
-    in-out property <color> update-badge-bg: #fbbf2426;  // “发现新版本”徽标底（琥珀淡底）
-    in-out property <color> update-badge-border: #fbbf2480;
-    in-out property <color> update-badge-text: #fcd34d;  // 琥珀强调文字
-
-    // —— 全局窗口置顶弹窗 · 模块停用警示条（v0.4.1）专用令牌 ——
-    // 模块主开关处于「已停止」时，弹窗顶部渲染琥珀警示条 + 列表控件全部禁用
-    //（Switch / 优先级步进器 enabled: false，禁止无效操作）。
-    in-out property <color> warn-bar-bg: #f59e0b1a;       // 警示条底（琥珀淡底）
-    in-out property <color> warn-bar-border: #f59e0b80;   // 警示条描边
-    in-out property <color> warn-bar-text: #fcd34d;       // 警示条文字（琥珀强调）
-}
-
-// —— 轻量操作按钮：全部启用 / 全部停用 / 关于 / 设置（幽灵样式，低打扰） ——
-component GhostButton inherits Rectangle {
-    in property <string> text: "";
-    in property <length> button-width: 76px;
-    callback clicked;
-
-    width: root.button-width;
-    height: 26px;
-    border-radius: 7px;
-    border-width: 1px;
-    background: Theme.btn-bg;
-    border-color: Theme.btn-border;
-
-    states [
-        hover when ghost-touch.has-hover && !ghost-touch.pressed : {
-            background: Theme.btn-bg-hover;
-            border-color: Theme.btn-border-hover;
-        }
-        pressed when ghost-touch.pressed : {
-            background: Theme.btn-bg-pressed;
-            border-color: Theme.btn-border-hover;
-        }
-    ]
-    animate background, border-color { duration: 100ms; }
-
-    Text {
-        text: root.text;
-        font-size: 12px;
-        font-weight: 600;
-        color: Theme.text-primary;
-        width: parent.width;
-        height: parent.height;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    ghost-touch := TouchArea {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        clicked => { root.clicked(); }
-    }
-}
-
-// —— 提权盾牌按钮：标题旁的醒目提权入口（仅未提权形态渲染） ——
-// 琥珀金描边 + 淡琥珀底，与全界面锌灰/翡翠基调刻意区分——它在视觉上宣告
-// “当前运行权限受限，点击可一键提权重启以突破 UIPI 弹窗拦截限制”。
-component ElevateButton inherits Rectangle {
-    callback clicked;
-
-    width: 28px;
-    height: 26px;
-    border-radius: 8px;
-    background: Theme.elevate-bg;
-    border-width: 1px;
-    border-color: Theme.elevate-border;
-
-    states [
-        hover when elevate-touch.has-hover && !elevate-touch.pressed : {
-            background: Theme.elevate-bg-hover;
-            border-color: Theme.elevate-border-hover;
-        }
-        pressed when elevate-touch.pressed : {
-            background: Theme.elevate-bg-pressed;
-            border-color: Theme.elevate-border-hover;
-        }
-    ]
-    animate background, border-color { duration: 100ms; }
-
-    Image {
-        source: @image-url("icons/shield.svg");
-        colorize: Theme.elevate-icon;
-        width: 15px;
-        height: 15px;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-    }
-    elevate-touch := TouchArea {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        clicked => { root.clicked(); }
-    }
-}
-
-// —— 管理员徽标：标题 / 版本旁的翡翠色小徽标（仅已提权形态渲染） ——
-// 与版本号徽标同高同族的“翡翠胶囊”；存在即向用户确认“当前实例已以管理员权限
-// 运行，弹窗拦截已突破 UIPI 限制”，同时提权按钮 / 托盘提权菜单随之隐藏。
-component AdminBadge inherits Rectangle {
-    width: 104px;
-    height: 20px;
-    border-radius: 10px;
-    background: Theme.admin-badge-bg;
-    border-width: 1px;
-    border-color: Theme.admin-badge-border;
-
-    Text {
-        text: "管理员 (Admin)";
-        font-size: 10px;
-        font-weight: 600;
-        color: Theme.admin-badge-text;
-        width: parent.width;
-        height: parent.height;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-}
-
-// —— 轻量图标按钮：模块齿轮入口 / 弹窗右上角关闭（透明底 + 悬停微亮） ——
-component GhostIconButton inherits Rectangle {
-    in property <image> icon;
-    in property <color> icon-color: Theme.text-secondary;
-    in property <length> icon-size: 15px;
-    callback clicked;
-
-    width: 26px;
-    height: 26px;
-    border-radius: 7px;
-    background: transparent;
-
-    states [
-        hover when icon-touch.has-hover && !icon-touch.pressed : {
-            background: Theme.btn-bg-hover;
-        }
-        pressed when icon-touch.pressed : {
-            background: Theme.btn-bg-pressed;
-        }
-    ]
-    animate background { duration: 100ms; }
-
-    Image {
-        source: root.icon;
-        colorize: root.icon-color;
-        width: root.icon-size;
-        height: root.icon-size;
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-    }
-    icon-touch := TouchArea {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        clicked => { root.clicked(); }
-    }
-}
-
-// —— 实底主按钮：「添加」规则（空输入时禁用态） ——
-component PrimaryButton inherits Rectangle {
-    in property <string> text: "";
-    in property <bool> enabled: true;
-    callback clicked;
-
-    width: 92px;
-    height: 32px;
-    border-radius: 8px;
-    background: Theme.accent-bg;
-
-    states [
-        disabled when !root.enabled : {
-            background: Theme.accent-bg-disabled;
-        }
-        hover when root.enabled && touch.has-hover && !touch.pressed : {
-            background: Theme.accent-bg-hover;
-        }
-        pressed when root.enabled && touch.pressed : {
-            background: Theme.accent-bg-pressed;
-        }
-    ]
-    animate background { duration: 100ms; }
-
-    Text {
-        text: root.text;
-        font-size: 12px;
-        font-weight: 700;
-        color: root.enabled ? Theme.accent-fg : Theme.accent-fg-disabled;
-        width: parent.width;
-        height: parent.height;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    touch := TouchArea {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        enabled: root.enabled;
-        clicked => { root.clicked(); }
-    }
-}
 
 // —— 模块卡片：名称 / 描述 / 状态徽标 / 设置齿轮（可选）/ 物理开关（可选） ——
 component ModuleCard inherits Rectangle {
@@ -616,52 +362,6 @@ component RuleRow inherits Rectangle {
     }
 }
 
-// —— 通用文本按钮：幽灵底 / 实底强调两态（存储管理、全局设置、关于弹窗复用） ——
-component TextButton inherits Rectangle {
-    in property <string> text: "";
-    in property <bool> primary: false;
-    in property <length> button-width: 84px;
-    in property <length> button-height: 30px;
-    callback clicked;
-
-    width: root.button-width;
-    height: root.button-height;
-    border-radius: 7px;
-    background: root.primary ? Theme.accent-bg : Theme.btn-bg;
-    border-width: 1px;
-    border-color: root.primary ? Theme.accent-bg : Theme.btn-border;
-
-    states [
-        hover when btn-touch.has-hover && !btn-touch.pressed : {
-            background: root.primary ? Theme.accent-bg-hover : Theme.btn-bg-hover;
-            border-color: root.primary ? Theme.accent-bg-hover : Theme.btn-border-hover;
-        }
-        pressed when btn-touch.pressed : {
-            background: root.primary ? Theme.accent-bg-pressed : Theme.btn-bg-pressed;
-            border-color: root.primary ? Theme.accent-bg-pressed : Theme.btn-border-hover;
-        }
-    ]
-    animate background, border-color { duration: 100ms; }
-
-    Text {
-        text: root.text;
-        font-size: 11.5px;
-        font-weight: 600;
-        color: root.primary ? Theme.accent-fg : Theme.text-primary;
-        width: parent.width;
-        height: parent.height;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-    btn-touch := TouchArea {
-        x: 0;
-        y: 0;
-        width: parent.width;
-        height: parent.height;
-        clicked => { root.clicked(); }
-    }
-}
 
 // —— 弹窗拦截留痕行：文件名 / 标题 / 时间（点击选中预览） ——
 component CaptureRow inherits Rectangle {
@@ -1097,6 +797,9 @@ component TerminalSettingsModal inherits Rectangle {
     callback open-log-dir-requested;
     callback browse-dir-requested;
     callback reset-dir-requested;
+    // v0.6.2（M10）：强制清理终端日志钩子——卸载失败残留 / 外部注入的历史残留
+    // 的手动修复入口（幂等，对无残留者同样是空操作）。
+    callback force-cleanup-requested;
 
     // 半透明遮罩底：透明度随 show 渐变（入场淡入 / 关闭淡出）。根元素宽高在装配点
     // （MainWindow）以窗口尺寸显式给出，组件自身不绑定 `parent`。
@@ -1204,7 +907,7 @@ component TerminalSettingsModal inherits Rectangle {
             // 弹性占位：把主操作按钮沉底（内容不足时吸收剩余纵向空间）。
             Rectangle { vertical-stretch: 1; }
 
-            // —— 操作行：更改目录（原生文件夹选择）/ 恢复默认 / 资源管理器打开 ——
+            // —— 操作行：更改目录（原生文件夹选择）/ 恢复默认 / 强制清理 / 打开 ——
             HorizontalBox {
                 spacing: 10px;
                 alignment: center;
@@ -1218,6 +921,11 @@ component TerminalSettingsModal inherits Rectangle {
                     text: "恢复默认";
                     button-width: 84px;
                     clicked => { root.reset-dir-requested(); }
+                }
+                TextButton {
+                    text: "强制清理钩子";
+                    button-width: 112px;
+                    clicked => { root.force-cleanup-requested(); }
                 }
                 TextButton {
                     text: "在资源管理器中打开";
@@ -1734,8 +1442,39 @@ component PortHunterRow inherits Rectangle {
                 }
             }
 
-            // —— 右侧：一键释放 / 确认操作 ——
-            if !root.confirming : kill-button := Rectangle {
+            // —— 右侧：一键释放 / 系统进程（受保护，不可释放）/ 确认操作 ——
+            // S2 整改：命中系统关键进程清单的行**不渲染释放入口**——"可显示"
+            // 不等于"可终止"。终止入口自身另有同等闸门，此处只是把结果前置到 UI，
+            // 避免用户点了才知道被拒。
+            if !root.confirming && root.entry.protected : Rectangle {
+                width: 68px;
+                height: 26px;
+                border-radius: 7px;
+                background: Theme.pill-bg;
+                border-width: 1px;
+                border-color: Theme.pill-border;
+
+                Text {
+                    text: "系统进程";
+                    font-size: 10.5px;
+                    font-weight: 700;
+                    color: Theme.text-muted;
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+
+                Tooltip {
+                    Text {
+                        text: "系统关键进程受保护，本工具不提供终止入口";
+                        font-size: 10.5px;
+                        color: Theme.text-primary;
+                    }
+                }
+            }
+
+            if !root.confirming && !root.entry.protected : kill-button := Rectangle {
                 width: 68px;
                 height: 26px;
                 border-radius: 7px;
@@ -2790,6 +2529,8 @@ export component MainWindow inherits Window {
     callback open_module_settings(string);
     callback close_terminal_modal();
     callback open_log_dir_in_explorer();
+    // v0.6.2（M10）：强制清理终端日志钩子（残留修复入口）。
+    callback force_cleanup_terminal_hooks();
     callback close_rules_modal();
     callback add_rule(string);
     callback remove_rule(int);
@@ -2999,6 +2740,7 @@ export component MainWindow inherits Window {
         open-log-dir-requested => { root.open_log_dir_in_explorer(); }
         browse-dir-requested => { root.browse_setting_dir("terminal_log"); }
         reset-dir-requested => { root.reset_setting_dir("terminal_log"); }
+        force-cleanup-requested => { root.force_cleanup_terminal_hooks(); }
     }
 
     // ============================================================

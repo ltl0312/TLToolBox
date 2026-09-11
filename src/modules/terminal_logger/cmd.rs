@@ -353,7 +353,9 @@ set "TLTB_CMD_LOGGED=1"
 rem ---- session start: pick a fresh log file and write the session header ----
 set "TLTB_CMD_LOG_DIR=__LOG_ROOT__"
 if not exist "%TLTB_CMD_LOG_DIR%\" mkdir "%TLTB_CMD_LOG_DIR%" >nul 2>&1
-set "TLTB_CMD_LOG=%TLTB_CMD_LOG_DIR%\cmd_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%%TIME:~9,2%_%RANDOM%.log"
+rem v0.6.2 (L7): name = centisecond time + two RANDOM segments (cmd.exe has no
+rem PID env var); two segments reduce same-instant collision to ~1e-9.
+set "TLTB_CMD_LOG=%TLTB_CMD_LOG_DIR%\cmd_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%%TIME:~9,2%_%RANDOM%_%RANDOM%.log"
 >> "%TLTB_CMD_LOG%" echo # TLToolBox cmd session start: %DATE% %TIME%
 >> "%TLTB_CMD_LOG%" echo # user: "%USERDOMAIN%\%USERNAME%"  machine: "%COMPUTERNAME%"
 >> "%TLTB_CMD_LOG%" echo # cwd: "%CD%"

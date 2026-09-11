@@ -4,6 +4,12 @@ use crate::config::IconCoordinate;
 use std::collections::HashMap;
 use std::fmt;
 
+/// 桌面图标显示名缓冲容量（v0.6.2 · L18：宽字符数）。
+///
+/// 旧实现 512 字符：被截断的显示名会产生「保存键 ≠ 还原键」的不一致，个别图标
+/// 漏还原。1 Ki 字符远超任何真实图标名；仍触顶者显式跳过（见 `display_name`）。
+const DISPLAY_NAME_BUFFER_CHARS: usize = 1024;
+
 #[derive(Debug)]
 pub enum ExplorerError {
     Unsupported,
@@ -145,13 +151,27 @@ mod windows_impl {
                 "IShellFolder::GetDisplayNameOf",
                 folder.GetDisplayNameOf(child, SHGDNF(SIGDN_NORMALDISPLAY.0 as u32), &mut raw),
             )?;
-            let mut buffer = [0u16; 512];
+            // v0.6.2（L18）：缓冲由 512 扩至 [`DISPLAY_NAME_BUFFER_CHARS`]——显示名
+            // 被截断会产生"保存时一个键、还原时另一个键"的不一致，个别图标漏还原。
+            let mut buffer = [0u16; DISPLAY_NAME_BUFFER_CHARS];
             com_step(
                 "StrRetToBufW",
                 windows::Win32::UI::Shell::StrRetToBufW(&mut raw, Some(child), &mut buffer),
             )?;
             let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-            Ok(String::from_utf16_lossy(&buffer[..len]))
+            let name = String::from_utf16_lossy(&buffer[..len]);
+            if len >= DISPLAY_NAME_BUFFER_CHARS - 1 {
+                // 触顶即视为被截断：跳过该图标（保安全的降级），绝不用不完整名
+                // 当键——那会让还原阶段找不到匹配项或移错图标。
+                tracing::warn!(
+                    target: "icon_locker",
+                    "桌面图标显示名超过 {DISPLAY_NAME_BUFFER_CHARS} 字符被截断，本次跳过该图标"
+                );
+                return Err(ExplorerError::Com(
+                    "StrRetToBufW 显示名超长被截断，无法作为稳定键".to_string(),
+                ));
+            }
+            Ok(name)
         }
     }
 

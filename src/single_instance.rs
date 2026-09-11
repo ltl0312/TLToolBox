@@ -28,6 +28,21 @@
 //! 第二实例检测成功后**必须立即退出**——若它也持有同名句柄，互斥将因“仍有打开
 //! 句柄”而失效（这正是第二实例在获取句柄后立即 `CloseHandle` 的原因）。
 //!
+//! # 提权交接期（v0.6.1 · S6 整改）
+//!
+//! 提权重启由旧实例经 `ShellExecuteW("runas")` 拉起新实例，而旧实例尚持有互斥、
+//! 要等平滑收尾才释放——于是新实例启动时必然看到 `ERROR_ALREADY_EXISTS`。这**不是
+//! 重复启动而是预期交接**，故新实例不得走「第二实例立即退出」路径。
+//!
+//! 旧实现对该分支直接把守卫降级为 `None`。旧实例退出后**没有任何进程持有互斥**，
+//! 整个提权执行期间单实例保证被打破：此时再次双击 exe 的新副本会被判定为 `Primary`
+//! 并常驻，导致托盘多图标、WinEvent 钩子 / 剪贴板监听 / 终端日志钩子重复注册、
+//! 模块状态互相覆盖、日志文件跨进程竞争。
+//!
+//! 现由 [`acquire_after_handoff`] 承担交接：以退避重试**持续询位**（不广播唤醒
+//! 消息——交接期不是"用户重复启动"），直到真正成为 `Primary` 并重新持有守卫；
+//! 超时才降级为 `Secondary` 并由调用方如实告警。
+//!
 //! # 非 Windows 平台
 //!
 //! 具名互斥是 Windows 原生能力；非 Windows 目标上 [`acquire`] 恒返回
@@ -43,6 +58,8 @@
 //! [`CloseHandle`]: https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-closehandle
 
 use std::fmt;
+#[cfg(windows)]
+use std::time::Duration;
 
 /// 会话级具名互斥体名称（唯一实例令牌）。
 ///
@@ -58,6 +75,17 @@ pub const INSTANCE_MUTEX_NAME: &str = r"Local\TLToolBox_SingleInstance_Mutex";
 /// 注册后的消息编号落在 `0xC000..=0xFFFF` 区间，**系统内唯一**：第二实例向
 /// `HWND_BROADCAST` 广播时使用与主实例完全相同的编号（同一字符串跨进程映射一致）。
 pub const WAKEUP_MESSAGE_NAME: &str = "TLTOOLBOX_WAKEUP_EXISTING_INSTANCE";
+
+/// 提权交接期等待互斥易手的上限（S6）：超过即放弃守护、如实告警。
+///
+/// 15s 是「旧实例平滑收尾（逆序停模块 + 关托盘 + 刷日志）」的宽裕上界；正常
+/// 情况下旧实例在数百毫秒内释放互斥，本等待几乎瞬时命中。
+#[cfg(windows)]
+pub const HANDOFF_WAIT: Duration = Duration::from_secs(15);
+
+/// 交接期询位重试间隔（100ms；上限内至多约 150 次轮询）。
+#[cfg(windows)]
+const HANDOFF_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 单实例检查结果。
 #[derive(Debug)]
@@ -160,6 +188,73 @@ pub fn acquire() -> Result<SingleInstanceOutcome, SingleInstanceError> {
     }
 }
 
+/// 提权交接期：等待旧（低权限）实例释放互斥后**重新持有**唯一性守卫（S6）。
+///
+/// # 语义
+/// 由 `main` 在「命令行含 `RESTART_MARKER_ARG` 且初次获取判定为 `Secondary`」时
+/// 调用——该组合意味着本进程是旧实例经 UAC 拉起的后继，旧实例尚在平滑收尾。
+///
+/// - 以 [`HANDOFF_RETRY_INTERVAL`] 为间隔询位，直到成为 `Primary`（立即返回并交出
+///   守卫，单实例保证**全程连续**）；
+/// - **不广播唤醒消息**：交接期不是"用户重复启动"，向旧实例广播只会让它把正在
+///   收尾的主窗口再弹一次（且每次询位都会弹）；
+/// - 超过 `timeout` 仍未取得（旧实例卡住 / 未退出）→ 返回 `Secondary`，
+///   由调用方如实告警并降级——不静默失败、不阻塞应用启动。
+///
+/// 非 Windows 平台恒返回 `Primary`（占位守卫，单实例语义不生效）。
+pub async fn acquire_after_handoff(
+    timeout: Duration,
+) -> Result<SingleInstanceOutcome, SingleInstanceError> {
+    #[cfg(windows)]
+    {
+        acquire_after_handoff_named(INSTANCE_MUTEX_NAME, timeout).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = timeout;
+        Ok(SingleInstanceOutcome::Primary(
+            SingleInstanceGuard::placeholder(),
+        ))
+    }
+}
+
+/// [`acquire_after_handoff`] 的可注入名称实现（测试用唯一互斥名直接驱动语义）。
+#[cfg(windows)]
+async fn acquire_after_handoff_named(
+    name: &str,
+    timeout: Duration,
+) -> Result<SingleInstanceOutcome, SingleInstanceError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        match imp::probe_named(name)? {
+            Some(guard) => {
+                tracing::info!(
+                    target: "single_instance",
+                    attempts,
+                    "提权交接完成：旧实例已释放互斥，本（高权限）实例重新持有单实例守护"
+                );
+                return Ok(SingleInstanceOutcome::Primary(guard));
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        target: "single_instance",
+                        attempts,
+                        "提权交接等待超时（{}ms）：未能取得单实例互斥，本次降级为无守护运行",
+                        timeout.as_millis()
+                    );
+                    return Ok(SingleInstanceOutcome::Secondary {
+                        wakeup_delivered: false,
+                    });
+                }
+                tokio::time::sleep(HANDOFF_RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
 /// 取得（或注册）唤醒广播消息编号；返回 `0` 表示注册失败（极罕见）。
 ///
 /// 供接收端（托盘消息泵）在泵循环中比对 `MSG.message`：编号与第二实例广播时
@@ -203,6 +298,29 @@ mod imp {
     /// （不调用 `ReleaseMutex`），句柄语义退化为“该名称是否已被本进程 / 其他进程
     /// 持有”。
     pub(super) fn acquire_named(name: &str) -> Result<SingleInstanceOutcome, SingleInstanceError> {
+        match probe_named(name)? {
+            Some(guard) => Ok(SingleInstanceOutcome::Primary(guard)),
+            None => {
+                tracing::info!(
+                    target: "single_instance",
+                    "检测到既有实例持有互斥 '{name}'：广播唤醒消息并转入退出路径"
+                );
+                let delivered = notify_existing_instance();
+                Ok(SingleInstanceOutcome::Secondary {
+                    wakeup_delivered: delivered,
+                })
+            }
+        }
+    }
+
+    /// 单次询位：互斥可独占时返回守卫（`Some`），否则关闭本进程拿到的副本并返回
+    /// `None`（S6 的交接重试循环与 [`acquire_named`] 共用本原语）。
+    ///
+    /// **不产生任何广播副作用**——交接期由 [`super::acquire_after_handoff`] 高频
+    /// 轮询本函数，若在此广播会让旧实例的收尾窗口被反复弹出。
+    pub(super) fn probe_named(
+        name: &str,
+    ) -> Result<Option<SingleInstanceGuard>, SingleInstanceError> {
         let wide = to_wide_units(name);
         // SAFETY: wide 为 NUL 结尾的 UTF-16 缓冲，其指针在本调用期间存活；
         // SECURITY_ATTRIBUTES 传 None（默认安全描述符，会话级命名空间无需提权）；
@@ -225,19 +343,10 @@ mod imp {
             // 关闭本进程拿到的句柄副本（不释放既有实例的互斥；若保留到进程退出，
             // 反而会因“仍存打开句柄”而破坏互斥的唯一性判定）。
             close_handle(handle.0 as usize);
-            tracing::info!(
-                target: "single_instance",
-                "检测到既有实例持有互斥 '{name}'：广播唤醒消息并转入退出路径"
-            );
-            let delivered = notify_existing_instance();
-            return Ok(SingleInstanceOutcome::Secondary {
-                wakeup_delivered: delivered,
-            });
+            return Ok(None);
         }
 
-        Ok(SingleInstanceOutcome::Primary(
-            SingleInstanceGuard::from_handle(handle.0 as usize),
-        ))
+        Ok(Some(SingleInstanceGuard::from_handle(handle.0 as usize)))
     }
 
     /// 注册唤醒广播消息并返回其系统内唯一编号；`0` = 注册失败。
@@ -388,5 +497,78 @@ mod tests {
             SingleInstanceOutcome::Primary(_guard) => {}
             other => panic!("非 Windows 平台应恒为主实例，实际: {other:?}"),
         }
+    }
+
+    // ---- S6：提权交接期重新持有互斥（v0.6.1 整改） ----
+
+    /// 交接契约：旧实例未释放时按超时降级为 `Secondary`；旧实例释放后**重新取得**
+    /// `Primary` 并持有守卫——这正是「提权期间单实例保证不出现空窗」的直接验证。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn handoff_reacquires_mutex_once_previous_instance_releases() {
+        let name = unique_test_name("handoff");
+
+        // 模拟旧实例：直接询位并持住守卫。
+        let holder = imp::probe_named(&name)
+            .expect("询位应成功")
+            .expect("首次询位应取得互斥");
+
+        // 1) 旧实例仍持有：等待至超时必须放弃（返回 Secondary），且不得 panic / 挂死。
+        let started = std::time::Instant::now();
+        match acquire_after_handoff_named(&name, Duration::from_millis(300))
+            .await
+            .expect("交接等待不应硬失败")
+        {
+            SingleInstanceOutcome::Secondary { .. } => {}
+            other => panic!("旧实例未释放时不应取得互斥，实际: {other:?}"),
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "应完整等待到超时点，实际 {:?}",
+            started.elapsed()
+        );
+
+        // 2) 旧实例退出（释放守卫）→ 交接必须重新取得 Primary，空窗期结束。
+        drop(holder);
+        match acquire_after_handoff_named(&name, Duration::from_secs(5))
+            .await
+            .expect("交接等待不应硬失败")
+        {
+            SingleInstanceOutcome::Primary(_guard) => {
+                // 守卫在此作用域末尾 Drop：测试自清理。
+            }
+            other => panic!("旧实例释放后应重新取得互斥，实际: {other:?}"),
+        }
+    }
+
+    /// 交接期间**不得**取得互斥的另一面：交接成功后同名再次获取仍应判别为
+    /// `Secondary`——证明重新持有的守卫是真实有效的，而非"看起来拿到了"。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn handoff_guard_actually_holds_uniqueness() {
+        let name = unique_test_name("handoff-hold");
+        let guard = match acquire_after_handoff_named(&name, Duration::from_secs(5))
+            .await
+            .expect("空闲互斥应立即取得")
+        {
+            SingleInstanceOutcome::Primary(guard) => guard,
+            other => panic!("空闲互斥应立即可用，实际: {other:?}"),
+        };
+        assert!(
+            imp::probe_named(&name).expect("询位应成功").is_none(),
+            "交接取得的守卫必须真实占位（其他人询位应为 None）"
+        );
+        drop(guard);
+    }
+
+    /// 交接等待上限必须是有界的短常量（否则提权后启动会被旧实例拖住）。
+    #[cfg(windows)]
+    #[test]
+    fn handoff_wait_is_bounded() {
+        assert!(
+            HANDOFF_WAIT <= Duration::from_secs(30),
+            "交接等待上限过长会明显拖慢提权后的启动"
+        );
+        assert!(!HANDOFF_WAIT.is_zero(), "上限不得为 0（否则永不等待）");
     }
 }

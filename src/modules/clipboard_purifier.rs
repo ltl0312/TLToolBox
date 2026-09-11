@@ -357,9 +357,21 @@ impl ClipboardPurifierModule {
         }
 
         // 4) 预分配新块并写入文本（在 EmptyClipboard 之前完成：分配失败不影响原数据）。
-        let byte_len = (text.len() + 1)
-            .checked_mul(2)
-            .expect("剪贴板文本长度溢出 usize");
+        //    v0.6.2（L14）：改用 `checked_mul().ok_or_else(..)` ——旧实现 `.expect(..)`
+        //    位于泵循环调用链上，溢出 panic 会让泵线程静默死亡（`running` 仍为真，
+        //    UI 显示运行中却不再净化）。溢出按"放弃本次净化"处理，语义等同分配失败。
+        let byte_len = match (text.len() + 1).checked_mul(2) {
+            Some(len) => len,
+            None => {
+                tracing::warn!(
+                    target: "clipboard_purifier",
+                    "剪贴板文本长度溢出 usize（len={}），放弃本次净化",
+                    text.len()
+                );
+                let _ = CloseClipboard();
+                return false;
+            }
+        };
         let new_global = match GlobalAlloc(GMEM_MOVEABLE, byte_len) {
             Ok(block) => block,
             Err(err) => {
@@ -471,9 +483,23 @@ impl ClipboardPurifierModule {
             // 4) 解析注册富文本格式 ID（返回 0 = 注册失败，仅该格式失去探测能力，
             //    不阻断整体运行）。CF_HTML / RTF 不是预定义常量，需经
             //    RegisterClipboardFormatW 取回各会话内的稳定注册值。
+            //    v0.6.2（L15）：注册失败补一条 `warn`——旧实现静默吞掉，用户只会
+            //    感到"富文本复制没被净化"，无从排查。
             let html_format = RegisterClipboardFormatW(w!("HTML Format"));
             let rtf_format = RegisterClipboardFormatW(w!("Rich Text Format"));
             let rtf_wo_format = RegisterClipboardFormatW(w!("Rich Text Format Without Objects"));
+            for (name, id) in [
+                ("HTML Format", html_format),
+                ("Rich Text Format", rtf_format),
+                ("Rich Text Format Without Objects", rtf_wo_format),
+            ] {
+                if id == 0 {
+                    tracing::warn!(
+                        target: "clipboard_purifier",
+                        "注册剪贴板格式 '{name}' 失败（返回 0）：该格式的探测能力不可用，净化仍对纯文本生效"
+                    );
+                }
+            }
 
             let thread_id = GetCurrentThreadId();
 
@@ -822,6 +848,26 @@ mod tests {
                 .expect("并发 stop 应成功");
         }
         assert!(!module.is_running(), "并发停止后应收敛到停止态");
+    }
+
+    /// §6.2 #7（v0.6.2 · P2-15）：**反复启停压测**——50 轮 start / stop，每轮都
+    /// 断言 `is_running()` 与真实资源状态一致。长驻工具的模块生命周期必须经得起
+    /// 用户长时间反复开关：状态漂移、句柄泄漏（泵线程残留）都会在此显形。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_start_stop_cycles_converge() {
+        let module = ClipboardPurifierModule::new();
+        for cycle in 0..50 {
+            module
+                .start()
+                .await
+                .unwrap_or_else(|err| panic!("第 {cycle} 轮 start 应成功: {err}"));
+            assert!(module.is_running(), "第 {cycle} 轮启动后应为运行态");
+            module
+                .stop()
+                .await
+                .unwrap_or_else(|err| panic!("第 {cycle} 轮 stop 应成功: {err}"));
+            assert!(!module.is_running(), "第 {cycle} 轮停止后应为停止态");
+        }
     }
 
     // -----------------------------------------------------------------------

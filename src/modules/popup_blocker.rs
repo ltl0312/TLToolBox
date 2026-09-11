@@ -103,9 +103,9 @@ use windows::Win32::{
     Foundation::{HMODULE, HWND, LPARAM, WPARAM},
     UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
     UI::WindowsAndMessaging::{
-        DispatchMessageW, GetClassNameW, GetMessageW, GetWindowTextW, PeekMessageW, PostMessageW,
-        PostThreadMessageW, TranslateMessage, EVENT_OBJECT_CREATE, MSG, PM_NOREMOVE,
-        WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_QUIT,
+        DispatchMessageW, GetClassNameW, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+        PeekMessageW, PostMessageW, PostThreadMessageW, TranslateMessage, EVENT_OBJECT_CREATE, MSG,
+        PM_NOREMOVE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE, WM_QUIT,
     },
 };
 
@@ -119,6 +119,15 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 #[cfg(windows)]
 const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 窗口标题 / 类名查询缓冲的**字符数上限**（v0.6.2 · M3）。
+///
+/// 4 Ki 字符已远超任何真实窗口标题 / 类名；既避免对异常窗口无限扩容，又保证
+/// 超长标题尾部的关键词不再被截断丢失（旧实现固定 256 字符 → 漏拦）。
+const MAX_WINDOW_TEXT_CHARS: usize = 4096;
+
+/// 类名查询的初始缓冲容量（类名普遍很短，256 已覆盖绝大多数）。
+const CLASS_BUFFER_CHARS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // 动态黑名单规则存储（跨平台核心：Windows 钩子回调与单元测试共用同一判定逻辑）
 // ---------------------------------------------------------------------------
@@ -128,8 +137,94 @@ const PUMP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 struct CompiledPattern {
     /// 归一化后的原始关键词（去首尾空白；保留原大小写，供日志与 `current_rules` 回读）。
     raw: String,
-    /// 小写归一后的匹配针：判定时与同样小写化的窗口标题 / 类名做子串匹配。
+    /// 小写归一后的匹配针：判定时与同样小写化的窗口标题 / 类名比对。
     needle: String,
+    /// 匹配模式（v0.6.2 · M3）：`无前缀` = 既有子串语义（向后兼容），
+    /// `exact:` / `prefix:` / `word:` 为显式收窄。
+    mode: MatchMode,
+}
+
+/// 关键词匹配模式（v0.6.2 · M3：在既有子串语义上**增量**提供收窄手段）。
+///
+/// 背景：旧实现是纯「子串 + 忽略大小写」，默认黑名单含 `"Update Notice"`、
+/// `"广告"` 这类宽泛词——任何**标题含**该串的正常窗口都会被直接关闭（误拦）。
+/// 引入模式让用户可以按需收紧，而**不改动**既有配置的语义（无前缀仍是子串）：
+///
+/// | 写法 | 语义 | 典型用途 |
+/// | --- | --- | --- |
+/// | `foo` | 子串（既有语义，不变） | 兼容旧配置 |
+/// | `exact:foo` | 标题 / 类名**全等于** `foo` | 精确命中已知弹窗 |
+/// | `prefix:foo` | 以 `foo` 开头 | 命中固定前缀的弹窗 |
+/// | `word:foo` | `foo` 以**整词**出现（ASCII 词边界） | `word:Update` 不再命中 `Update Center` 之外的 `Updated` 等连续词 |
+///
+/// 中文等无空格分词的文本没有可靠的词边界概念，对它们请继续用子串或 `exact:`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MatchMode {
+    /// 子串匹配（既有语义，保持向后兼容）。
+    #[default]
+    Substring,
+    /// 全等匹配。
+    Exact,
+    /// 前缀匹配。
+    Prefix,
+    /// ASCII 词边界匹配（`needle` 两侧须为非 ASCII 字母数字字符 / 串首尾）。
+    Word,
+}
+
+impl MatchMode {
+    /// 从原始关键词解析模式并剥离前缀；返回 `(模式, 剥离后的关键词)`。
+    ///
+    /// 前缀**大小写不敏感**（与关键词本身忽略大小写的精神一致）；仅前缀而无正文
+    /// 时视为无模式（由 [`RuleSet::compile`] 按"空针"剔除）。逐字节前缀比较用
+    /// `str::get` 防御多字节字符边界（如 `"广告"` 的第 5 字节不是字符边界）。
+    fn parse(raw: &str) -> (Self, &str) {
+        for (prefix, mode) in [
+            ("exact:", MatchMode::Exact),
+            ("prefix:", MatchMode::Prefix),
+            ("word:", MatchMode::Word),
+        ] {
+            if let Some(head) = raw.get(..prefix.len()) {
+                if head.eq_ignore_ascii_case(prefix) {
+                    if let Some(rest) = raw.get(prefix.len()..) {
+                        if !rest.is_empty() {
+                            return (mode, rest);
+                        }
+                    }
+                }
+            }
+        }
+        (MatchMode::Substring, raw)
+    }
+
+    /// 判定小写化后的 `haystack` 是否命中小写化后的 `needle`。
+    fn hit(self, haystack: &str, needle: &str) -> bool {
+        match self {
+            Self::Substring => haystack.contains(needle),
+            Self::Exact => haystack == needle,
+            Self::Prefix => haystack.starts_with(needle),
+            Self::Word => {
+                let mut start = 0usize;
+                while let Some(rel) = haystack[start..].find(needle) {
+                    let hit_start = start + rel;
+                    let hit_end = hit_start + needle.len();
+                    let left_ok = haystack[..hit_start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric());
+                    let right_ok = haystack[hit_end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric());
+                    if left_ok && right_ok {
+                        return true;
+                    }
+                    // 该处不是词边界：从下一字节继续找（needle 非空，必有进展）。
+                    start = hit_start + 1;
+                }
+                false
+            }
+        }
+    }
 }
 
 /// 不可变黑名单快照。
@@ -144,7 +239,8 @@ struct RuleSet {
 impl RuleSet {
     /// 从原始关键词列表编译快照：
     /// 1) 逐条去首尾空白，空白串直接剔除；
-    /// 2) 按**小写归一针**去重（同一关键词的大小写变体视作同一条目，保留首现形态）。
+    /// 2) 解析 `exact:` / `prefix:` / `word:` 模式前缀（v0.6.2 · M3）；
+    /// 3) 按**小写归一针**去重（同一关键词的大小写变体视作同一条目，保留首现形态）。
     fn compile(raw_rules: impl IntoIterator<Item = String>) -> Self {
         let mut seen = std::collections::HashSet::new();
         let patterns = raw_rules
@@ -154,11 +250,20 @@ impl RuleSet {
                 if raw.is_empty() {
                     return None; // 空白条目无匹配意义
                 }
-                let needle = raw.to_lowercase();
-                if !seen.insert(needle.clone()) {
-                    return None; // 与既有条目同义（大小写不敏感去重）
+                // 仅模式前缀、无正文（如 "exact:"）：同样无匹配意义，剔除。
+                let lowered = raw.to_lowercase();
+                if ["exact:", "prefix:", "word:"].iter().any(|p| lowered == *p) {
+                    return None;
                 }
-                Some(CompiledPattern { raw, needle })
+                let (mode, body) = MatchMode::parse(&raw);
+                let needle = body.to_lowercase();
+                if needle.is_empty() {
+                    return None; // 空针无匹配意义
+                }
+                if !seen.insert(format!("{mode:?}:{needle}")) {
+                    return None; // 同模式同针去重（大小写不敏感）
+                }
+                Some(CompiledPattern { raw, needle, mode })
             })
             .collect();
         Self { patterns }
@@ -179,18 +284,43 @@ impl RuleSet {
 
     /// 判定窗口标题 / 类名是否命中任意黑名单关键词。
     ///
-    /// 匹配语义：**子串匹配 + 忽略大小写**（Unicode 小写归一；中文等无大小写之分的
-    /// 字符不受影响，仍为逐字子串匹配）。标题与类名各自小写化**一次**后统一比对，
-    /// 避免按关键词逐条重复归一化。
+    /// 匹配语义：默认**子串匹配 + 忽略大小写**（Unicode 小写归一；中文等无大小写
+    /// 之分的字符不受影响，仍为逐字子串匹配）；关键词可经 `exact:` / `prefix:` /
+    /// `word:` 前缀收窄（见 [`MatchMode`]，v0.6.2 · M3）。标题与类名各自小写化
+    /// **一次**后统一比对，避免按关键词逐条重复归一化。
     fn matches(&self, title: &str, class_name: &str) -> bool {
         if self.is_empty() {
             return false;
         }
         let title = title.to_lowercase();
         let class_name = class_name.to_lowercase();
-        self.patterns
-            .iter()
-            .any(|pattern| title.contains(&pattern.needle) || class_name.contains(&pattern.needle))
+        self.patterns.iter().any(|pattern| {
+            pattern.mode.hit(&title, &pattern.needle)
+                || pattern.mode.hit(&class_name, &pattern.needle)
+        })
+    }
+}
+
+/// 读取窗口类名（动态缓冲，v0.6.2 · M3）。
+///
+/// `GetClassNameW` 没有类似 `GetWindowTextLengthW` 的长度查询：返回值即复制到
+/// 缓冲的字符数（缓冲不足时被截断且**不**回填所需长度），故按容量翻倍重查，
+/// 直至确认未截断或达到 [`MAX_WINDOW_TEXT_CHARS`] 上限。
+#[cfg(windows)]
+fn read_class_name(hwnd: windows::Win32::Foundation::HWND) -> String {
+    let mut capacity = CLASS_BUFFER_CHARS;
+    loop {
+        let mut buf = vec![0u16; capacity];
+        // SAFETY: buf 为容量 capacity 的可写缓冲；失效句柄返回 0，无访问违规。
+        let copied = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
+        let copied = copied.min(buf.len());
+        // 返回值 == 容量-1 时无法区分「恰好装满」与「被截断」，翻倍重查一次即可
+        // 消除歧义（两种情况下前缀内容一致，重查无副作用）。
+        let may_be_truncated = copied + 1 >= buf.len() && capacity < MAX_WINDOW_TEXT_CHARS;
+        if !may_be_truncated {
+            return String::from_utf16_lossy(&buf[..copied]);
+        }
+        capacity = (capacity * 2).min(MAX_WINDOW_TEXT_CHARS);
     }
 }
 
@@ -592,7 +722,12 @@ impl PopupBlockerModule {
     /// # Safety / 约束
     /// - 必须与 `WINEVENTPROC` 布局一致（`unsafe extern "system"`）；
     /// - 运行于专用原生线程的系统回调上下文，**严禁**在其中执行任何异步 / Tokio
-    ///   操作，也禁止可能 `panic` / 跨 FFI 边界展开的代码；
+    ///   操作；
+    /// - **panic 边界（v0.6.1 · S5）**：回调体整体置于
+    ///   [`crate::ffi_guard::guard_ffi`] 内。回调内的 `String` 分配、
+    ///   `String::from_utf16_lossy`、`Mutex` 加锁、`tracing!` 宏均可 panic，而 panic
+    ///   一旦跨 `extern "system"` 展开会让整个常驻进程直接 abort（无 Toast、无日志、
+    ///   钩子与托盘全丢）。此前这条约束只写在文档里、无强制手段，现由代码保证；
     /// - 黑名单不再硬编码：回调经句柄注册表（[`lookup_hook_routing`]）路由回所属实例
     ///   的规则存储与截图状态——锁内只做查表与 `Arc` 克隆两个指针级操作，窗口文本
     ///   查询与字符串匹配全部在**无锁路径**上执行，规则热更新无需重启泵线程；
@@ -608,60 +743,73 @@ impl PopupBlockerModule {
         _event_thread: u32,
         _event_time: u32,
     ) {
-        // OBJID_WINDOW == 0 && CHILDID_SELF == 0：只关心窗口本体（而非子元素/子对象）的创建。
-        if event != EVENT_OBJECT_CREATE || hwnd.0.is_null() || id_object != 0 || id_child != 0 {
-            return;
-        }
-
-        // 快照为空（空黑名单 = 不拦截）时零分配短路：连窗口文本都无需读取。
-        let Some(routing) = lookup_hook_routing(hook) else {
-            return; // 钩子已注销 / 注册表未就绪：忽略该事件
-        };
-        let snapshot = routing.rules.snapshot();
-        if snapshot.is_empty() {
-            return;
-        }
-
-        // SAFETY: 以下 Win32 查询均为进程内只读调用，hwnd 可能已失效（窗口刚销毁），
-        // 但 GetClassNameW / GetWindowTextW 对失效句柄返回 0，不会引发访问违规。
-        unsafe {
-            let mut class_buf = [0u16; 256];
-            let mut title_buf = [0u16; 256];
-            let class_len = GetClassNameW(hwnd, &mut class_buf).max(0) as usize;
-            let title_len = GetWindowTextW(hwnd, &mut title_buf).max(0) as usize;
-
-            let class_name = String::from_utf16_lossy(&class_buf[..class_len.min(class_buf.len())]);
-            let title = String::from_utf16_lossy(&title_buf[..title_len.min(title_buf.len())]);
-
-            // 快照匹配：子串匹配 + 忽略大小写（大小写归一在快照写入时已完成）。
-            if !snapshot.matches(&title, &class_name) {
+        let _ = crate::ffi_guard::guard_ffi("popup_blocker::win_event_proc", || {
+            // OBJID_WINDOW == 0 && CHILDID_SELF == 0：只关心窗口本体（而非子元素/子对象）的创建。
+            if event != EVENT_OBJECT_CREATE || hwnd.0.is_null() || id_object != 0 || id_child != 0 {
                 return;
             }
 
-            tracing::warn!(
-                target: "popup_blocker",
-                "捕获目标弹窗: 标题=\"{title}\", 类名=\"{class_name}\", HWND=0x{:X}; 下发 WM_CLOSE 关闭指令",
-                hwnd.0 as usize,
-            );
-            // 截图留痕（可选）：把任务投递给专用 worker 后立即继续——PrintWindow
-            // 与 PNG 编码绝不阻塞钩子消息泵。
-            if let Some(screenshots) = &routing.screenshots {
-                screenshots.submit(hwnd.0 as usize, &title, &class_name);
+            // 快照为空（空黑名单 = 不拦截）时零分配短路：连窗口文本都无需读取。
+            let Some(routing) = lookup_hook_routing(hook) else {
+                return; // 钩子已注销 / 注册表未就绪：忽略该事件
+            };
+            let snapshot = routing.rules.snapshot();
+            if snapshot.is_empty() {
+                return;
             }
-            // 关闭指令为**异步消息投递**（PostMessageW），不等待目标窗口处理。
-            // 严禁改用同步阻塞式 SendMessageW：WinEvent 回调运行在系统回调上下文
-            // 中，同步等待目标窗口响应会阻塞本进程消息泵，且受 UIPI 限制向高权限
-            // 窗口同步发送会直接失败——异步投递 + 不等待是防卡死钩子消息泵的唯一
-            // 正确形态（SendMessageTimeoutW 亦可用，但此处无需任何应答，Post 最优）。
-            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
 
-            // 审计留痕（可选）：命中动作落定后经事件总线发布「弹窗关闭」事件，
-            // 由装配层（总线 → UI 桥）写入用户操作审计日志 `app_audit.log`。
-            // 发布为同步非阻塞广播（bus::publish 即发即弃），不增加回调耗时。
-            if let Some(bus) = &routing.bus {
-                bus.publish(AppEvent::PopupClosed { title, class_name });
+            // SAFETY: 以下 Win32 查询均为进程内只读调用，hwnd 可能已失效（窗口刚销毁），
+            // 但 GetClassNameW / GetWindowTextW 对失效句柄返回 0，不会引发访问违规。
+            //
+            // v0.6.2（M3）：标题 / 类名改用**动态缓冲**——旧实现固定 `[0u16; 256]`，
+            // 超长标题被截断后若关键词恰在尾部则匹配不到（漏拦）。标题先经
+            // `GetWindowTextLengthW` 取精确长度；类名无对应长度 API，按
+            // [`CLASS_BUFFER_CHARS`] 起步、命中容量即翻倍重查，至
+            // [`MAX_WINDOW_TEXT_CHARS`] 封顶。
+            unsafe {
+                let title_len = GetWindowTextLengthW(hwnd);
+                let title = if title_len <= 0 {
+                    String::new()
+                } else {
+                    let cap = (title_len as usize + 1).min(MAX_WINDOW_TEXT_CHARS);
+                    let mut buf = vec![0u16; cap];
+                    let copied = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
+                    String::from_utf16_lossy(&buf[..copied.min(buf.len())])
+                };
+
+                let class_name = read_class_name(hwnd);
+
+                // 快照匹配：默认子串 + 忽略大小写，支持 exact:/prefix:/word: 收窄
+                //（大小写归一在快照写入时已完成）。
+                if !snapshot.matches(&title, &class_name) {
+                    return;
+                }
+
+                tracing::warn!(
+                    target: "popup_blocker",
+                    "捕获目标弹窗: 标题=\"{title}\", 类名=\"{class_name}\", HWND=0x{:X}; 下发 WM_CLOSE 关闭指令",
+                    hwnd.0 as usize,
+                );
+                // 截图留痕（可选）：把任务投递给专用 worker 后立即继续——PrintWindow
+                // 与 PNG 编码绝不阻塞钩子消息泵。
+                if let Some(screenshots) = &routing.screenshots {
+                    screenshots.submit(hwnd.0 as usize, &title, &class_name);
+                }
+                // 关闭指令为**异步消息投递**（PostMessageW），不等待目标窗口处理。
+                // 严禁改用同步阻塞式 SendMessageW：WinEvent 回调运行在系统回调上下文
+                // 中，同步等待目标窗口响应会阻塞本进程消息泵，且受 UIPI 限制向高权限
+                // 窗口同步发送会直接失败——异步投递 + 不等待是防卡死钩子消息泵的唯一
+                // 正确形态（SendMessageTimeoutW 亦可用，但此处无需任何应答，Post 最优）。
+                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+
+                // 审计留痕（可选）：命中动作落定后经事件总线发布「弹窗关闭」事件，
+                // 由装配层（总线 → UI 桥）写入用户操作审计日志 `app_audit.log`。
+                // 发布为同步非阻塞广播（bus::publish 即发即弃），不增加回调耗时。
+                if let Some(bus) = &routing.bus {
+                    bus.publish(AppEvent::PopupClosed { title, class_name });
+                }
             }
-        }
+        });
     }
 
     /// 泵线程主体：运行于专用操作系统原生线程，承载钩子安装与标准 Win32 消息泵。
@@ -1154,6 +1302,96 @@ mod tests {
             "应保留首现形态并按序去重"
         );
         assert!(!rules.is_empty());
+    }
+
+    // ---- M3：匹配模式（v0.6.2 整改；§6.2 建议测试 #2） ----
+
+    /// `word:` 模式按 ASCII 词边界命中——审计指出的「`Update` 命中正常标题」
+    /// 的误拦面由此收窄（既有无前缀规则语义不变）。
+    #[test]
+    fn word_mode_matches_on_ascii_word_boundaries() {
+        let rules = RuleSet::compile(["word:Update"].into_iter().map(String::from));
+        // 整词命中：标题 / 类名均算。
+        assert!(rules.matches("Update", ""), "整串即整词，应命中");
+        assert!(rules.matches("Update Required", ""), "空格分隔，应命中");
+        assert!(
+            rules.matches("Software Update – 请确认", ""),
+            "标点分隔，应命中"
+        );
+        assert!(rules.matches("", "Update_Window"), "类名下划线分隔，应命中");
+        // 连续词不得命中（这正是旧子串语义的误拦来源）。
+        assert!(
+            !rules.matches("Updated Settings", ""),
+            "`Updated` 不是整词 Update"
+        );
+        assert!(
+            !rules.matches("UpdateCenter", ""),
+            "无分隔符的连续词不应命中"
+        );
+        assert!(!rules.matches("MyUpdateTool", ""));
+        // 中文紧邻（无空格分词）：按 ASCII 词边界定义，非 ASCII 字母数字字符
+        // 即边界——因此会命中。这是 `word:` 的文档化语义（见 MatchMode 文档）：
+        // 中文文本请用子串或 `exact:`。
+        assert!(rules.matches("软件更新Update中心", ""));
+    }
+
+    /// `exact:` / `prefix:` 模式分别按全等 / 前缀命中，且对标题与类名同样生效。
+    #[test]
+    fn exact_and_prefix_modes_narrow_the_match() {
+        let rules = RuleSet::compile(
+            ["exact:推广弹窗", "prefix:Flash Helper"]
+                .into_iter()
+                .map(String::from),
+        );
+        // exact：全等才命中。
+        assert!(rules.matches("推广弹窗", ""));
+        assert!(!rules.matches("今日推广弹窗提醒", ""), "子串不再命中");
+        // prefix：前缀命中、中间含不算。
+        assert!(rules.matches("Flash Helper Service", ""));
+        assert!(
+            rules.matches("flash helper service 已就绪", ""),
+            "忽略大小写"
+        );
+        assert!(!rules.matches("请使用 Flash Helper", ""), "非前缀不命中");
+    }
+
+    /// 模式前缀本身（如 `exact:`）不构成有效关键词；前缀大小写不敏感地解析。
+    #[test]
+    fn mode_prefixes_are_parsed_case_insensitively_and_bare_prefix_is_dropped() {
+        // 仅前缀、无正文：编译期剔除，等价空黑名单。
+        let bare = RuleSet::compile(["exact:", "word:", "prefix:"].into_iter().map(String::from));
+        assert!(bare.is_empty(), "裸前缀无匹配意义，应被剔除");
+
+        // 大写前缀同样生效（与关键词忽略大小写的精神一致）。
+        let rules = RuleSet::compile(["WORD:Update"].into_iter().map(String::from));
+        assert!(rules.matches("Update Required", ""));
+        assert!(!rules.matches("Updated", ""));
+    }
+
+    /// 超长标题（> 256 字符，旧定长缓冲的截断长度）**尾部**的关键词必须命中
+    /// ——M3 漏拦半边的直接回归用例（匹配层；读取层已改动态缓冲）。
+    #[test]
+    fn keyword_at_tail_of_overlong_title_is_matched() {
+        let rules = RuleSet::compile(["推广弹窗"].into_iter().map(String::from));
+        let mut title = "正常窗口标题 ".repeat(40); // > 256 字符
+        title.push_str("推广弹窗");
+        assert!(title.chars().count() > 256, "用例前提：标题超长");
+        assert!(rules.matches(&title, ""), "尾部关键词不得因超长而漏拦");
+    }
+
+    /// 模式与子串可混合使用：同一条黑名单内新旧写法并存（向后兼容的直接验证）。
+    #[test]
+    fn mixed_modes_coexist_in_one_rule_set() {
+        let rules = RuleSet::compile(
+            ["广告", "word:Update", "exact:激活提示"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert!(rules.matches("xx广告xx", ""), "无前缀：子串语义不变");
+        assert!(rules.matches("Update Needed", ""), "word: 整词命中");
+        assert!(!rules.matches("Updated", ""), "word: 不命中连续词");
+        assert!(rules.matches("激活提示", ""), "exact: 全等命中");
+        assert!(!rules.matches("请完成激活提示操作", ""), "exact: 不做子串");
     }
 
     /// [`RuleStore`] 的 copy-on-write 语义：`set` 整体替换快照后，新针即时生效、

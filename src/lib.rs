@@ -8,7 +8,8 @@
 //!   平台权限门面（[`platform`]：管理员权限检测与提权重启）、
 //!   事件总线（[`bus`]）、配置引擎（[`config`]）、日志子系统（[`logging`]，
 //!   按天滚动落盘 + WorkerGuard 刷盘守卫）、模块调度器（[`manager`]）、
-//!   系统托盘与常驻生命周期（[`tray`]）、单实例守护（[`single_instance`]）与常驻守护模块（[`modules`]）。`tests/` 下的集成测试与 `src/main.rs`
+//!   系统托盘与常驻生命周期（[`tray`]）、单实例守护（[`single_instance`]）、
+//!   FFI 回调 panic 边界（[`ffi_guard`]）与常驻守护模块（[`modules`]）。`tests/` 下的集成测试与 `src/main.rs`
 //!   可执行程序都以 `tltoolbox` 为依赖，确保 `cargo test` 能在**脱离 GUI
 //!   会话**的前提下验证模块调度与配置/自启链路；
 //! - **二进制（`src/main.rs`）**：最终装配点——加载配置并同步注册表自启状态、
@@ -23,10 +24,12 @@
 pub mod autostart;
 pub mod bus;
 pub mod config;
+pub mod ffi_guard;
 pub mod logging;
 pub mod manager;
 pub mod modules;
 pub mod platform;
 pub mod single_instance;
+pub mod thread_rules;
 pub mod tray;
 pub mod update;

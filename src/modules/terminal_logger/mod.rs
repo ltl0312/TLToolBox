@@ -297,9 +297,18 @@ fn ensure_log_dirs(log_base: &Path, hooks: &HookManager) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 // TerminalLoggerModule：ToolModule 化的常驻守护模块本体
 // ---------------------------------------------------------------------------
-/// 终端交互日志模块（第四个常驻守护模块）。
+/// 钩子卸载失败后的**自动重试次数**（v0.6.2 · M10）。
 ///
-/// 生命周期完全由内部可变性管理（原子运行标志 + 异步锁串行化变迁 + 最近
+/// 卸载承担回滚系统改写的职责（移除 Shell 配置注入块 / 注册表 AutoRun 片段），
+/// 失败会在用户系统上留下残留。最常见的失败形态是目标文件被编辑器 / 杀毒进程
+/// 瞬态占用（`ERROR_SHARING_VIOLATION` 一类），短退避重试即可解决——因此重试
+/// 收益远高于成本。
+const UNINSTALL_MAX_ATTEMPTS: usize = 3;
+
+/// 相邻两次卸载重试之间的退避间隔。
+const UNINSTALL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// 终端交互日志模块（第四个常驻守护模块）。/// 生命周期完全由内部可变性管理（原子运行标志 + 异步锁串行化变迁 + 最近
 /// 一次成功安装的钩子快照），对外仅暴露共享引用接口，天然满足 [`ToolModule`]
 /// 的 `Send + Sync` 契约。钩子在 `start` 期按运行期配置**惰性装配**——
 /// 模块注册与构造不做任何系统探测或改写。
@@ -327,6 +336,13 @@ struct TerminalLoggerInner {
     /// `None` = 守护未在运行）。修复式重装 / 重复启动时先取消旧令牌，
     /// 杜绝双守护任务并存。
     retention_guard: SyncMutex<Option<CancellationToken>>,
+    /// 最近一次「钩子卸载失败」的原因（v0.6.2 · M10）。
+    ///
+    /// `Some` = 存在**已知的系统侧残留**（Shell 配置文件注入块 / 注册表
+    /// AutoRun 片段），UI 据此给出「需修复」提示；成功卸载 / 强制清理后清空。
+    /// 无此记录时，一次失败的卸载会表现为"点了没反应"——残留悄悄留在用户
+    /// 的 Shell 配置里，下次启动还可能重复注入。
+    last_stop_error: SyncMutex<Option<String>>,
 }
 
 impl TerminalLoggerModule {
@@ -343,6 +359,7 @@ impl TerminalLoggerModule {
                 running: AtomicBool::new(false),
                 cmd_hook_active: AtomicBool::new(false),
                 retention_guard: SyncMutex::new(None),
+                last_stop_error: SyncMutex::new(None),
             }),
         }
     }
@@ -439,6 +456,126 @@ impl TerminalLoggerModule {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
     }
+    /// 带自动重试的钩子卸载（v0.6.2 · M10）。
+    ///
+    /// 最多尝试 [`UNINSTALL_MAX_ATTEMPTS`] 次，相邻两次间隔
+    /// [`UNINSTALL_RETRY_BACKOFF`]——覆盖"目标文件被编辑器 / 杀毒进程瞬态占用"
+    /// 这一最常见的失败形态。全部尝试都失败时返回**最后一次**错误（每次失败都
+    /// 照常 `warn` 留痕，保证失败路径可诊断）。
+    async fn uninstall_with_retry(&self, hooks: &HookManager) -> Result<(), ModuleError> {
+        let mut last_err: Option<ModuleError> = None;
+        for attempt in 1..=UNINSTALL_MAX_ATTEMPTS {
+            // v0.6.2（L6）：同步文件 / 注册表 IO 移出 Tokio 工作线程。
+            let attempt_hooks = hooks.clone();
+            let result = tokio::task::spawn_blocking(move || attempt_hooks.uninstall_all()).await;
+            match result {
+                Ok(Ok(())) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            target: "terminal_logger",
+                            attempt,
+                            "钩子卸载在第 {attempt} 次尝试成功"
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        target: "terminal_logger",
+                        attempt,
+                        total = UNINSTALL_MAX_ATTEMPTS,
+                        "钩子卸载失败（第 {attempt}/{UNINSTALL_MAX_ATTEMPTS} 次）: {err}"
+                    );
+                    last_err = Some(err);
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        target: "terminal_logger",
+                        "钩子卸载阻塞任务异常终止: {join_err}"
+                    );
+                    last_err = Some(format!("卸载任务异常终止: {join_err}").into());
+                }
+            }
+            if attempt < UNINSTALL_MAX_ATTEMPTS {
+                tokio::time::sleep(UNINSTALL_RETRY_BACKOFF).await;
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "钩子卸载失败（无错误详情）".into()))
+    }
+
+    /// 最近一次「钩子卸载失败」的原因；`None` = 无已知残留。
+    ///
+    /// 供装配层写审计 / UI 提示「需修复」。
+    pub fn last_stop_error(&self) -> Option<String> {
+        self.inner
+            .last_stop_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 是否需要修复（v0.6.2 · M10，UI「需修复」提示的判定来源）。
+    ///
+    /// 两种形态都意味着**系统侧存在与模块状态不一致的残留**：
+    /// 1. 最近一次卸载失败（Shell 配置注入块 / 注册表 AutoRun 片段仍在）；
+    /// 2. 运行标志为真但 [`Self::is_running`] 为假（cmd AutoRun 片段被外部清理）。
+    pub fn needs_repair(&self) -> bool {
+        if self.last_stop_error().is_some() {
+            return true;
+        }
+        self.inner.running.load(Ordering::Acquire) && !self.is_running()
+    }
+
+    /// **强制清理**终端日志钩子（v0.6.2 · M10 手动修复入口）。
+    ///
+    /// 与 [`ToolModule::stop`] 的差异：不依赖运行标志与「最近一次成功安装」的
+    /// 快照，而是按**当前配置**重新装配全部 Shell 挂载器并逐一卸载——专为清理
+    /// 「上次卸载失败的残留」或「外部注入的历史残留」设计，对未残留者同样是
+    /// 幂等空操作。成功后清空残留记录。
+    ///
+    /// # 线程模型
+    /// 同步文件 / 注册表 IO 经 `spawn_blocking` 移出 Tokio 工作线程（与
+    /// [`crate::modules::terminal_logger`] 的装配纪律一致）。
+    pub async fn force_cleanup_hooks(&self) -> Result<(), ModuleError> {
+        let _guard = self.inner.lifecycle.lock().await;
+        // 按当前配置装配挂载器（与 start 同一套定位逻辑，保证能找到残留所在的
+        // 目标文件 / 注册表值）。
+        let enabled_shells = {
+            let cfg = self.inner.config.lock().await;
+            cfg.enabled_shells.clone()
+        };
+        let hooks = HookManager::for_enabled_shells(&enabled_shells);
+        let attempt = hooks.clone();
+
+        let outcome = tokio::task::spawn_blocking(move || attempt.uninstall_all())
+            .await
+            .map_err(|err| -> ModuleError {
+                format!("强制清理任务异常终止: {err}").into()
+            })?;
+
+        match outcome {
+            Ok(()) => {
+                *self
+                    .inner
+                    .last_stop_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                tracing::info!(
+                    target: "terminal_logger",
+                    "终端日志钩子强制清理完成：Shell 配置与注册表均无本模块残留"
+                );
+                Ok(())
+            }
+            Err(err) => {
+                *self
+                    .inner
+                    .last_stop_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(err.to_string());
+                Err(err)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -482,6 +619,8 @@ impl ToolModule for TerminalLoggerModule {
         ensure_log_dirs(&log_base, &hooks);
 
         // 3) 统一安装钩子（未启用任何 Shell 时为空操作）。
+        //    v0.6.2（L6）：同步文件 IO（读配置文件 / 写注入块）经 `spawn_blocking`
+        //    移出 Tokio 工作线程，与模块卸载路径的纪律一致。
         if hooks.is_empty() {
             tracing::info!(
                 target: "terminal_logger",
@@ -489,7 +628,13 @@ impl ToolModule for TerminalLoggerModule {
                 "终端交互日志启动：enabled_shells 为空，本次未安装任何会话钩子"
             );
         } else {
-            hooks.install_all(&log_base)?;
+            let attempt = hooks.clone();
+            let install_dir = log_base.clone();
+            tokio::task::spawn_blocking(move || attempt.install_all(&install_dir))
+                .await
+                .map_err(|err| -> ModuleError {
+                    format!("钩子安装任务异常终止: {err}").into()
+                })??;
         }
 
         // 4) 落定状态：快照钩子集（供 stop 精确卸载）+ 运行标志 + cmd 核验开关。
@@ -527,15 +672,31 @@ impl ToolModule for TerminalLoggerModule {
         // 卸载「最近一次成功 start 安装的钩子」；快照缺失（异常状态）时按当前
         // 配置重建兜底，尽力清理。
         let hooks = self.current_hooks().await;
-        if let Err(err) = hooks.uninstall_all() {
-            // 卸载失败：部分钩子可能仍残留。归还快照供重试，并保持运行标志——
-            // 状态机与系统事实一致，避免「UI 显示已停止、钩子仍生效」的虚假状态。
-            *self
-                .inner
-                .hooks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hooks);
-            return Err(err);
+        match self.uninstall_with_retry(&hooks).await {
+            Ok(()) => {
+                *self
+                    .inner
+                    .last_stop_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+            Err(err) => {
+                // 卸载失败（已自动重试仍失败）：部分钩子**确定残留**。归还快照供
+                // 重试、保持运行标志（状态机与系统事实一致，避免「UI 显示已停止、
+                // 钩子仍生效」的虚假状态），并记录残留原因供 UI 提示「需修复」
+                // 与手动强制清理（v0.6.2 · M10）。
+                *self
+                    .inner
+                    .hooks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hooks);
+                *self
+                    .inner
+                    .last_stop_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(err.to_string());
+                return Err(err);
+            }
         }
 
         self.inner.cmd_hook_active.store(false, Ordering::Release);
@@ -555,7 +716,6 @@ impl ToolModule for TerminalLoggerModule {
     }
 
     /// 运行状态判定：**内存原子标志 + 注册表状态**联合判断。
-    ///
     /// 1. 内存运行标志为 `false` → 停止态；
     /// 2. 内存标志为 `true` 且本次运行含 cmd 钩子（`cmd_hook_active`）→ 额外
     ///    核验 AutoRun 注册表值仍持有本模块的 `call` 片段（[`Self::registry_state_ok`]）：
@@ -854,5 +1014,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- M10：卸载重试 / 残留状态 / 强制清理（v0.6.2 整改） ----
+
+    /// 从未启动的模块：无残留、无需修复，强制清理为幂等空操作。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_cleanup_on_never_started_module_is_noop() {
+        let module = module_with(Vec::new(), None);
+        assert!(!module.needs_repair(), "从未启动的模块不应报告「需修复」");
+        assert!(module.last_stop_error().is_none());
+        module
+            .force_cleanup_hooks()
+            .await
+            .expect("无残留时强制清理应成功");
+        assert!(!module.needs_repair(), "清理后仍不应报告「需修复」");
+        assert!(module.last_stop_error().is_none());
+    }
+
+    /// 空残留状态下强制清理的幂等性：连续两次均成功且不产生任何状态翻转。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_cleanup_is_idempotent() {
+        let module = module_with(vec!["powershell".to_string(), "bash".to_string()], None);
+        for round in 1..=2 {
+            module
+                .force_cleanup_hooks()
+                .await
+                .unwrap_or_else(|err| panic!("第 {round} 次强制清理应成功: {err}"));
+            assert!(!module.needs_repair(), "第 {round} 次清理后不应报告需修复");
+            // 强制清理是幂等的清理动作，**不得**翻转运行标志。
+            assert!(!module.is_running(), "强制清理不得把模块置为运行态");
+        }
+    }
+
+    /// 重试常量必须有界（避免卸载失败时长时间挂住 stop 路径）。
+    #[test]
+    fn uninstall_retry_constants_are_bounded() {
+        assert!(
+            (2..=5).contains(&UNINSTALL_MAX_ATTEMPTS),
+            "重试次数过少失去意义、过多拖慢停止: {UNINSTALL_MAX_ATTEMPTS}"
+        );
+        assert!(
+            UNINSTALL_RETRY_BACKOFF <= std::time::Duration::from_millis(500),
+            "退避过长会明显拖慢模块停止"
+        );
     }
 }
